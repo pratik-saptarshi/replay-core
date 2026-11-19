@@ -65,6 +65,17 @@ func isReservedSchemaRef(ref string) bool {
 	return false
 }
 
+// ErrIntentPathMismatch is returned when an append reuses an
+// intent ID that was first recorded on a different owner path.
+// An intent ID belongs to the owner path that first used it,
+// globally: cross-path reuse is an error, never a replay —
+// without this check it returned the first path's receipts with
+// a nil error and appended nothing on the requested path
+// (issue #3). Whether intent IDs should instead be scoped per
+// path is an open Phase 2 design question; this rejection keeps
+// the global law explicit and safe under either outcome.
+var ErrIntentPathMismatch = errors.New("store: append intent belongs to a different owner path")
+
 // IntentConflictError reports an append whose intent ID was already
 // recorded with a different batch digest: the intent names a
 // different batch than the one being appended, so nothing is
@@ -184,19 +195,26 @@ type rowQuerier interface {
 // resolveIntent applies the intent-idempotency rule for one append
 // whose batch digest is already computed: if the intent ID is not
 // recorded, it reports handled = false and the append proceeds; if
-// it is recorded with the same batch digest, it returns the stored
-// receipts (a replay — nothing is appended); if it is recorded with
-// a different batch digest, it returns *IntentConflictError.
-func resolveIntent(ctx context.Context, q rowQuerier, intentID, batchDigest string) (receipts []Receipt, handled bool, err error) {
-	var existingDigest, receiptsJSON string
+// it is recorded on a different owner path, it returns
+// ErrIntentPathMismatch (the path check precedes the digest
+// check: the intent belongs to that path, whatever batch this
+// append carries); if it is recorded with the same batch digest,
+// it returns the stored receipts (a replay — nothing is
+// appended); if it is recorded with a different batch digest, it
+// returns *IntentConflictError.
+func resolveIntent(ctx context.Context, q rowQuerier, intentID, ownerPath, batchDigest string) (receipts []Receipt, handled bool, err error) {
+	var existingPath, existingDigest, receiptsJSON string
 	err = q.QueryRowContext(ctx,
-		"SELECT batch_digest, receipts FROM append_intents WHERE intent_id = ?", intentID).
-		Scan(&existingDigest, &receiptsJSON)
+		"SELECT owner_path, batch_digest, receipts FROM append_intents WHERE intent_id = ?", intentID).
+		Scan(&existingPath, &existingDigest, &receiptsJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
 	if err != nil {
 		return nil, false, fmt.Errorf("store: look up intent %q: %w", intentID, err)
+	}
+	if existingPath != ownerPath {
+		return nil, false, fmt.Errorf("%w: intent %q belongs to %q, not %q", ErrIntentPathMismatch, intentID, existingPath, ownerPath)
 	}
 	if existingDigest != batchDigest {
 		return nil, false, &IntentConflictError{IntentID: intentID, ExistingDigest: existingDigest, IncomingDigest: batchDigest}
@@ -220,7 +238,10 @@ func resolveIntent(ctx context.Context, q rowQuerier, intentID, batchDigest stri
 // Appends are intent-idempotent: repeating a call with the same
 // intent ID and the same drafts returns the original receipts and
 // appends nothing; the same intent ID with different drafts fails
-// with *IntentConflictError and appends nothing. Degenerate inputs
+// with *IntentConflictError and appends nothing. An intent ID
+// belongs to the owner path that first used it: reuse on a
+// different path fails with ErrIntentPathMismatch and appends
+// nothing. Degenerate inputs
 // — an empty batch, an empty intent ID, an empty owner path, or a
 // reserved replaycore. owner path — are rejected before any work,
 // as is any draft carrying a reserved system schema ref
@@ -286,7 +307,7 @@ func (s *Store) appendBatch(ownerPath, intentID string, drafts []RecordDraft) ([
 	if err != nil {
 		return nil, fmt.Errorf("store: batch digest: %w", err)
 	}
-	if receipts, handled, err := resolveIntent(ctx, s.db, intentID, batchDigest); err != nil {
+	if receipts, handled, err := resolveIntent(ctx, s.db, intentID, ownerPath, batchDigest); err != nil {
 		return nil, err
 	} else if handled {
 		return receipts, nil
@@ -313,7 +334,7 @@ func (s *Store) appendBatch(ownerPath, intentID string, drafts []RecordDraft) ([
 	// the winner's row here — replay returns the winner's receipts,
 	// conflict errors — and never reaches the intent insert, so it
 	// can never surface a primary-key error.
-	if receipts, handled, err := resolveIntent(ctx, conn, intentID, batchDigest); err != nil {
+	if receipts, handled, err := resolveIntent(ctx, conn, intentID, ownerPath, batchDigest); err != nil {
 		return nil, err
 	} else if handled {
 		return receipts, nil
