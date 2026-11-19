@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Phase 0 Implementation Plan — replay-core: Canonical-Digest Law &amp; Conformance Fixtures (2026-11-18)</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 24px auto; max-width: 960px; padding: 0 16px; line-height: 1.55; color: #1a2332; }
+  h1 { font-size: 1.45rem; } h2 { font-size: 1.15rem; border-bottom: 2px solid #dbe3ee; padding-bottom: 4px; margin-top: 30px; }
+  h3 { font-size: 1.02rem; margin-top: 20px; }
+  code { font-family: ui-monospace, Menlo, monospace; font-size: 0.88em; }
+  table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 0.92rem; }
+  th, td { border: 1px solid #dbe3ee; padding: 6px 9px; text-align: left; vertical-align: top; }
+  th { background: #f4f7fb; }
+  .warn { background: #fdf1f1; border: 1px solid #e5b4b4; border-radius: 8px; padding: 10px 14px; }
+  .note { background: #fff7e8; border: 1px solid #ecd9a8; border-radius: 8px; padding: 10px 14px; }
+  .ok { background: #eefaf0; border: 1px solid #b5dcbc; border-radius: 8px; padding: 10px 14px; }
+  ul { margin: 6px 0; }
+  pre { background: #f4f7fb; border: 1px solid #dbe3ee; border-radius: 6px; padding: 8px 12px; overflow-x: auto; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+<h1>Phase 0 Implementation Plan — replay-core: Canonical-Digest Law &amp; Conformance Fixtures</h1>
+<p><i>Produced under the feature-pr-pipeline skill (Stage 1, writing-plans). For agentic workers: REQUIRED SUB-SKILL — subagent-driven-development (fresh implementer + task reviewer per task), test-driven-development inside each task. Steps use checkbox syntax for tracking.</i></p>
+
+<p><b>Goal:</b> Establish the byte-exact canonical-digest law for replay-core — a Go canonical-JSON encoder and record/witness digest API whose outputs match the conformance corpus's frozen vectors bit-for-bit — plus the versioned conformance corpus that gates it in CI forever. No runtime, no store, no replay in this phase.</p>
+<p><b>Architecture:</b> Two canonical profiles are adopted and both are in scope: <code>replaycore.kernel.canonical.v1</code> (trace records; raw UTF-8, Python <code>json.dumps</code> semantics) is the primary law for F2's store; <code>commons.canonical.v1</code> (ASCII-escaped, floats forbidden) is the secondary profile. A language-neutral JSON corpus under <code>testdata/corpus/</code> — golden vectors, law-test cases, and shipped vectors generated from the reference law suite — is the normative form of the law in this repo; the Go implementation is proven against that corpus, never against hand-copied expectations.</p>
+<p><b>Tech Stack:</b> Go 1.27.2 (this VM: <code>~/sdk/go</code>); stdlib only for the codec (<code>crypto/sha256</code>, custom encoder — <code>encoding/json</code> defaults do <i>not</i> match the law); Python 3.12 for corpus generation tooling only (held outside this repo, never shipped); corpus format = JSON files under <code>testdata/corpus/</code>.</p>
+<p><b>Spec:</b> the features development plan for the replay capability (AEP goal workspace, 2026-11-18) §4 F1, §6 Phase 0, §7 (canonical-divergence risk), and the reverse-engineering findings held with it. The in-repo normative form of the canonical law is the conformance corpus under <code>testdata/corpus/</code> (corpus v2) together with the Global Constraints below.</p>
+
+<h2>Global Constraints</h2>
+<ul>
+<li><b>Corpus discipline:</b> the corpus under <code>testdata/corpus/</code> is the normative form of the law in this repo. Its manifest records the corpus version and the law versions it pins; any regeneration is a new corpus version, reviewed as such. Generation tooling and its reference inputs are held outside this repo.</li>
+<li><b>Two profiles, never conflated:</b> the kernel profile = prefix <code>"replaycore.kernel.canonical.v1\n"</code>, <code>ensure_ascii=False</code> (raw UTF-8), compact separators <code>( ",", ":" )</code>, keys sorted by Unicode code point, <code>allow_nan=False</code>. The commons profile = prefix <code>"commons.canonical.v1\n"</code>, <code>ensure_ascii=True</code> (lowercase <code>\uXXXX</code>), floats/bytes/sets/tuples forbidden. A digest is always <code>sha256:&lt;lowercase hex&gt;</code> of <code>prefix + canonical bytes</code>.</li>
+<li><b>Record identity (v2):</b> digest input is exactly <code>{body, caused_by, kind:"record", mode, schema_ref, witness}</code>; <code>caused_by</code> order is identity (reordering changes the digest); <code>record_id == digest</code>. Path, ordinal, receipt, and <code>kind_label</code> are excluded from identity.</li>
+<li><b>Root witness law:</b> the empty witness sentinel <code>""</code> is legal only for the root witness record (<code>schema_ref == "kernel.witness.root.v1"</code>, mode <code>capture</code>, no causal parents, body exactly <code>root_witness_body()</code>). Ground truth verified 2026-11-18 against the fork's own code: <code>root_witness_body_digest = sha256:22e3bf15…fdb1f0a9</code>, <code>root_witness_record_id = sha256:0b67497c…1fbc739777</code>.</li>
+<li><b>Claims discipline:</b> every capability statement in any doc produced by this phase cites the test that proves it. No upstream performance or cache numbers anywhere.</li>
+<li><b>Memory rule:</b> replay-core is an execution store, not a memory system. Nothing in this phase touches NeuroStrata except, at phase close, a pointer inscription (plan + corpus locations) in the <code>aep</code> namespace.</li>
+<li><b>Build discipline (this VM):</b> ~1.5 GiB effective memory; Go builds are light, keep them that way — stdlib only, no cgo in this phase. <code>GOTMPDIR=$HOME/.gotmp</code> for any large build step.</li>
+<li><b>Repo mechanics (once D2 lands):</b> Conventional Commit subjects; all GitHub calls through <code>ghg</code> with <code>GHG_ACTOR=replay-core-phase0</code>; PRs target <code>develop</code> if the home is AEP; merges only on Pratik's per-PR word; planning documents ship in the PR under <code>docs/plans/</code>.</li>
+<li><b>TDD check scripts</b> live in <code>/tmp</code> during execution (never committed), per the pipeline. The phase gate script is specified in Task 5 and prototyped at <code>~/workspace/goals/autonomous-code-defense-factory/hidden_files/replay-core/check-phase0.sh</code>.</li>
+</ul>
+
+<h2>Review Focus</h2>
+<p>The five input classes most likely to bite, each pinned to its owning task's tests:</p>
+<ol>
+<li><b>Float formatting divergence</b> (kernel profile only): Python <code>repr</code> shortest-round-trip vs Go formatting — exponent forms (<code>1e+21</code> vs <code>1e21</code>), <code>1.0</code> vs <code>1</code>, <code>-0.0</code>, subnormals. A silent mismatch corrupts every digest downstream. → Task 3.</li>
+<li><b>Integers beyond int64/uint64:</b> Python ints are unbounded; a body carrying <code>9007199254740993</code> (in the v1 vectors) or larger must digest identically, not saturate or fall back to float64. → Task 3.</li>
+<li><b>Unicode key ordering and escaping:</b> keys sort by code point (not byte-wise UTF-16 units — astral-plane keys expose this); the kernel profile emits raw UTF-8 (snowman bytes <code>\xe2\x98\x83</code>), v1 escapes. Wrong in either profile = wrong digests only for non-ASCII payloads, i.e. exactly the payloads tests forget. → Task 2.</li>
+<li><b>Non-finite and out-of-law values:</b> NaN/±Inf must be rejected in both profiles; floats must be rejected in v1 with a typed error naming the JSON path (upstream: <code>TypeError … at $.a[0]</code>). Accepting one silently forks the law. → Tasks 2–3.</li>
+<li><b>Witness/root-sentinel misuse:</b> empty witness on a non-root record, root schema with a non-empty witness, root body differing by one field — each must be a hard validation error before any digest is computed, matching upstream's <code>ValueError</code> cases one-for-one. → Task 4.</li>
+</ol>
+
+<h2>File Structure</h2>
+<table>
+<tr><th>Path (repo-relative; home per D2)</th><th>Responsibility</th></tr>
+<tr><td><code>go.mod</code></td><td>Module scaffold (module path fixed at D2; placeholder <code>replay-core</code> until then). Go 1.27, no dependencies.</td></tr>
+<tr><td><code>testdata/corpus/README.md</code></td><td>What the corpus is, how its versions are governed, and how the gate consumes it. Corpus generation tooling is held outside this repo; no Python ships in this phase.</td></tr>
+<tr><td><code>testdata/corpus/manifest.json</code></td><td>Corpus provenance: law versions, corpus version, source list.</td></tr>
+<tr><td><code>testdata/corpus/kernel_v1.json</code></td><td>Kernel-profile cases: golden records/witnesses, canonical-JSON byte cases, validation-error cases.</td></tr>
+<tr><td><code>testdata/corpus/commons_v1.json</code></td><td>Commons-profile cases: the four shipped vectors plus error cases (float, duplicate key, non-canonical bytes).</td></tr>
+<tr><td><code>testdata/corpus/numbers.json</code></td><td>Number-law cases: float/int edge values with their reference-canonical bytes and digests.</td></tr>
+<tr><td><code>internal/canonical/value.go</code></td><td>The value model: a JSON value representation that preserves integer precision and distinguishes int from float (no <code>float64</code>-only decoding).</td></tr>
+<tr><td><code>internal/canonical/encode.go</code></td><td>The encoder for both profiles: key sorting, escaping, separators, prefixing.</td></tr>
+<tr><td><code>internal/canonical/number.go</code></td><td>Python-<code>repr</code>-compatible float formatting and arbitrary-precision integer handling.</td></tr>
+<tr><td><code>internal/canonical/digest.go</code></td><td><code>DigestCommons</code>, <code>DigestKernel</code> over encoded bytes.</td></tr>
+<tr><td><code>internal/record/record.go</code></td><td>Record/witness digest API + validation law (Task 4).</td></tr>
+<tr><td><code>internal/canonical/conformance_test.go</code>, <code>internal/record/conformance_test.go</code></td><td>Corpus-driven conformance tests — the phase gate.</td></tr>
+<tr><td><code>docs/replay-semantics.html</code></td><td>The one-page replay-semantics spec (Task 1), shipped in the PR under <code>docs/plans/</code> alongside this plan.</td></tr>
+</table>
+
+<h2>Tasks</h2>
+
+<h3>Task 0: Conformance corpus extraction from the pinned fork</h3>
+<p><b>Files:</b> Create <code>testdata/corpus/{manifest,kernel_v1,commons_v1,numbers}.json</code> and <code>testdata/corpus/README.md</code> (generation tooling is held outside this repo).</p>
+<p><b>Interfaces:</b> Produces — the corpus schema every later task consumes: each case is <code>{name, profile, input, canonical_text|canonical_bytes_b64, digest, expect_error?}</code>; the manifest is <code>{abi_version, canonical_version, corpus_version, sources[]}</code>. Consumes — the reference law suite (golden vectors + law tests), held outside this repo.</p>
+<ul>
+<li>[ ] <b>Step 1 — Write the failing check:</b> <code>/tmp/check-t0.sh</code> asserts the four corpus files exist, the manifest records <code>canonical_version == "replaycore.kernel.canonical.v1"</code> and <code>corpus_version == 2</code>, and at least the golden capture-record case is present with digest <code>sha256:c1130f70…fa9077b</code>. Run it: FAIL (no corpus yet) — RED.</li>
+<li>[ ] <b>Step 2 — Generate the corpus:</b> with the generation tooling held outside this repo, which computes every digest <i>by</i> the reference law implementation (never a re-implementation inside the tooling). Sources: (a) every entry of the reference golden file (10 top-level keys, incl. ordered vs reversed parent records — parent order must survive generation); (b) the reference byte-stability case; (c) the four commons-profile shipped vectors verbatim; (d) validation-error cases enumerated from the reference law tests (invalid mode, empty-witness misuse ×3, root-shape violations ×3, missing witness fields). The generated files are committed as normative data.</li>
+<li>[ ] <b>Step 3 — Idempotence (pipeline prompt):</b> <i>Runs twice?</i> Byte-identical corpus — generation sorts case names, embeds no timestamps, and writes via temp-file + atomic rename per file. <i>Crashed halfway?</i> A corpus file is either the old complete version or the new complete version, never partial; the manifest is written last and its recorded law versions let the gate detect a mixed-generation corpus. The gate (Task 5) recomputes every digest from its case input — a hand-edited or mixed-generation corpus fails.</li>
+<li>[ ] <b>Step 4 — Run check:</b> GREEN. Also verify generation reproduces the two root-witness ground truths from Global Constraints.</li>
+<li>[ ] <b>Step 5 — Commit:</b> <code>feat(corpus): add canonical-digest conformance corpus (corpus v2)</code>.</li>
+</ul>
+
+<h3>Task 1: Replay-semantics spec (one page, review before codec merges)</h3>
+<p><b>Files:</b> Create <code>docs/replay-semantics.html</code>.</p>
+<p><b>Interfaces:</b> Produces — the normative statement Tasks 2–5 and all later phases argue from: effect boundary, record-by-value, replay-by-digest-match, fork-at-Cut, projection-only revert, honesty rule (identical inputs guaranteed, not identical live model behavior), and the execution-store-not-memory charter line. Consumes — features plan §2 verbatim as its source; no new semantics may be introduced here (any gap found is an escalation, not an invention).</p>
+<ul>
+<li>[ ] <b>Step 1 — Draft</b> from features-plan §2 + findings-kernel §3, every normative sentence traceable to a cited plan section or fork file.</li>
+<li>[ ] <b>Step 2 — Check:</b> <code>/tmp/check-t1.sh</code> greps the spec for the five required elements (effect boundary, by-value capture, digest-match replay, projection-only revert, NeuroStrata pointer rule) and for forbidden content (any unverified upstream number — <code>95%</code>, <code>5×</code>/<code>5x</code> — outside an explicitly-labelled unverified-claim context). RED before draft, GREEN after.</li>
+<li>[ ] <b>Step 3 — Commit:</b> <code>docs(spec): replay semantics for replay-core (phase 0)</code>. This task's PR review is the Phase-0 spec gate named in the features plan.</li>
+</ul>
+
+<h3>Task 2: Canonical encoder — both profiles</h3>
+<p><b>Files:</b> Create <code>internal/canonical/value.go</code>, <code>internal/canonical/encode.go</code>, <code>internal/canonical/digest.go</code>; Test <code>internal/canonical/encode_test.go</code>.</p>
+<p><b>Interfaces:</b> Consumes — corpus schema (Task 0). Produces — <code>type Value</code> (tagged union: Null, Bool, String, IntText, Float, Array, Object with string keys); <code>func MarshalKernel(v Value) ([]byte, error)</code> returning prefix-tagged bytes; <code>func MarshalCommons(v Value) ([]byte, error)</code>; <code>func DigestKernel(v Value) (string, error)</code>, <code>func DigestCommons(v Value) (string, error)</code>. Decoding from <code>encoding/json</code> is via <code>json.Decoder.UseNumber()</code> into <code>Value</code> so integer text is preserved exactly.</p>
+<ul>
+<li>[ ] <b>Step 1 — Failing tests:</b> table tests from corpus byte cases: key-order independence; snowman raw-UTF-8 bytes equal <code>{"a":{"snowman":"snowman-\xe2\x98\x83"},"z":1}</code> under the kernel profile; v1 unicode case equals the escaped <code>caf\u00e9 \u2615</code> form; astral-plane key sorting by code point. Run: FAIL — RED.</li>
+<li>[ ] <b>Step 2 — Implement the encoder:</b> explicit recursive writer (no <code>encoding/json</code> marshaling of maps — Go map order and escaping both diverge); string escaping per profile (kernel profile: only control chars, quote, backslash escaped, matching <code>json.dumps(ensure_ascii=False)</code>; v1: additionally all non-ASCII as lowercase <code>\uXXXX</code> with surrogate pairs for astral chars); NaN/Inf rejected in both profiles; floats rejected in v1 with a path-naming error.</li>
+<li>[ ] <b>Step 3 — Run tests:</b> GREEN for all non-number corpus cases (number cases belong to Task 3 and are skipped-by-tag here, not deleted).</li>
+<li>[ ] <b>Step 4 — Commit:</b> <code>feat(canonical): canonical JSON encoder for kernel v2 and commons v1 profiles</code>.</li>
+</ul>
+
+<h3>Task 3: Number law — Python-repr floats and arbitrary-precision ints</h3>
+<p><b>Files:</b> Create <code>internal/canonical/number.go</code>; Regenerate <code>testdata/corpus/numbers.json</code> with the external generation tooling; Test <code>internal/canonical/number_test.go</code>.</p>
+<p><b>Interfaces:</b> Consumes — <code>Value</code> IntText/Float variants (Task 2). Produces — <code>func FormatFloat(f float64) (string, error)</code> byte-identical to Python <code>repr(float)</code> as emitted by <code>json.dumps</code>; integer path that round-trips arbitrary-precision integer text unchanged.</p>
+<ul>
+<li>[ ] <b>Step 1 — Extend the corpus first:</b> the generation tooling produces <code>numbers.json</code> by running the reference Python implementation over a fixed value list: <code>1.0, -0.0, 0.1, 1e21, 1e20, 1e-7, 123456789.123456789, 5e-324, 1.7976931348623157e308</code>, ints <code>9007199254740993, 2^63, 2^64, -(2^63)-1</code>, each with Python's canonical bytes + digest. (Expected trap, recorded so the implementer does not rediscover it: Go's <code>strconv.FormatFloat(f,'g',-1,64)</code> differs from Python on exponent threshold and <code>1e+21</code> zero-padding — Python switches to exponent at <code>1e16</code> and pads exponents to two digits.)</li>
+<li>[ ] <b>Step 2 — Failing tests</b> over <code>numbers.json</code>: RED.</li>
+<li>[ ] <b>Step 3 — Implement:</b> shortest-round-trip digits via <code>strconv.FormatFloat(f, 'e'/'f', -1, 64)</code> digit extraction, re-rendered under Python's rules (exponent iff <code>exp &lt; -4 || exp &gt;= 16</code> on the decimal exponent, <code>.0</code> suffix for integral floats in fixed form, signed two-digit-minimum exponent). Ints never pass through <code>float64</code>.</li>
+<li>[ ] <b>Step 4 — Run tests:</b> GREEN, including the v1 large-int vector <code>sha256:bf7c3cc5…d987ca</code>.</li>
+<li>[ ] <b>Step 5 — Commit:</b> <code>feat(canonical): Python-repr number law for floats and big integers</code>.</li>
+</ul>
+
+<h3>Task 4: Record &amp; witness digest API with validation law</h3>
+<p><b>Files:</b> Create <code>internal/record/record.go</code>; Test <code>internal/record/record_test.go</code>.</p>
+<p><b>Interfaces:</b> Consumes — <code>DigestKernel</code> (Task 2/3). Produces — <code>func RecordInput(schemaRef, mode string, body canonical.Value, causedBy []string, witness string) (canonical.Value, error)</code>; <code>func RecordDigest(...) (string, error)</code> with the same parameters; <code>func WitnessBodyDigest(schemaRef string, body canonical.Value) (string, error)</code>; <code>func RootWitnessBody() canonical.Value</code>; <code>func RootWitnessRecordID() string</code> (must equal <code>sha256:0b67497c…</code>); mode type restricted to <code>capture|declaration</code>.</p>
+<ul>
+<li>[ ] <b>Step 1 — Failing tests</b> from the golden file: capture vs declaration digests differ and match golden (<code>c1130f70…</code> / <code>21cdb1f8…</code>); ordered-parent digest <code>8220f74f…</code> ≠ reversed-parent digest; witness-body digest ≠ retained witness record id (upstream asserts both the inequality and each exact value); every validation-error corpus case returns an error (invalid mode; empty witness on non-root ×2 shapes; root schema with non-empty witness; root with wrong mode / with parents / with altered body; witness body missing <code>substrate_ref</code>; invalid <code>containment</code>). RED.</li>
+<li>[ ] <b>Step 2 — Implement</b> as a transliteration of the reference canonical-law validators — same checks, same order, Go-idiomatic error values carrying the reference message text.</li>
+<li>[ ] <b>Step 3 — Run tests:</b> GREEN; <code>RootWitnessRecordID()</code> equals ground truth.</li>
+<li>[ ] <b>Step 4 — Commit:</b> <code>feat(record): record and witness digest law (kernel canonical v2)</code>.</li>
+</ul>
+
+<h3>Task 5: Conformance gate — corpus-driven tests, phase check script, CI wiring</h3>
+<p><b>Files:</b> Create <code>internal/canonical/conformance_test.go</code>, <code>internal/record/conformance_test.go</code>; Create the phase gate script (execution copy in <code>/tmp</code>; durable prototype at <code>~/workspace/goals/autonomous-code-defense-factory/hidden_files/replay-core/check-phase0.sh</code> until D2 gives it a repo home).</p>
+<p><b>Interfaces:</b> Consumes — everything above. Produces — the Phase-0 gate: one command that (a) re-extracts the corpus to a temp dir and diffs it against the committed corpus, (b) runs the full conformance suite, (c) asserts the named golden digests explicitly (defense against a corpus that is consistently wrong in both copies).</p>
+<ul>
+<li>[ ] <b>Step 1 — Write the gate script; run it against the pre-implementation tree: FAIL — RED</b> (verified at plan time: the prototype script fails today with "no Go module", see the lane report).</li>
+<li>[ ] <b>Step 2 — Wire the conformance tests</b> to load every corpus file and execute every case (digest cases bit-for-bit; error cases must error; byte cases byte-equal).</li>
+<li>[ ] <b>Step 3 — Idempotence/crash prompt for the gate itself:</b> the gate is read-only against the repo (extraction goes to a temp dir); running it twice, or killing it mid-run, leaves the tree untouched.</li>
+<li>[ ] <b>Step 4 — Run the gate:</b> GREEN. Record the full case count in the PR body (no truncated listings for gate verdicts).</li>
+<li>[ ] <b>Step 5 — Commit:</b> <code>test(conformance): bit-for-bit digest gate against the conformance corpus</code>.</li>
+</ul>
+
+<h2>Phase Gate</h2>
+<div class="ok"><b>Phase 0 is done when:</b> the Task 5 gate passes end-to-end — every corpus case (golden kernel-profile records/witnesses, v1 vectors, number law, validation errors) matches bit-for-bit; the corpus re-extraction diff is empty; and the spec (Task 1) has passed review. Then: Stage 3 independent whole-branch review → Stage 4 hygiene (<code>scrubbing-public-tree</code>) → Stage 5 PR (per-PR authorization; target <code>develop</code> if AEP is the home) → Stage 6 CI + Codex final-head gate → merge only on Pratik's word.</div>
+
+<h2>Self-Review (writing-plans checklist)</h2>
+<ul>
+<li><b>Spec coverage:</b> features-plan F1 → Tasks 0/2/3/4/5; Phase-0 spec deliverable → Task 1; §7 canonical-divergence mitigations (1) corpus-as-CI-gate → Task 5, (2) float pinning → Task 3 + schema note in Global Constraints. Phase 0 contains no F2–F10 work — correct per the features plan.</li>
+<li><b>Step scan:</b> each step names one artifact and one check; no step requires inventing an interface (all signatures are in the owning task's Interfaces block).</li>
+<li><b>Type consistency:</b> <code>canonical.Value</code>, <code>MarshalCommons/V2</code>, <code>DigestCommons/V2</code>, <code>RecordDigest</code>, <code>RootWitnessRecordID</code> are named identically across Tasks 2–5.</li>
+<li><b>Review Focus:</b> all five items are pinned to owning-task tests above.</li>
+<li><b>Proportion:</b> plan is decision-dense, code-light; the only full algorithm specified is the float renderer, whose rules the tests alone do not determine (recorded in Task 3 Step 1).</li>
+</ul>
+
+<div class="warn"><b>Open decisions blocking execution (not planning):</b> <b>D1</b> language — this plan is written for Go per the features plan's recommendation; a Rust election invalidates Tasks 2–5 as written. <b>D2</b> home — Tasks 0–1 can execute in the staging tree (<code>~/workspace/replay-core/</code>) without it; no worktree, branch, or PR can be created until it lands. <b>D3</b> first Phase-3 consumer — not needed until Phase 3; deferring it costs nothing now.</div>
+</body>
+</html>
