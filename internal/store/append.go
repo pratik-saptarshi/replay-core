@@ -37,6 +37,24 @@ var ErrEmptyBatch = errors.New("store: append batch is empty")
 // the store grows).
 var ErrReservedSchemaRef = errors.New("store: schema ref is reserved to its constructor")
 
+// ErrDuplicateCause is returned when one draft's CausedBy lists
+// the same record twice. The duplicate is detected before the
+// write transaction, so the append fails with this named error —
+// naming the draft index and the duplicated record — instead of
+// the record_edges primary key's raw constraint string.
+var ErrDuplicateCause = errors.New("store: draft cites the same record twice")
+
+// ErrDuplicateRecord is returned when a draft's computed record
+// ID duplicates another draft in the same batch, or already
+// exists in the store under a different intent. Record identity
+// is content-derived, so a duplicate ID is a duplicate record:
+// the append is rejected with this named error — naming the ID —
+// instead of the records primary key's raw constraint string.
+// (Repeating an append under its own intent ID is not a
+// duplicate: intent replay returns the stored receipts before
+// this check is reached.)
+var ErrDuplicateRecord = errors.New("store: record already exists")
+
 // isReservedSchemaRef reports whether ref is one of the system
 // schema refs the public append boundary must refuse.
 func isReservedSchemaRef(ref string) bool {
@@ -79,6 +97,13 @@ func prepareDrafts(drafts []RecordDraft) ([]preparedDraft, error) {
 	prepared := make([]preparedDraft, len(drafts))
 	for i := range drafts {
 		d := drafts[i]
+		seenCauses := make(map[string]bool, len(d.CausedBy))
+		for _, parent := range d.CausedBy {
+			if seenCauses[parent] {
+				return nil, fmt.Errorf("store: draft %d: %w: %s", i, ErrDuplicateCause, parent)
+			}
+			seenCauses[parent] = true
+		}
 		if err := record.ValidateWitnessBody(d.WitnessBody); err != nil {
 			return nil, fmt.Errorf("store: draft %d: %w", i, err)
 		}
@@ -200,7 +225,11 @@ func resolveIntent(ctx context.Context, q rowQuerier, intentID, batchDigest stri
 // reserved replaycore. owner path — are rejected before any work,
 // as is any draft carrying a reserved system schema ref
 // (ErrReservedSchemaRef): those records are minted only through
-// their constructors, via appendBatch.
+// their constructors, via appendBatch. Duplicates are likewise
+// rejected by name, never by raw constraint string: a draft
+// citing one record twice (ErrDuplicateCause), or a record whose
+// content already landed — elsewhere in this batch or under
+// another intent (ErrDuplicateRecord).
 func (s *Store) AppendBatch(ownerPath, intentID string, drafts []RecordDraft) ([]Receipt, error) {
 	for i := range drafts {
 		if isReservedSchemaRef(drafts[i].SchemaRef) {
@@ -236,6 +265,18 @@ func (s *Store) appendBatch(ownerPath, intentID string, drafts []RecordDraft) ([
 	prepared, err := prepareDrafts(drafts)
 	if err != nil {
 		return nil, err
+	}
+	// A batch may not carry the same record twice: identity is
+	// content-derived, so two drafts with the same computed ID
+	// are the same record, and the second insert could only fail
+	// on the records primary key. Detect it here, before the
+	// intent is resolved or any row is written.
+	seenIDs := make(map[string]bool, len(prepared))
+	for i, p := range prepared {
+		if seenIDs[p.id] {
+			return nil, fmt.Errorf("store: draft %d: %w: %s", i, ErrDuplicateRecord, p.id)
+		}
+		seenIDs[p.id] = true
 	}
 	batchIDs := make([]string, len(prepared))
 	for i, p := range prepared {
@@ -305,6 +346,22 @@ func (s *Store) appendBatch(ownerPath, intentID string, drafts []RecordDraft) ([
 			if n == 0 {
 				return nil, fmt.Errorf("store: draft %d cites unknown record %s", i, parent)
 			}
+		}
+		// A record whose content already landed under a different
+		// intent is a duplicate, not a replay: replay of this
+		// append's own intent was resolved above, so an existing
+		// row here can only belong to another append. Reject it
+		// by name instead of surfacing the records primary key's
+		// raw constraint string. (In-batch duplicates were
+		// rejected before the transaction, so this check never
+		// sees this batch's own earlier inserts as duplicates.)
+		var existing int
+		if err := conn.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM records WHERE record_id = ?", p.id).Scan(&existing); err != nil {
+			return nil, fmt.Errorf("store: check duplicate %s: %w", p.id, err)
+		}
+		if existing > 0 {
+			return nil, fmt.Errorf("store: draft %d: %w: %s", i, ErrDuplicateRecord, p.id)
 		}
 		ordinal := nextOrdinal + int64(i)
 		if _, err := conn.ExecContext(ctx,
