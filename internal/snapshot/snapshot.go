@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pratik-saptarshi/replay-core/internal/canonical"
@@ -43,10 +44,31 @@ const (
 	commitPrefix  = 12          // hex chars of the commit ID used in the ref name
 )
 
+// zeroOID is the all-zero object ID: as an update-ref old value it
+// means "the ref must not exist yet" — the compare-and-swap guard
+// for the first snapshot in a chain.
+const zeroOID = "0000000000000000000000000000000000000000"
+
+// maxChainAttempts bounds Snapshot's compare-and-swap retries: if
+// a peer handle or process keeps advancing the chain head first,
+// Snapshot rebuilds on the new head this many times before
+// failing.
+const maxChainAttempts = 16
+
 // Store is a snapshot store backed by one bare Git repository.
 type Store struct {
-	dir  string // bare repository directory
-	last string // commit ID of the latest snapshot, "" if none yet
+	dir string // bare repository directory
+	// mu serializes Snapshot calls on this handle: a snapshot
+	// resolves the chain head, builds on it, and compare-and-swaps
+	// refs/vcscore/ops/latest, and that sequence must not
+	// interleave with itself. Contention across handles and
+	// processes is handled by the compare-and-swap retry in
+	// Snapshot, not by this mutex.
+	mu sync.Mutex
+	// last caches the chain head's commit ID, "" if none yet. It
+	// is a cache only — refs/vcscore/ops/latest is the truth, and
+	// Snapshot re-resolves it rather than trusting this field.
+	last string
 }
 
 // Open opens the snapshot store at dir, creating a bare repository
@@ -79,29 +101,37 @@ func Open(dir string) (*Store, error) {
 	if got != emptyBlobID {
 		return nil, fmt.Errorf("%w: probe hash-object returned %q, want %q", ErrGitUnavailable, got, emptyBlobID)
 	}
-	// Recover the chain head, if any. A missing latest ref means
-	// no chain yet. A latest ref that exists but does not resolve
-	// to a commit is corruption, and Open fails loudly rather
-	// than silently starting a fresh chain over the existing
-	// snapshots: the ref may name a non-commit object or a
-	// dangling object ID (the unpeeled rev-parse below still
-	// resolves it), or its contents may be unparseable — git
-	// reports that as a "broken ref" warning on the failing
-	// rev-parse's stderr while treating the ref as absent, so
-	// the warning text is the only signal separating a broken
-	// ref from a genuinely absent one.
-	head, err := s.git(nil, "rev-parse", "--verify", "--quiet", latestRef+"^{commit}")
-	switch {
-	case err == nil:
-		s.last = head
-	default:
-		if _, uerr := s.git(nil, "rev-parse", "--verify", "--quiet", latestRef); uerr == nil {
-			return nil, fmt.Errorf("snapshot: chain head %s does not resolve to a commit", latestRef)
-		} else if strings.Contains(err.Error(), "broken ref") || strings.Contains(uerr.Error(), "broken ref") {
-			return nil, fmt.Errorf("snapshot: chain head %s is corrupt: %v", latestRef, err)
-		}
+	// Recover the chain head, if any.
+	head, err := s.resolveChainHead()
+	if err != nil {
+		return nil, err
 	}
+	s.last = head
 	return s, nil
+}
+
+// resolveChainHead returns the commit refs/vcscore/ops/latest
+// names, or "" when the ref is absent (no chain yet). A latest ref
+// that exists but does not resolve to a commit is corruption, and
+// resolveChainHead fails loudly rather than silently starting a
+// fresh chain over the existing snapshots: the ref may name a
+// non-commit object or a dangling object ID (the unpeeled
+// rev-parse below still resolves it), or its contents may be
+// unparseable — git reports that as a "broken ref" warning on the
+// failing rev-parse's stderr while treating the ref as absent, so
+// the warning text is the only signal separating a broken ref
+// from a genuinely absent one.
+func (s *Store) resolveChainHead() (string, error) {
+	head, err := s.git(nil, "rev-parse", "--verify", "--quiet", latestRef+"^{commit}")
+	if err == nil {
+		return head, nil
+	}
+	if _, uerr := s.git(nil, "rev-parse", "--verify", "--quiet", latestRef); uerr == nil {
+		return "", fmt.Errorf("snapshot: chain head %s does not resolve to a commit", latestRef)
+	} else if strings.Contains(err.Error(), "broken ref") || strings.Contains(uerr.Error(), "broken ref") {
+		return "", fmt.Errorf("snapshot: chain head %s is corrupt: %v", latestRef, err)
+	}
+	return "", nil
 }
 
 // git runs one plumbing command against the store's repository:
@@ -271,18 +301,18 @@ type prevEntry struct {
 	Size  int64  `json:"size"`
 }
 
-// previousManifest loads the manifest of the store's latest
-// snapshot commit from that commit's meta/manifest.json, or nil
-// when the store has no snapshot yet. The commit is the chain head
-// recovered from refs/vcscore/ops/latest (tracked as s.last), and
-// the manifest is read from the repository at Snapshot time —
-// never from memory — so a reopened store stays incremental
-// (plan Task 14, Step 2).
-func (s *Store) previousManifest() (map[string]prevEntry, error) {
-	if s.last == "" {
+// previousManifestOf loads the manifest of the given snapshot
+// commit from that commit's meta/manifest.json, or nil when
+// commit is "" (no parent snapshot). The manifest is read from
+// the repository at Snapshot time — never from memory — so a
+// reopened store stays incremental (plan Task 14, Step 2), and so
+// the manifest always describes the parent the new commit is
+// actually built on.
+func (s *Store) previousManifestOf(commit string) (map[string]prevEntry, error) {
+	if commit == "" {
 		return nil, nil
 	}
-	raw, err := s.git(nil, "cat-file", "-p", s.last+":meta/manifest.json")
+	raw, err := s.git(nil, "cat-file", "-p", commit+":meta/manifest.json")
 	if err != nil {
 		return nil, fmt.Errorf("snapshot: read previous manifest: %w", err)
 	}
@@ -301,21 +331,60 @@ func (s *Store) previousManifest() (map[string]prevEntry, error) {
 
 // Snapshot captures workspaceDir as a new dual-tree commit: the
 // workspace tree under workspace/, the manifest and snapshot
-// metadata under meta/. The commit's parent is the store's previous
-// snapshot commit; it is referenced as refs/vcscore/ops/snapshot-
-// <commit-prefix> and refs/vcscore/ops/latest. It returns the new
+// metadata under meta/. The commit's parent is the chain head
+// refs/vcscore/ops/latest names at snapshot time — re-resolved on
+// every call, never the handle's cached head, so two handles (or
+// processes) on one repository chain onto each other's snapshots
+// instead of forking the chain. The commit is referenced as
+// refs/vcscore/ops/snapshot-<commit-prefix> and
+// refs/vcscore/ops/latest, the latter advanced by a
+// compare-and-swap on the resolved head: if a peer advanced the
+// chain first, the commit is rebuilt on the new head and the swap
+// retried (bounded by maxChainAttempts). It returns the new
 // commit ID. The build is incremental (plan Task 14): an entry
-// whose (size, mtime) pair matches the previous snapshot's manifest
+// whose (size, mtime) pair matches the parent snapshot's manifest
 // reuses that entry's blob SHA without the file being read or
 // re-hashed; only new or changed entries are read and hashed.
 func (s *Store) Snapshot(workspaceDir string, meta map[string]string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	entries, err := walk(workspaceDir)
 	if err != nil {
 		return "", err
 	}
-	prev, err := s.previousManifest()
+	snapMeta, err := snapshotMetaBytes(meta)
 	if err != nil {
 		return "", err
+	}
+	for attempt := 0; attempt < maxChainAttempts; attempt++ {
+		commit, advanced, err := s.snapshotOnce(workspaceDir, entries, snapMeta)
+		if err != nil {
+			return "", err
+		}
+		if advanced {
+			return commit, nil
+		}
+	}
+	return "", fmt.Errorf("snapshot: chain head %s kept moving under contention after %d attempts", latestRef, maxChainAttempts)
+}
+
+// snapshotOnce makes one attempt at extending the chain: it
+// resolves the current head, builds a snapshot commit on it, and
+// tries to advance refs/vcscore/ops/latest to the new commit with
+// a compare-and-swap on the resolved head. advanced is false when
+// the swap lost a race against a peer — the built commit is left
+// orphaned (its per-snapshot ref remains, harmlessly) and the
+// caller retries on the new head, so the manifest the retry
+// reuses is always the manifest of the parent actually used.
+func (s *Store) snapshotOnce(workspaceDir string, entries []entry, snapMeta []byte) (commit string, advanced bool, err error) {
+	head, err := s.resolveChainHead()
+	if err != nil {
+		return "", false, err
+	}
+	prev, err := s.previousManifestOf(head)
+	if err != nil {
+		return "", false, err
 	}
 	for i := range entries {
 		e := &entries[i]
@@ -328,30 +397,26 @@ func (s *Store) Snapshot(workspaceDir string, meta map[string]string) (string, e
 			path := filepath.Join(workspaceDir, filepath.FromSlash(e.rel))
 			b, err := os.ReadFile(path)
 			if err != nil {
-				return "", fmt.Errorf("snapshot: read %s: %w", path, err)
+				return "", false, fmt.Errorf("snapshot: read %s: %w", path, err)
 			}
 			data = b
 		}
 		blob, err := s.git(data, "hash-object", "-w", "--stdin")
 		if err != nil {
-			return "", fmt.Errorf("snapshot: hash %s: %w", e.rel, err)
+			return "", false, fmt.Errorf("snapshot: hash %s: %w", e.rel, err)
 		}
 		e.blob = blob
 	}
 	manifest, err := manifestBytes(entries)
 	if err != nil {
-		return "", err
-	}
-	snapMeta, err := snapshotMetaBytes(meta)
-	if err != nil {
-		return "", err
+		return "", false, err
 	}
 
 	// Assemble the dual tree in a temporary index so no real index
 	// is touched.
 	idxFile, err := os.CreateTemp("", "replay-core-index-*")
 	if err != nil {
-		return "", fmt.Errorf("snapshot: create temp index: %w", err)
+		return "", false, fmt.Errorf("snapshot: create temp index: %w", err)
 	}
 	idxPath := idxFile.Name()
 	_ = idxFile.Close()
@@ -368,7 +433,7 @@ func (s *Store) Snapshot(workspaceDir string, meta map[string]string) (string, e
 	}
 	for _, e := range entries {
 		if err := add(e.mode, e.blob, "workspace/"+e.rel); err != nil {
-			return "", err
+			return "", false, err
 		}
 	}
 	for _, m := range []struct {
@@ -377,32 +442,41 @@ func (s *Store) Snapshot(workspaceDir string, meta map[string]string) (string, e
 	}{{"manifest.json", manifest}, {"snapshot.json", snapMeta}} {
 		blob, err := s.git(m.data, "hash-object", "-w", "--stdin")
 		if err != nil {
-			return "", fmt.Errorf("snapshot: hash meta/%s: %w", m.name, err)
+			return "", false, fmt.Errorf("snapshot: hash meta/%s: %w", m.name, err)
 		}
 		if err := add("100644", blob, "meta/"+m.name); err != nil {
-			return "", err
+			return "", false, err
 		}
 	}
 	tree, err := s.gitEnv(nil, idxEnv, "write-tree")
 	if err != nil {
-		return "", fmt.Errorf("snapshot: write-tree: %w", err)
+		return "", false, fmt.Errorf("snapshot: write-tree: %w", err)
 	}
 
 	commitArgs := []string{"commit-tree", tree}
-	if s.last != "" {
-		commitArgs = append(commitArgs, "-p", s.last)
+	if head != "" {
+		commitArgs = append(commitArgs, "-p", head)
 	}
 	commitArgs = append(commitArgs, "-m", "snapshot")
-	commit, err := s.git(nil, commitArgs...)
+	newCommit, err := s.git(nil, commitArgs...)
 	if err != nil {
-		return "", fmt.Errorf("snapshot: commit-tree: %w", err)
+		return "", false, fmt.Errorf("snapshot: commit-tree: %w", err)
 	}
-	if _, err := s.git(nil, "update-ref", opsRefPrefix+snapshotRefIn+commit[:commitPrefix], commit); err != nil {
-		return "", fmt.Errorf("snapshot: update-ref snapshot: %w", err)
+	if _, err := s.git(nil, "update-ref", opsRefPrefix+snapshotRefIn+newCommit[:commitPrefix], newCommit); err != nil {
+		return "", false, fmt.Errorf("snapshot: update-ref snapshot: %w", err)
 	}
-	if _, err := s.git(nil, "update-ref", latestRef, commit); err != nil {
-		return "", fmt.Errorf("snapshot: update-ref latest: %w", err)
+	// Advance the chain head only if it still names the head this
+	// commit was built on (or still does not exist): the
+	// compare-and-swap that keeps two handles from forking the
+	// chain. Losing the race is not an error — the caller retries
+	// on the new head.
+	expectedOld := head
+	if expectedOld == "" {
+		expectedOld = zeroOID
 	}
-	s.last = commit
-	return commit, nil
+	if _, err := s.git(nil, "update-ref", latestRef, newCommit, expectedOld); err != nil {
+		return "", false, nil
+	}
+	s.last = newCommit
+	return newCommit, true, nil
 }
