@@ -9,9 +9,40 @@ import (
 	"github.com/pratik-saptarshi/replay-core/internal/record"
 )
 
-// GetRecord returns the stored record with the given ID: existence
-// and parse only — witness-chain validation hardens this read path
-// in Task 4. A missing ID returns ErrNotFound.
+// CorruptionError reports a stored record that failed read-time
+// validation: the bytes or witness material in the database do not
+// satisfy the identity law the record's ID claims. A read that
+// fails validation returns this error and never the record.
+type CorruptionError struct {
+	RecordID, Reason string
+}
+
+func (e *CorruptionError) Error() string {
+	return fmt.Sprintf("store: record %s failed validation: %s", e.RecordID, e.Reason)
+}
+
+// recordField returns the value of key in a decoded record object.
+func recordField(rec canonical.Value, key string) (canonical.Value, bool) {
+	for _, p := range rec.Pairs {
+		if p.Key == key {
+			return p.Value, true
+		}
+	}
+	return canonical.Value{}, false
+}
+
+// GetRecord returns the stored record with the given ID, validated
+// against the identity law before it is returned: (1) the stored
+// canonical bytes must decode and re-digest to the record's ID;
+// (2) the row's witness_digest column must equal the record
+// object's witness field; (3) the stored witness body must
+// re-digest via record.WitnessBodyDigest to that same digest and
+// pass record.ValidateWitnessBody. The root witness record is the
+// sole exception to (2)–(3): its witness is the empty sentinel, it
+// has no witness_bodies row, and its WitnessBody is its own body
+// (the root witness fields). Any validation failure returns
+// *CorruptionError, never the record. A missing ID returns
+// ErrNotFound.
 func (s *Store) GetRecord(recordID string) (StoredRecord, error) {
 	var ownerPath, witnessDigest string
 	var ordinal int64
@@ -25,28 +56,85 @@ func (s *Store) GetRecord(recordID string) (StoredRecord, error) {
 	if err != nil {
 		return StoredRecord{}, fmt.Errorf("store: read record %s: %w", recordID, err)
 	}
+
+	// (1) The stored canonical bytes decode and re-digest to the
+	// row's record_id. A byte flip that still parses is
+	// indistinguishable from a different valid record except by
+	// digest — that is the point of this check.
 	rec, err := canonical.DecodeKernel(raw)
 	if err != nil {
-		return StoredRecord{}, fmt.Errorf("store: decode record %s: %w", recordID, err)
+		return StoredRecord{}, &CorruptionError{RecordID: recordID, Reason: fmt.Sprintf("stored bytes do not decode: %v", err)}
+	}
+	digest, err := canonical.DigestKernel(rec)
+	if err != nil {
+		return StoredRecord{}, &CorruptionError{RecordID: recordID, Reason: fmt.Sprintf("stored bytes do not re-digest: %v", err)}
+	}
+	if digest != recordID {
+		return StoredRecord{}, &CorruptionError{RecordID: recordID, Reason: fmt.Sprintf("stored bytes re-digest to %s", digest)}
 	}
 	out := StoredRecord{ID: recordID, OwnerPath: ownerPath, OwnerOrdinal: ordinal, Record: rec}
-	if witnessDigest != "" {
-		var witnessRaw []byte
-		if err := s.db.QueryRow(
-			"SELECT body_bytes FROM witness_bodies WHERE witness_digest = ?",
-			witnessDigest).Scan(&witnessRaw); err != nil {
-			return StoredRecord{}, fmt.Errorf("store: read witness body %s: %w", witnessDigest, err)
+
+	// The root witness record is the sole exception to (2)–(3):
+	// step (1) has already pinned its bytes to the root record ID,
+	// its witness is the empty sentinel, it has no witness_bodies
+	// row, and its WitnessBody is its own body (the root witness
+	// fields).
+	if recordID == record.RootWitnessRecordID() {
+		body, ok := recordField(rec, "body")
+		if !ok {
+			return StoredRecord{}, &CorruptionError{RecordID: recordID, Reason: "root witness record has no body"}
 		}
-		witnessBody, err := canonical.DecodeKernel(witnessRaw)
-		if err != nil {
-			return StoredRecord{}, fmt.Errorf("store: decode witness body %s: %w", witnessDigest, err)
-		}
-		out.WitnessBody = witnessBody
+		out.WitnessBody = body
+		return out, nil
 	}
+
+	// (2) The row's witness_digest column equals the record
+	// object's witness field.
+	witnessField, ok := recordField(rec, "witness")
+	if !ok || witnessField.Kind != canonical.KindString {
+		return StoredRecord{}, &CorruptionError{RecordID: recordID, Reason: "record object has no witness field"}
+	}
+	if witnessDigest == "" {
+		return StoredRecord{}, &CorruptionError{RecordID: recordID, Reason: "row stores an empty witness digest for a non-root record"}
+	}
+	if witnessDigest != witnessField.Str {
+		return StoredRecord{}, &CorruptionError{RecordID: recordID, Reason: fmt.Sprintf("row witness digest %s does not match the record's witness field %s", witnessDigest, witnessField.Str)}
+	}
+
+	// (3) The stored witness body re-digests to that same digest
+	// and passes witness-body validation.
+	var witnessSchemaRef string
+	var witnessRaw []byte
+	err = s.db.QueryRow(
+		"SELECT schema_ref, body_bytes FROM witness_bodies WHERE witness_digest = ?",
+		witnessDigest).Scan(&witnessSchemaRef, &witnessRaw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return StoredRecord{}, &CorruptionError{RecordID: recordID, Reason: fmt.Sprintf("witness body %s is not stored", witnessDigest)}
+	}
+	if err != nil {
+		return StoredRecord{}, fmt.Errorf("store: read witness body %s: %w", witnessDigest, err)
+	}
+	witnessBody, err := canonical.DecodeKernel(witnessRaw)
+	if err != nil {
+		return StoredRecord{}, &CorruptionError{RecordID: recordID, Reason: fmt.Sprintf("stored witness body %s does not decode: %v", witnessDigest, err)}
+	}
+	if err := record.ValidateWitnessBody(witnessBody); err != nil {
+		return StoredRecord{}, &CorruptionError{RecordID: recordID, Reason: fmt.Sprintf("stored witness body %s is invalid: %v", witnessDigest, err)}
+	}
+	recomputed, err := record.WitnessBodyDigest(witnessSchemaRef, witnessBody)
+	if err != nil {
+		return StoredRecord{}, &CorruptionError{RecordID: recordID, Reason: fmt.Sprintf("stored witness body %s does not re-digest: %v", witnessDigest, err)}
+	}
+	if recomputed != witnessDigest {
+		return StoredRecord{}, &CorruptionError{RecordID: recordID, Reason: fmt.Sprintf("stored witness body re-digests to %s, not %s", recomputed, witnessDigest)}
+	}
+	out.WitnessBody = witnessBody
 	return out, nil
 }
 
 // PathRecords returns every record on ownerPath in ordinal order.
+// Each record goes through GetRecord, so reads are validated the
+// same way.
 func (s *Store) PathRecords(ownerPath string) ([]StoredRecord, error) {
 	rows, err := s.db.Query(
 		"SELECT record_id FROM path_entries WHERE owner_path = ? ORDER BY owner_ordinal ASC",

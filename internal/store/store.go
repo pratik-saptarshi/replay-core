@@ -53,9 +53,10 @@ type Receipt struct {
 }
 
 // StoredRecord is a record read back from the store: its identity,
-// placement, the full record object, and its witness fields object
-// (the zero Value for the root witness record, which carries the
-// empty witness sentinel and has no witness body).
+// placement, the full record object, and its witness fields object.
+// The root witness record carries the empty witness sentinel and
+// has no witness body; its WitnessBody is its own body (the root
+// witness fields).
 type StoredRecord struct {
 	ID           string
 	OwnerPath    string
