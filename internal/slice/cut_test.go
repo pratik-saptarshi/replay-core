@@ -324,19 +324,3 @@ func TestResolveCutDeepChain(t *testing.T) { // Review Focus 5
 		t.Errorf("Digest: %v", err)
 	}
 }
-
-func TestResolveCutRejectsNonEmptyFilter(t *testing.T) {
-	// Task 7 honesty rule: until Task 8 implements mode filters, a
-	// non-empty filter is rejected outright — silently treating it
-	// as nil would be a false claim. Task 8 removes this test when
-	// it removes the rejection.
-	s := openTemp(t)
-	r1 := appendFact(t, s, "runs/a", `{"n":"r1"}`, []string{record.RootWitnessRecordID()})
-	cutID, err := slice.PublishCut(s, "runs/a", r1)
-	if err != nil {
-		t.Fatalf("PublishCut: %v", err)
-	}
-	if _, err := slice.ResolveCut(s, cutID, []string{record.ModeCapture}); err == nil {
-		t.Fatal("ResolveCut with a non-empty mode filter: got nil error, want rejection until Task 8")
-	}
-}

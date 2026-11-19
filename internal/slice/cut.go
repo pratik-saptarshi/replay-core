@@ -139,6 +139,10 @@ func ReadCut(s *store.Store, cutID string) (Cut, error) {
 	return Cut{OwnerPath: ownerPath.Str, ThroughFactID: throughFactID.Str, ThroughOrdinal: ordinal}, nil
 }
 
+// ErrUnknownMode is returned by ResolveCut when a mode filter
+// names a mode other than capture or declaration.
+var ErrUnknownMode = errors.New("slice: unknown mode in filter")
+
 // ResolveCut resolves the cut with the given ID to its Slice: the
 // target path's records with ordinal ≤ the cut's through-ordinal,
 // closed transitively over caused_by — cross-path ancestors are
@@ -146,12 +150,18 @@ func ReadCut(s *store.Store, cutID string) (Cut, error) {
 // (OwnerPath, OwnerOrdinal, ID), so the Slice and its Digest are
 // stable across resolutions.
 //
-// Mode filters are Task 8: in this task a nil filter admits all,
-// and a non-empty filter is rejected with a descriptive error
-// rather than silently treated as nil.
+// A mode filter is applied to the closed Slice, never to the
+// closure input (the mode-filter law): the result is the full
+// causally closed Slice minus the records whose mode is not in the
+// filter, except milestone and cut records, which are exempt from
+// mode filtering (Decision 4(b)) and always retained; edges are
+// restricted to the retained records. An empty filter admits all.
+// A filter naming a mode other than capture or declaration fails
+// with ErrUnknownMode.
 func ResolveCut(s *store.Store, cutID string, modeFilter []string) (Slice, error) {
-	if len(modeFilter) > 0 {
-		return Slice{}, fmt.Errorf("slice: mode filter %v is not implemented yet (Task 8)", modeFilter)
+	admit, err := modeSet(modeFilter)
+	if err != nil {
+		return Slice{}, err
 	}
 	cut, err := ReadCut(s, cutID)
 	if err != nil {
@@ -165,12 +175,70 @@ func ResolveCut(s *store.Store, cutID string, modeFilter []string) (Slice, error
 	if err != nil {
 		return Slice{}, err
 	}
+	if admit != nil {
+		ordered, edges, err = applyModeFilter(ordered, edges, admit)
+		if err != nil {
+			return Slice{}, err
+		}
+	}
 	return Slice{
 		CutID:    cutID,
 		Records:  ordered,
 		Edges:    edges,
 		Frontier: cut.ThroughFactID,
 	}, nil
+}
+
+// modeSet validates a ResolveCut mode filter and returns the set
+// of admitted modes. A nil result means the filter is empty and
+// admits all; any entry that is not a Phase 0 mode fails with
+// ErrUnknownMode.
+func modeSet(modeFilter []string) (map[string]bool, error) {
+	if len(modeFilter) == 0 {
+		return nil, nil
+	}
+	admit := make(map[string]bool, len(modeFilter))
+	for _, mode := range modeFilter {
+		if mode != record.ModeCapture && mode != record.ModeDeclaration {
+			return nil, fmt.Errorf("%w: %q", ErrUnknownMode, mode)
+		}
+		admit[mode] = true
+	}
+	return admit, nil
+}
+
+// applyModeFilter drops the records whose mode is not in admit —
+// except records under store.MilestoneSchemaRef or
+// store.CutSchemaRef, which are exempt from mode filtering
+// (Decision 4(b)): a filter that could drop a boundary marker
+// would silently move epoch boundaries. Edges are restricted to
+// the retained records. Filtering the ordered closure preserves
+// the relative causal order of what remains, so the filtered
+// Slice is exactly the filter applied to the unfiltered Slice.
+func applyModeFilter(ordered []store.StoredRecord, edges [][2]string, admit map[string]bool) ([]store.StoredRecord, [][2]string, error) {
+	retained := make(map[string]bool, len(ordered))
+	kept := make([]store.StoredRecord, 0, len(ordered))
+	for _, rec := range ordered {
+		mode, ok := fieldOf(rec.Record, "mode")
+		if !ok || mode.Kind != canonical.KindString {
+			return nil, nil, fmt.Errorf("slice: record %s has no mode string", rec.ID)
+		}
+		schemaRef, ok := fieldOf(rec.Record, "schema_ref")
+		if !ok || schemaRef.Kind != canonical.KindString {
+			return nil, nil, fmt.Errorf("slice: record %s has no schema_ref string", rec.ID)
+		}
+		if admit[mode.Str] || schemaRef.Str == store.MilestoneSchemaRef || schemaRef.Str == store.CutSchemaRef {
+			retained[rec.ID] = true
+			kept = append(kept, rec)
+		}
+	}
+	var keptEdges [][2]string
+	for _, e := range edges {
+		if retained[e[0]] && retained[e[1]] {
+			keptEdges = append(keptEdges, e)
+		}
+	}
+	return kept, keptEdges, nil
 }
 
 // closure computes a cut's record set iteratively (explicit stack —
