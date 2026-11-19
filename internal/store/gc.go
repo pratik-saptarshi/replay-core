@@ -4,6 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
+
+	"github.com/pratik-saptarshi/replay-core/internal/canonical"
 )
 
 // GarbageReport summarizes one CollectGarbage run: how many
@@ -12,14 +15,27 @@ type GarbageReport struct {
 	Collected, Kept int
 }
 
-// CollectGarbage removes every record that is unreachable — via
-// caused_by closure — from the retention roots (plan Decision
-// 4(c)): every path's frontier tail, every record under
-// CutSchemaRef, and every record under MilestoneSchemaRef. This is
-// the store's single deletion mechanism and the one exception to
-// the append-only rule; its guarantee is the contrapositive of the
-// root definition — a record a frontier, a published cut, or a
-// milestone can reach is never removed (AC-F2-7).
+// CollectGarbage removes every record that is unreachable from
+// the retention roots (plan Decision 4(c)): every path's frontier
+// tail, every record under CutSchemaRef, and every record under
+// MilestoneSchemaRef. Reachability is defined per root class by
+// what the root addresses: a frontier tail reaches its caused_by
+// closure; a milestone reaches its caused_by closure; a
+// published cut reaches every record on its owner path with
+// ordinal at most the cut's through_owner_ordinal, plus that
+// set's closure. A cut differs from the other classes because
+// it is a published immutable address whose resolution is
+// prefix-defined — ResolveCut returns the whole addressed set
+// and publishes its digest, so the set must survive or the
+// address mutates. A milestone publishes no such address:
+// EpochSlice is a derived view over current state, so a
+// milestone retains by closure alone and non-causal records
+// inside an epoch window remain collectable. This is the
+// store's single deletion mechanism
+// and the one exception to the append-only rule; its guarantee
+// is the contrapositive of the root definition — a record a
+// frontier, a published cut, or a milestone can reach is never
+// removed (AC-F2-7).
 //
 // The whole pass — loading the graph, computing the kept set, and
 // deleting the complement — runs inside one BEGIN IMMEDIATE
@@ -88,29 +104,83 @@ func (s *Store) CollectGarbage() (GarbageReport, error) {
 	}
 	rows.Close()
 
-	roots := make(map[string]bool)
+	// Retention seeds, per root class (controller ruling on the
+	// Codex P1, PR #2): retention covers what a root's own
+	// resolution semantics return, where the root is a published
+	// immutable address. A frontier tail addresses its causal
+	// ancestry, and a milestone — which publishes no address —
+	// likewise retains only its causal ancestry. A published
+	// cut addresses an ordinal prefix of its path: ResolveCut
+	// returns every record in the prefix, not just the
+	// through-fact's ancestors, and publishes the set's digest,
+	// so the cut's whole addressed set is seeded. The kept set
+	// is the caused_by closure of all the seeds.
+	seeds := make(map[string]bool)
 	frontierIDs, err := gcScanIDs(ctx, conn, "frontiers", "SELECT tail_record_id FROM frontiers")
 	if err != nil {
 		return GarbageReport{}, err
 	}
 	for _, id := range frontierIDs {
-		roots[id] = true
+		seeds[id] = true
 	}
-	rootSchemaIDs, err := gcScanIDs(ctx, conn, "root-schema records",
-		"SELECT record_id FROM records WHERE schema_ref IN (?, ?)", CutSchemaRef, MilestoneSchemaRef)
+
+	cutRows, err := conn.QueryContext(ctx,
+		"SELECT record_id, canonical_bytes FROM records WHERE schema_ref = ?", CutSchemaRef)
+	if err != nil {
+		return GarbageReport{}, fmt.Errorf("store: gc list cuts: %w", err)
+	}
+	var cutPrefixes []struct {
+		ownerPath      string
+		throughOrdinal int64
+	}
+	for cutRows.Next() {
+		var id string
+		var raw []byte
+		if err := cutRows.Scan(&id, &raw); err != nil {
+			cutRows.Close()
+			return GarbageReport{}, fmt.Errorf("store: gc scan cut: %w", err)
+		}
+		ownerPath, throughOrdinal, err := cutAddress(id, raw)
+		if err != nil {
+			cutRows.Close()
+			return GarbageReport{}, err
+		}
+		seeds[id] = true
+		cutPrefixes = append(cutPrefixes, struct {
+			ownerPath      string
+			throughOrdinal int64
+		}{ownerPath, throughOrdinal})
+	}
+	if err := cutRows.Err(); err != nil {
+		cutRows.Close()
+		return GarbageReport{}, fmt.Errorf("store: gc list cuts: %w", err)
+	}
+	cutRows.Close()
+	for _, p := range cutPrefixes {
+		prefixIDs, err := gcPrefixIDs(ctx, conn, p.ownerPath, p.throughOrdinal)
+		if err != nil {
+			return GarbageReport{}, err
+		}
+		for _, id := range prefixIDs {
+			seeds[id] = true
+		}
+	}
+
+	milestoneIDs, err := gcScanIDs(ctx, conn, "milestones",
+		"SELECT record_id FROM records WHERE schema_ref = ?", MilestoneSchemaRef)
 	if err != nil {
 		return GarbageReport{}, err
 	}
-	for _, id := range rootSchemaIDs {
-		roots[id] = true
+	for _, id := range milestoneIDs {
+		seeds[id] = true
 	}
 
-	// Kept = the caused_by closure of the roots, walked
+	// Kept = the caused_by closure of the seeds, walked
 	// iteratively. A kept record's causes are kept by construction,
 	// so no surviving record can cite a collected one.
 	kept := make(map[string]bool)
-	stack := make([]string, 0, len(roots))
-	for id := range roots {
+	stack := make([]string, 0, len(seeds))
+	for id := range seeds {
 		if all[id] && !kept[id] {
 			kept[id] = true
 			stack = append(stack, id)
@@ -216,6 +286,46 @@ func (s *Store) CollectGarbage() (GarbageReport, error) {
 	}
 	committed = true
 	return report, nil
+}
+
+// gcPrefixIDs returns the IDs of every record on ownerPath with
+// ordinal at most throughOrdinal — one root class's addressed
+// prefix set.
+func gcPrefixIDs(ctx context.Context, conn *sql.Conn, ownerPath string, throughOrdinal int64) ([]string, error) {
+	return gcScanIDs(ctx, conn, "path prefix records",
+		"SELECT record_id FROM path_entries WHERE owner_path = ? AND owner_ordinal <= ?",
+		ownerPath, throughOrdinal)
+}
+
+// cutAddress decodes a cut record's canonical bytes and returns
+// the (owner_path, through_owner_ordinal) its body names — the
+// prefix the cut addresses, extracted the way slice.ReadCut
+// extracts it. The store is the lowest layer and cannot import
+// slice, so the field walk is repeated here over the same body
+// shape. A cut whose body does not parse fails the whole pass:
+// GC must not guess at what a published cut retains.
+func cutAddress(recordID string, raw []byte) (string, int64, error) {
+	recObj, err := canonical.DecodeKernel(raw)
+	if err != nil {
+		return "", 0, fmt.Errorf("store: gc decode cut %s: %w", recordID, err)
+	}
+	body, ok := recordField(recObj, "body")
+	if !ok || body.Kind != canonical.KindObject {
+		return "", 0, fmt.Errorf("store: gc cut %s has no body object", recordID)
+	}
+	ownerPath, ok := recordField(body, "owner_path")
+	if !ok || ownerPath.Kind != canonical.KindString {
+		return "", 0, fmt.Errorf("store: gc cut %s body has no owner_path string", recordID)
+	}
+	ordinalValue, ok := recordField(body, "through_owner_ordinal")
+	if !ok || ordinalValue.Kind != canonical.KindInt {
+		return "", 0, fmt.Errorf("store: gc cut %s body has no through_owner_ordinal integer", recordID)
+	}
+	ordinal, err := strconv.ParseInt(ordinalValue.Int, 10, 64)
+	if err != nil {
+		return "", 0, fmt.Errorf("store: gc cut %s through_owner_ordinal: %w", recordID, err)
+	}
+	return ownerPath.Str, ordinal, nil
 }
 
 // gcScanIDs runs a single-column query on the GC connection and
