@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 )
 
@@ -20,43 +21,56 @@ type GarbageReport struct {
 // root definition — a record a frontier, a published cut, or a
 // milestone can reach is never removed (AC-F2-7).
 //
-// Collection removes, in one BEGIN IMMEDIATE transaction, the
-// collected records' rows, their causal edges and path entries,
-// witness bodies left unreferenced by any surviving record, and
-// intent rows whose every receipted record was collected.
-// Surviving records are untouched: their ordinals never change
-// (no renumbering), and frontiers — being roots — are never
-// collected, so no frontier row moves.
+// The whole pass — loading the graph, computing the kept set, and
+// deleting the complement — runs inside one BEGIN IMMEDIATE
+// transaction on a dedicated connection, so the kept set is
+// computed on the same snapshot the deletes apply to. An append
+// either committed before the pass began (and is part of the
+// graph it loads) or waits for the write lock and then validates
+// its citations against the post-collection state; no append can
+// commit in between and cite a record this pass deletes. (The
+// pre-fix shape loaded the graph through the connection pool and
+// took the write lock only for the deletes, which left exactly
+// that window — Codex review of PR #2, 2026-11-19.)
+//
+// Collection removes the collected records' rows, their causal
+// edges and path entries, witness bodies left unreferenced by any
+// surviving record, and intent rows whose every receipted record
+// was collected. Surviving records are untouched: their ordinals
+// never change (no renumbering), and frontiers — being roots —
+// are never collected, so no frontier row moves.
 func (s *Store) CollectGarbage() (GarbageReport, error) {
 	ctx := context.Background()
 
-	// Load the graph: every record ID, every causal edge, and the
-	// retention roots. The kept set is computed iteratively in Go
-	// (explicit stack — the same iterative discipline as Task 7's
-	// closure), then the complement is deleted by explicit ID, so
-	// a record appended concurrently after this load is never in
-	// the deletion set.
-	all := make(map[string]bool)
-	rows, err := s.db.QueryContext(ctx, "SELECT record_id FROM records")
+	conn, err := s.db.Conn(ctx)
 	if err != nil {
-		return GarbageReport{}, fmt.Errorf("store: gc list records: %w", err)
+		return GarbageReport{}, fmt.Errorf("store: gc acquire connection: %w", err)
 	}
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return GarbageReport{}, fmt.Errorf("store: gc scan record: %w", err)
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return GarbageReport{}, fmt.Errorf("store: gc begin immediate: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
 		}
+	}()
+
+	// Load the graph: every record ID, every causal edge, and the
+	// retention roots — all on the GC connection, inside the
+	// transaction, so the load is the state the deletes apply to.
+	all := make(map[string]bool)
+	recordIDs, err := gcScanIDs(ctx, conn, "records", "SELECT record_id FROM records")
+	if err != nil {
+		return GarbageReport{}, err
+	}
+	for _, id := range recordIDs {
 		all[id] = true
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return GarbageReport{}, fmt.Errorf("store: gc list records: %w", err)
-	}
-	rows.Close()
 
 	causes := make(map[string][]string)
-	rows, err = s.db.QueryContext(ctx, "SELECT record_id, caused_by FROM record_edges")
+	rows, err := conn.QueryContext(ctx, "SELECT record_id, caused_by FROM record_edges")
 	if err != nil {
 		return GarbageReport{}, fmt.Errorf("store: gc list edges: %w", err)
 	}
@@ -75,41 +89,21 @@ func (s *Store) CollectGarbage() (GarbageReport, error) {
 	rows.Close()
 
 	roots := make(map[string]bool)
-	rows, err = s.db.QueryContext(ctx, "SELECT tail_record_id FROM frontiers")
+	frontierIDs, err := gcScanIDs(ctx, conn, "frontiers", "SELECT tail_record_id FROM frontiers")
 	if err != nil {
-		return GarbageReport{}, fmt.Errorf("store: gc list frontiers: %w", err)
+		return GarbageReport{}, err
 	}
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return GarbageReport{}, fmt.Errorf("store: gc scan frontier: %w", err)
-		}
+	for _, id := range frontierIDs {
 		roots[id] = true
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return GarbageReport{}, fmt.Errorf("store: gc list frontiers: %w", err)
-	}
-	rows.Close()
-	rows, err = s.db.QueryContext(ctx,
+	rootSchemaIDs, err := gcScanIDs(ctx, conn, "root-schema records",
 		"SELECT record_id FROM records WHERE schema_ref IN (?, ?)", CutSchemaRef, MilestoneSchemaRef)
 	if err != nil {
-		return GarbageReport{}, fmt.Errorf("store: gc list root-schema records: %w", err)
+		return GarbageReport{}, err
 	}
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return GarbageReport{}, fmt.Errorf("store: gc scan root-schema record: %w", err)
-		}
+	for _, id := range rootSchemaIDs {
 		roots[id] = true
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return GarbageReport{}, fmt.Errorf("store: gc list root-schema records: %w", err)
-	}
-	rows.Close()
 
 	// Kept = the caused_by closure of the roots, walked
 	// iteratively. A kept record's causes are kept by construction,
@@ -140,6 +134,13 @@ func (s *Store) CollectGarbage() (GarbageReport, error) {
 	}
 	report := GarbageReport{Collected: len(collected), Kept: len(all) - len(collected)}
 	if len(collected) == 0 {
+		// Nothing to delete — and, no record having been deleted,
+		// no witness body or intent row can have become
+		// collectable either. Commit the read-only pass.
+		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+			return GarbageReport{}, fmt.Errorf("store: gc commit: %w", err)
+		}
+		committed = true
 		return report, nil
 	}
 	collectedSet := make(map[string]bool, len(collected))
@@ -151,7 +152,7 @@ func (s *Store) CollectGarbage() (GarbageReport, error) {
 	// collected with them; an intent with any surviving receipted
 	// record stays, so its replay/conflict behavior is unchanged.
 	var doomedIntents []string
-	rows, err = s.db.QueryContext(ctx, "SELECT intent_id, receipts FROM append_intents")
+	rows, err = conn.QueryContext(ctx, "SELECT intent_id, receipts FROM append_intents")
 	if err != nil {
 		return GarbageReport{}, fmt.Errorf("store: gc list intents: %w", err)
 	}
@@ -186,22 +187,7 @@ func (s *Store) CollectGarbage() (GarbageReport, error) {
 	}
 	rows.Close()
 
-	// Delete the complement in a single BEGIN IMMEDIATE
-	// transaction, on a dedicated connection like AppendBatch.
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
-		return GarbageReport{}, fmt.Errorf("store: gc acquire connection: %w", err)
-	}
-	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
-		return GarbageReport{}, fmt.Errorf("store: gc begin immediate: %w", err)
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_, _ = conn.ExecContext(ctx, "ROLLBACK")
-		}
-	}()
+	// Delete the complement, still inside the same transaction.
 	for _, id := range collected {
 		if _, err := conn.ExecContext(ctx, "DELETE FROM record_edges WHERE record_id = ? OR caused_by = ?", id, id); err != nil {
 			return GarbageReport{}, fmt.Errorf("store: gc delete edges of %s: %w", id, err)
@@ -230,4 +216,27 @@ func (s *Store) CollectGarbage() (GarbageReport, error) {
 	}
 	committed = true
 	return report, nil
+}
+
+// gcScanIDs runs a single-column query on the GC connection and
+// returns the column's values. what names the query's subject
+// for error messages.
+func gcScanIDs(ctx context.Context, conn *sql.Conn, what, query string, args ...any) ([]string, error) {
+	rows, err := conn.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: gc list %s: %w", what, err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("store: gc scan %s: %w", what, err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: gc list %s: %w", what, err)
+	}
+	return ids, nil
 }
