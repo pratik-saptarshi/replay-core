@@ -80,7 +80,13 @@ func PublishCut(s *store.Store, ownerPath, throughFactID string) (string, error)
 
 // ReadCut reads and decodes the cut record with the given ID. The
 // record must carry store.CutSchemaRef; anything else is an error,
-// never a silently misread cut.
+// never a silently misread cut. The body's placement claims are
+// cross-checked against the through record's stored placement
+// before the cut is returned: MintCut copied owner_path and
+// through_owner_ordinal from that record at publish time, so a
+// disagreement means the cut no longer names the slice it claims
+// to name, and reading it must fail rather than resolve a slice
+// over the wrong prefix (issue #6).
 func ReadCut(s *store.Store, cutID string) (Cut, error) {
 	rec, err := s.GetRecord(cutID)
 	if err != nil {
@@ -110,7 +116,18 @@ func ReadCut(s *store.Store, cutID string) (Cut, error) {
 	if err != nil {
 		return Cut{}, fmt.Errorf("slice: cut %s through_owner_ordinal: %w", cutID, err)
 	}
-	return Cut{OwnerPath: ownerPath.Str, ThroughFactID: throughFactID.Str, ThroughOrdinal: ordinal}, nil
+	cut := Cut{OwnerPath: ownerPath.Str, ThroughFactID: throughFactID.Str, ThroughOrdinal: ordinal}
+	through, err := s.GetRecord(cut.ThroughFactID)
+	if err != nil {
+		return Cut{}, fmt.Errorf("slice: read cut %s: through-fact %s: %w", cutID, cut.ThroughFactID, err)
+	}
+	if through.OwnerPath != cut.OwnerPath {
+		return Cut{}, fmt.Errorf("slice: cut %s body claims owner path %q, but through-fact %s is stored on %q", cutID, cut.OwnerPath, cut.ThroughFactID, through.OwnerPath)
+	}
+	if through.OwnerOrdinal != cut.ThroughOrdinal {
+		return Cut{}, fmt.Errorf("slice: cut %s body claims through ordinal %d, but through-fact %s is stored at ordinal %d", cutID, cut.ThroughOrdinal, cut.ThroughFactID, through.OwnerOrdinal)
+	}
+	return cut, nil
 }
 
 // ErrUnknownMode is returned by ResolveCut when a mode filter
