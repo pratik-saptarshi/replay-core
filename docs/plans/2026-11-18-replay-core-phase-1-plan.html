@@ -219,7 +219,7 @@ CREATE TABLE IF NOT EXISTS owner_ordinals (
 <p><b>Interfaces:</b> Consumes — Task 1's <code>AppendBatch</code> and the <code>append_intents</code> table. Produces —</p>
 <pre>type IntentConflictError struct { IntentID, ExistingDigest, IncomingDigest string }
 func (e *IntentConflictError) Error() string // "store: append intent %q already recorded with a different batch digest"</pre>
-<p>Semantics: same intent ID + same batch digest → the stored receipts, nothing appended; same intent ID + different batch digest → <code>*IntentConflictError</code>, nothing appended.</p>
+<p>Semantics: same intent ID + same batch digest → the stored receipts, nothing appended; same intent ID + different batch digest → <code>*IntentConflictError</code>, nothing appended. <b>Wave 3 clarification (panel ADV-2 disposition, 2026-11-19):</b> an intent ID belongs to the owner path that first used it, globally — reuse of the same intent ID on a different owner path is rejected with <code>ErrIntentPathMismatch</code>, checked before the digest comparison, never replayed and never conflict-checked; per-path intent scoping remains an open Phase 2 design question (issue #3).</p>
 <ul>
 <li>[ ] <b>Step 1 — Failing tests:</b>
 <pre>func TestAppendIntentReplayReturnsPriorReceipt(t *testing.T) { // AC-F2-2, first leg
