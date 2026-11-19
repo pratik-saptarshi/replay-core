@@ -247,7 +247,11 @@ func TestEncodeCorpusCommonsErrorCases(t *testing.T) {
 				} else if !strings.Contains(err.Error(), *c.ExpectError) {
 					t.Fatalf("error %q does not contain %q", err, *c.ExpectError)
 				}
-			case "error/duplicate_key":
+			case "error/duplicate_key", "error/non_canonical_bytes":
+				// Both are canonical_value_from_bytes cases: the strict
+				// decoder (Task 5) must reject the payload — duplicate
+				// keys at parse time, unsorted keys at the byte-equality
+				// check — with the corpus's error wording.
 				var in struct {
 					PayloadB64 string `json:"payload_b64"`
 				}
@@ -258,16 +262,13 @@ func TestEncodeCorpusCommonsErrorCases(t *testing.T) {
 				if err != nil {
 					t.Fatalf("decode payload_b64: %v", err)
 				}
-				body := strings.TrimPrefix(string(payload), "commons.canonical.v1\n")
-				if _, err := canonical.FromJSON([]byte(body)); err == nil {
-					t.Fatal("FromJSON accepted duplicate keys from corpus payload")
+				if _, err := canonical.DecodeCommons(payload); err == nil {
+					t.Fatalf("DecodeCommons accepted corpus payload for %s", c.Name)
 				} else if !strings.Contains(err.Error(), *c.ExpectError) {
 					t.Fatalf("error %q does not contain %q", err, *c.ExpectError)
 				}
 			default:
-				// error/non_canonical_bytes needs a strict canonical-bytes
-				// decoder, which is not a Task 2 interface.
-				t.Skipf("case %s is outside Task 2's interfaces", c.Name)
+				t.Fatalf("unhandled commons error case %s", c.Name)
 			}
 		})
 	}

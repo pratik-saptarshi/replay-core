@@ -1,6 +1,7 @@
 package canonical_test
 
 import (
+	"errors"
 	"math"
 	"strconv"
 	"strings"
@@ -72,8 +73,16 @@ func TestNumberFormatFloatBoundaries(t *testing.T) {
 
 func TestNumberFormatFloatNonFinite(t *testing.T) {
 	for _, f := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
-		if _, err := canonical.FormatFloat(f); err == nil {
+		_, err := canonical.FormatFloat(f)
+		if err == nil {
 			t.Errorf("FormatFloat(%v) accepted a non-finite float", f)
+			continue
+		}
+		// The rejection must be the typed *NonFiniteError, so callers
+		// can match it with errors.As rather than matching text.
+		var nfErr *canonical.NonFiniteError
+		if !errors.As(err, &nfErr) {
+			t.Errorf("FormatFloat(%v) error = %T %v, want *canonical.NonFiniteError", f, err, err)
 		}
 	}
 }

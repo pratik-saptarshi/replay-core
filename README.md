@@ -14,6 +14,11 @@ Claims discipline: every capability statement in these docs cites the test
 that proves it. No unverified performance or cache-reuse numbers.
 
 Status: Phase 0 — canonical-digest law + conformance fixtures (no runtime).
+The canonical codec (`internal/canonical`) and the record/witness API
+(`internal/record`) pass every case in the committed conformance corpus
+with zero skipped cases; `scripts/check-phase0.sh` is the Phase 0 gate
+(gofmt, vet, the full test suite, corpus integrity against the manifest,
+and the named golden digests).
 Plan: `docs/plans/2026-11-18-replay-core-phase-0-plan.html`;
 semantics: `docs/replay-semantics.html`;
 conformance corpus: `testdata/corpus/` (see its README).

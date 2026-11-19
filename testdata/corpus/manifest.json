@@ -2,6 +2,11 @@
  "abi_version": "replaycore.kernel.abi.v0",
  "canonical_version": "replaycore.kernel.canonical.v1",
  "corpus_version": 2,
+ "file_hashes": {
+  "commons_v1.json": "1cc0369a9dac8b84f69a74b05e4869f56f172c02cb9e934ae2a06fadb6ad3b6f",
+  "kernel_v1.json": "191cecec046c4b479940e969dd4472c70f41e3085391cfdd743ba33b14151c05",
+  "numbers.json": "0367d9c950c3e73b6aba132c34ee0186a20e3fb77b6e697f189b93e10b6a5968"
+ },
  "note": "Normative conformance vectors for replay-core's canonical-digest law. Digests are computed under the replaycore.kernel.canonical.v1 domain-separation prefix; the law itself (key sorting by code point, compact separators, profile-specific escaping, number rendering) is specified in docs/plans/2026-11-18-replay-core-phase-0-plan.html.",
  "sources": [
   "golden record and witness vectors (canonical law conformance suite)",
