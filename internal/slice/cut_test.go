@@ -185,6 +185,42 @@ func TestPublishCutResolvesCausalClosure(t *testing.T) { // AC-F3-1
 	}
 }
 
+func TestPublishCutRejectsCrossPathThroughFact(t *testing.T) {
+	// The cut body's through_owner_ordinal is the through-fact's
+	// ordinal on its own owner path, and ordinals are per-owner
+	// (AC-F2-4): a through-fact from another path would transplant
+	// a foreign ordinal into this path's cut, and ResolveCut would
+	// seed this path's prefix at a meaningless position while
+	// claiming a frontier outside the slice. Publication must
+	// reject it.
+	s := openTemp(t)
+	rootID := record.RootWitnessRecordID()
+	r1 := appendFact(t, s, "runs/a", `{"n":"r1"}`, []string{rootID})
+	r2 := appendFact(t, s, "runs/a", `{"n":"r2"}`, []string{r1})
+	r3 := appendFact(t, s, "runs/a", `{"n":"r3"}`, []string{r2})
+	// A record on runs/b as well, so runs/b is a real path whose
+	// own numbering differs from runs/a's.
+	appendFact(t, s, "runs/b", `{"n":"x1"}`, []string{r1})
+
+	if _, err := slice.PublishCut(s, "runs/b", r3); err == nil {
+		t.Fatal("PublishCut(runs/b, r3-on-runs/a): got nil error, want cross-path rejection")
+	}
+
+	// The same through-fact on its own path still publishes and
+	// resolves.
+	cutID, err := slice.PublishCut(s, "runs/a", r3)
+	if err != nil {
+		t.Fatalf("PublishCut(runs/a, r3): %v", err)
+	}
+	sl, err := slice.ResolveCut(s, cutID, nil)
+	if err != nil {
+		t.Fatalf("ResolveCut: %v", err)
+	}
+	if sl.Frontier != r3 {
+		t.Errorf("Frontier = %q, want the through-fact %q", sl.Frontier, r3)
+	}
+}
+
 func TestResolvedSliceImmutable(t *testing.T) { // AC-F3-2
 	s := openTemp(t)
 	rootID := record.RootWitnessRecordID()

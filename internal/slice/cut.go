@@ -65,10 +65,18 @@ func causedByOf(rec canonical.Value) ([]string, error) {
 // through-fact's stored record, caused_by = [throughFactID], root
 // witness body as witness (plan Decision 4(a)). A published cut is
 // a retention root (plan Decision 4(c)).
+//
+// The through-fact must live on ownerPath: the body's
+// through_owner_ordinal is that fact's ordinal, and ordinals are
+// per-owner (AC-F2-4), so a through-fact from another path would
+// transplant a foreign ordinal into this path's cut.
 func PublishCut(s *store.Store, ownerPath, throughFactID string) (string, error) {
 	through, err := s.GetRecord(throughFactID)
 	if err != nil {
 		return "", fmt.Errorf("slice: publish cut on %q: %w", ownerPath, err)
+	}
+	if through.OwnerPath != ownerPath {
+		return "", fmt.Errorf("slice: publish cut on %q: through-fact %s is on owner path %q, not %q", ownerPath, throughFactID, through.OwnerPath, ownerPath)
 	}
 	fields, ok := rootFields()
 	if !ok {
