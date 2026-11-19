@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 	"strconv"
 
 	"github.com/pratik-saptarshi/replay-core/internal/canonical"
@@ -30,7 +31,11 @@ type GarbageReport struct {
 // address mutates. A milestone publishes no such address:
 // EpochSlice is a derived view over current state, so a
 // milestone retains by closure alone and non-causal records
-// inside an epoch window remain collectable. This is the
+// inside an epoch window remain collectable. Which records
+// belong to the cut and milestone classes is read from the
+// records' canonical bytes, never the records.schema_ref
+// column: the column is a denormalized copy, and a tampered
+// cell must not change the outcome (issue #5). This is the
 // store's single deletion mechanism
 // and the one exception to the append-only rule; its guarantee
 // is the contrapositive of the root definition — a record a
@@ -76,14 +81,55 @@ func (s *Store) CollectGarbage() (GarbageReport, error) {
 	// Load the graph: every record ID, every causal edge, and the
 	// retention roots — all on the GC connection, inside the
 	// transaction, so the load is the state the deletes apply to.
+	//
+	// Root classification — which records are cuts, which are
+	// milestones — is derived from each record's canonical
+	// bytes, never from the records.schema_ref column (issue
+	// #5): the column is a denormalized copy of the record's own
+	// schema_ref field, and a tampered cell must not change what
+	// GC retains. The bytes are the identity law's ground truth —
+	// GetRecord re-digests them on every read — so they are what
+	// GC classifies by. A record whose bytes do not decode, or
+	// carry no schema_ref string, fails the pass: GC is the
+	// store's one destructive operation and must not guess at
+	// what a record is.
 	all := make(map[string]bool)
-	recordIDs, err := gcScanIDs(ctx, conn, "records", "SELECT record_id FROM records")
+	cutBodies := make(map[string][]byte)
+	var milestoneIDs []string
+	recRows, err := conn.QueryContext(ctx, "SELECT record_id, canonical_bytes FROM records")
 	if err != nil {
-		return GarbageReport{}, err
+		return GarbageReport{}, fmt.Errorf("store: gc list records: %w", err)
 	}
-	for _, id := range recordIDs {
+	for recRows.Next() {
+		var id string
+		var raw []byte
+		if err := recRows.Scan(&id, &raw); err != nil {
+			recRows.Close()
+			return GarbageReport{}, fmt.Errorf("store: gc scan record: %w", err)
+		}
+		recObj, err := canonical.DecodeKernel(raw)
+		if err != nil {
+			recRows.Close()
+			return GarbageReport{}, fmt.Errorf("store: gc decode record %s: %w", id, err)
+		}
+		ref, ok := recordField(recObj, "schema_ref")
+		if !ok || ref.Kind != canonical.KindString {
+			recRows.Close()
+			return GarbageReport{}, fmt.Errorf("store: gc record %s has no schema_ref string", id)
+		}
 		all[id] = true
+		switch ref.Str {
+		case CutSchemaRef:
+			cutBodies[id] = raw
+		case MilestoneSchemaRef:
+			milestoneIDs = append(milestoneIDs, id)
+		}
 	}
+	if err := recRows.Err(); err != nil {
+		recRows.Close()
+		return GarbageReport{}, fmt.Errorf("store: gc list records: %w", err)
+	}
+	recRows.Close()
 
 	causes := make(map[string][]string)
 	rows, err := conn.QueryContext(ctx, "SELECT record_id, caused_by FROM record_edges")
@@ -124,53 +170,29 @@ func (s *Store) CollectGarbage() (GarbageReport, error) {
 		seeds[id] = true
 	}
 
-	cutRows, err := conn.QueryContext(ctx,
-		"SELECT record_id, canonical_bytes FROM records WHERE schema_ref = ?", CutSchemaRef)
-	if err != nil {
-		return GarbageReport{}, fmt.Errorf("store: gc list cuts: %w", err)
+	// The cuts classified from canonical bytes during the load,
+	// in ID order so the pass is deterministic: each cut seeds
+	// itself and the whole prefix its body addresses.
+	cutIDs := make([]string, 0, len(cutBodies))
+	for id := range cutBodies {
+		cutIDs = append(cutIDs, id)
 	}
-	var cutPrefixes []struct {
-		ownerPath      string
-		throughOrdinal int64
-	}
-	for cutRows.Next() {
-		var id string
-		var raw []byte
-		if err := cutRows.Scan(&id, &raw); err != nil {
-			cutRows.Close()
-			return GarbageReport{}, fmt.Errorf("store: gc scan cut: %w", err)
-		}
-		ownerPath, throughOrdinal, err := cutAddress(id, raw)
+	sort.Strings(cutIDs)
+	for _, id := range cutIDs {
+		ownerPath, throughOrdinal, err := cutAddress(id, cutBodies[id])
 		if err != nil {
-			cutRows.Close()
 			return GarbageReport{}, err
 		}
 		seeds[id] = true
-		cutPrefixes = append(cutPrefixes, struct {
-			ownerPath      string
-			throughOrdinal int64
-		}{ownerPath, throughOrdinal})
-	}
-	if err := cutRows.Err(); err != nil {
-		cutRows.Close()
-		return GarbageReport{}, fmt.Errorf("store: gc list cuts: %w", err)
-	}
-	cutRows.Close()
-	for _, p := range cutPrefixes {
-		prefixIDs, err := gcPrefixIDs(ctx, conn, p.ownerPath, p.throughOrdinal)
+		prefixIDs, err := gcPrefixIDs(ctx, conn, ownerPath, throughOrdinal)
 		if err != nil {
 			return GarbageReport{}, err
 		}
-		for _, id := range prefixIDs {
-			seeds[id] = true
+		for _, pid := range prefixIDs {
+			seeds[pid] = true
 		}
 	}
 
-	milestoneIDs, err := gcScanIDs(ctx, conn, "milestones",
-		"SELECT record_id FROM records WHERE schema_ref = ?", MilestoneSchemaRef)
-	if err != nil {
-		return GarbageReport{}, err
-	}
 	for _, id := range milestoneIDs {
 		seeds[id] = true
 	}
