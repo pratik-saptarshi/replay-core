@@ -289,6 +289,40 @@ func TestOpenRejectsCorruptChainHead(t *testing.T) {
 	})
 }
 
+// TestOpenRejectsForeignChainHead (ADV-6): a well-formed foreign
+// commit — a real commit, just not a snapshot commit — named by
+// refs/vcscore/ops/latest must be rejected at Open. It used to be
+// adopted as the chain head, and every later Snapshot then failed
+// permanently reading the manifest the foreign commit lacks.
+func TestOpenRejectsForeignChainHead(t *testing.T) {
+	ws := t.TempDir()
+	writeFile(t, filepath.Join(ws, "hello.txt"), "hello\n")
+	dir := filepath.Join(t.TempDir(), "snap.git")
+	s, err := snapshot.Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := s.Snapshot(ws, map[string]string{"run": "foreign-head"}); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	// Build a foreign commit by plumbing: an empty tree, committed
+	// directly, with no meta/ at all.
+	emptyTree := git(t, dir, "mktree")
+	foreign := git(t, dir,
+		"-c", "user.name=replay-core-test", "-c", "user.email=replay-core-test@localhost",
+		"commit-tree", emptyTree, "-m", "foreign")
+	git(t, dir, "update-ref", "refs/vcscore/ops/latest", foreign)
+
+	_, err = snapshot.Open(dir)
+	if err == nil {
+		t.Fatal("Open accepted a foreign commit as chain head; want a loud failure")
+	}
+	if !strings.Contains(err.Error(), "refs/vcscore/ops/latest") {
+		t.Fatalf("Open error = %q, want it to name the chain-head ref", err)
+	}
+}
+
 func TestSnapshotRejectsSpecialFiles(t *testing.T) {
 	ws := t.TempDir()
 	writeFile(t, filepath.Join(ws, "real.txt"), "real\n")

@@ -101,13 +101,37 @@ func Open(dir string) (*Store, error) {
 	if got != emptyBlobID {
 		return nil, fmt.Errorf("%w: probe hash-object returned %q, want %q", ErrGitUnavailable, got, emptyBlobID)
 	}
-	// Recover the chain head, if any.
+	// Recover the chain head, if any, and check it is actually a
+	// snapshot commit before adopting it.
 	head, err := s.resolveChainHead()
 	if err != nil {
 		return nil, err
 	}
+	if head != "" {
+		if err := s.validateChainHead(head); err != nil {
+			return nil, err
+		}
+	}
 	s.last = head
 	return s, nil
+}
+
+// validateChainHead checks that head — the commit
+// refs/vcscore/ops/latest names — is a snapshot commit: its tree
+// must carry meta/snapshot.json, and its meta/manifest.json must
+// parse as a snapshot manifest, read through previousManifestOf —
+// the same read Snapshot performs on its parent. A foreign commit
+// (well-formed, but not a snapshot) adopted as chain head would
+// otherwise pass Open and then fail every later Snapshot
+// permanently on the manifest it lacks.
+func (s *Store) validateChainHead(head string) error {
+	if _, err := s.git(nil, "cat-file", "-e", head+":meta/snapshot.json"); err != nil {
+		return fmt.Errorf("snapshot: chain head %s names commit %s, which is not a snapshot commit (no meta/snapshot.json): %w", latestRef, head, err)
+	}
+	if _, err := s.previousManifestOf(head); err != nil {
+		return fmt.Errorf("snapshot: chain head %s names commit %s, whose meta/manifest.json does not parse as a snapshot manifest: %w", latestRef, head, err)
+	}
+	return nil
 }
 
 // resolveChainHead returns the commit refs/vcscore/ops/latest
