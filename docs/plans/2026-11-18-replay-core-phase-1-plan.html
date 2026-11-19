@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Phase 1 Implementation Plan — replay-core: Trace Store, Cuts/Slices, Git Snapshot Store</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 24px auto; max-width: 960px; padding: 0 16px; line-height: 1.55; color: #1a2332; }
+  h1 { font-size: 1.45rem; } h2 { font-size: 1.15rem; border-bottom: 2px solid #dbe3ee; padding-bottom: 4px; margin-top: 30px; }
+  h3 { font-size: 1.02rem; margin-top: 20px; }
+  code { font-family: ui-monospace, Menlo, monospace; font-size: 0.88em; }
+  table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 0.92rem; }
+  th, td { border: 1px solid #dbe3ee; padding: 6px 9px; text-align: left; vertical-align: top; }
+  th { background: #f4f7fb; }
+  .warn { background: #fdf1f1; border: 1px solid #e5b4b4; border-radius: 8px; padding: 10px 14px; }
+  .note { background: #fff7e8; border: 1px solid #ecd9a8; border-radius: 8px; padding: 10px 14px; }
+  .ok { background: #eefaf0; border: 1px solid #b5dcbc; border-radius: 8px; padding: 10px 14px; }
+  ul { margin: 6px 0; }
+  pre { background: #f4f7fb; border: 1px solid #dbe3ee; border-radius: 6px; padding: 8px 12px; overflow-x: auto; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+<h1>Phase 1 Implementation Plan — replay-core: Trace Store, Cuts/Slices, Git Snapshot Store</h1>
+<p><i>Produced under the feature-pr-pipeline skill (Stage 1, writing-plans). For agentic workers: REQUIRED SUB-SKILL — subagent-driven-development (fresh implementer + task reviewer per task), test-driven-development inside each task. Steps use checkbox syntax for tracking.</i></p>
+
+<p><b>Goal:</b> Build the persistent half of replay-core — an append-only, content-addressed trace store (F2) holding records under the Phase 0 identity law, immutable Cut/Slice addressing with projections and epoch slicing over it (F3), and a Git-backed dual-tree snapshot store (F4) — so a synthetic run's records, slices, and snapshots round-trip end-to-end byte-identical, with GC-survival and concurrent-append evidence, discharging the Phase 1 gate.</p>
+
+<p><b>Architecture:</b> Three new packages under <code>internal/</code>, layered strictly downward: <code>internal/snapshot</code> and <code>internal/slice</code> consume <code>internal/store</code>; <code>internal/store</code> consumes only Phase 0's <code>internal/canonical</code> and <code>internal/record</code>. The trace store is one SQLite file whose schema mirrors the design evidence (records, path entries, causal edges, append intents, frontiers, per-owner ordinals, witness bodies); identity is enforced in the database itself by a <code>CHECK (record_id = digest)</code> constraint and re-validated on every read. The snapshot store is a bare Git repository driven through plumbing commands; snapshots are dual-tree commits (<code>files/</code> + <code>meta/</code>) and worlds/scopes are refs. The two stores are separate; the only coupling is a one-way citation — a milestone record in the trace store names a snapshot commit.</p>
+
+<p><b>Tech Stack:</b> Go 1.27 (module <code>github.com/pratik-saptarshi/replay-core</code>); <code>database/sql</code> with the CGO SQLite driver <code>github.com/mattn/go-sqlite3</code> (the module's first external dependency — Decision 1); the <code>git</code> binary's plumbing commands via <code>os/exec</code> (git 2.43.0 present in this environment — Decision 2); Phase 0 packages <code>internal/canonical</code> and <code>internal/record</code>, unmodified.</p>
+
+<p><b>Spec:</b> <code>docs/replay-semantics.html</code> (in-repo normative spec, especially §4 fork-at-cut, §5 projection-only revert, §7 memory charter); the ratified roadmap and its Phase 1 feature specs and acceptance criteria (AEP goal workspace, 2026-11-18: roadmap matrix v1.3, feature specs §1–§3, acceptance criteria AC-F2-1…AC-F4-5 and AC-GATE-1). Phase scope, verbatim from the source plan §6: Phase 1 is “F2+F3+F4: trace store, cuts/slices, Git snapshot store”. This plan refines the roadmap's 17-task Phase 1 decomposition (T-F2-1…7, T-F3-1…5, T-F4-1…4, T-GATE-P1) into executable tasks without re-cutting it: plan tasks keep roadmap task IDs, in roadmap dependency order.</p>
+
+<h2>Decisions (made by this plan, for the owner's plan review)</h2>
+
+<p><b>Decision 1 — Storage engine for F2: SQLite via the CGO driver <code>github.com/mattn/go-sqlite3</code>.</b> The alternatives were weighed against the acceptance criteria as written, not against preference:</p>
+<ul>
+<li><b>Non-SQL store (custom file format / embedded KV) — rejected on AC fidelity.</b> AC-F2-3's check is, verbatim, a “direct INSERT with a deliberately mismatched record_id” asserting a constraint violation, and its build-phase remediation demands a mutation sweep over insert paths “including raw-SQL bypass attempts”. A store with no SQL surface cannot discharge that criterion as written; choosing it would mean silently rewriting a ratified AC. The design evidence also describes the store as one SQLite file with <code>BEGIN IMMEDIATE</code> atomicity and the CHECK constraint — the criteria and the evidence agree.</li>
+<li><b>Pure-Go SQLite (<code>modernc.org/sqlite</code>) — viable, not chosen.</b> It is genuine SQLite (transpiled) and keeps CGO off, but it is a very large dependency tree and its transpiled amalgamation is compile-time memory-hungry; in this sandbox (~1.5 GiB effective memory, sequential builds) a cold build risks becoming the phase's pacing item. If a future platform forbids CGO, this is the fallback and the store's SQL surface is written to be driver-portable (standard <code>database/sql</code>, no driver-specific SQL beyond pragmas).</li>
+<li><b>CGO driver (<code>mattn/go-sqlite3</code>) — chosen.</b> The canonical driver over the SQLite amalgamation: CHECK constraints, <code>BEGIN IMMEDIATE</code>, and WAL behave exactly as the evidence describes. gcc is present in this environment (verified 2026-11-18) and the Go toolchain here already builds CGO packages.</li>
+</ul>
+<p><b>Dependency-policy consequence, stated plainly:</b> Phase 0 shipped with zero dependencies. This plan adds the module's first <code>require</code> (Task 1) and makes every build a CGO build (<code>CGO_ENABLED=1</code>, gcc required). That is a visible change to the project's build contract, taken because the ratified criteria presuppose a real SQL store. No other third-party dependency is added in Phase 1.</p>
+
+<p><b>Decision 2 — Git access for F4: shell out to the <code>git</code> binary's plumbing commands.</b> The snapshot design is refs-and-trees shaped (bare repository, <code>refs/vcscore/…</code> layout, dual-tree commits, incremental tree assembly), and plumbing (<code>hash-object</code>, <code>update-index</code>, <code>write-tree</code>, <code>commit-tree</code>, <code>update-ref</code>, <code>for-each-ref</code>, <code>count-objects</code>) is the stable interface built for exactly this. A pure-Go Git library would be a second large dependency whose tree-building APIs do not map cleanly onto the incremental dual-tree build, and its memory would be spent inside the Go process, under the sandbox ceiling; the subprocess keeps Git's memory in Git's process. Cost: a runtime dependency on the <code>git</code> binary — discharged by an explicit capability probe in <code>snapshot.Open</code> (Task 13) that fails loudly with a named error if plumbing is unavailable, which is also the empirical spike the feature spec asked this plan to run. Committer identity is pinned per-invocation (<code>-c user.name=replay-core -c user.email=replay-core@localhost</code>) so snapshot commits never depend on host Git configuration.</p>
+
+<p><b>Decision 3 — File layout (following the existing <code>internal/</code> pattern).</b> New packages: <code>internal/store</code> (F2), <code>internal/slice</code> (F3), <code>internal/snapshot</code> (F4). The Phase 1 gate demonstration joins <code>internal/conformance</code> as a test file, mirroring Phase 0, and <code>scripts/check-phase1.sh</code> mirrors <code>scripts/check-phase0.sh</code>. No Phase 0 package is modified. Reserved schema constants (<code>replaycore.milestone.v1</code>, <code>replaycore.cut.v1</code>, <code>replaycore.abandon.v1</code>) live in <code>internal/store</code> — the lowest layer — so the store's GC can recognize cut and milestone records as retention roots without an import cycle (<code>slice</code> and <code>snapshot</code> import <code>store</code>, never the reverse).</p>
+
+<p><b>Decision 4 — smaller calls the specs left open, pinned here.</b> (a) The spec's <code>AppendFact(owner_path, body, caused_by[], mode, schema_ref)</code> elides the witness the Phase 0 law requires of every non-root record; plan drafts therefore carry witness material explicitly (<code>RecordDraft.WitnessBody</code> + <code>WitnessSchemaRef</code>), and the store computes the witness digest. “Witness body” throughout this plan means the witness <i>fields</i> object — the value <code>record.ValidateWitnessBody</code> and <code>record.WitnessBodyDigest</code> consume (Phase 0's <code>record.RootWitnessBody()</code> returns those fields wrapped in the witness object; the fields are its <code>body</code> field). Store-minted records (cuts, milestones, abandon facts) carry the root witness fields as their witness — deterministic, already computed in Phase 0, and lawful (a valid witness body, digest <code>sha256:22e3bf15…85721130</code>). (b) Milestone and cut records are <b>exempt from mode filtering</b> (resolving the F3 spec's open question): a mode filter that could drop a boundary marker would silently move epoch boundaries; the purity law in Task 8 is stated over this one well-defined filter function. (c) GC collects only records unreachable — via <code>caused_by</code> closure — from the retention roots (every frontier, every published cut, every milestone); this is a storage operation under AC-F2-7's survival guarantee, distinct from revert, which remains projection-only (spec §5) and deletes nothing. (d) The spec's <code>CiteSnapshot(milestone_record, commit_id)</code> is realized as body construction before append (<code>snapshot.MilestoneBody</code> + <code>store.AppendMilestone</code>), because an append-only store cannot edit a record after the fact; the citation lives in the milestone body, per the F4 spec's normative placement.</p>
+
+<h2>Global Constraints</h2>
+<ul>
+<li><b>Record model (normative, as built in Phase 0):</b> a record is <code>{body, caused_by, kind:"record", mode, schema_ref, witness}</code>; <code>mode</code> is exactly <code>capture</code> or <code>declaration</code> (<code>record.ModeCapture</code> / <code>record.ModeDeclaration</code>); a witness body has exactly the eight fields <code>active_binding_refs, actor_ref, authority_refs, containment, provenance_policy_refs, semantic_environment_refs, substrate_ref, visibility_policy_refs</code>. The store adds no fields to the record itself.</li>
+<li><b>Identity law:</b> <code>record_id == digest</code> always, under the canonical-digest law with prefix <code>replaycore.kernel.canonical.v1</code>; digests are <code>sha256:&lt;lowercase hex&gt;</code> of the prefix-tagged canonical bytes, computed only through <code>internal/canonical</code> and <code>internal/record</code> (<code>record.RecordDigest</code>, <code>record.WitnessBodyDigest</code>, <code>record.RecordInput</code>). Ground truths: root witness body digest <code>sha256:22e3bf15914b5007dea08a1079d1542470a369bcbed067687f345e7e85721130</code>; root witness record ID <code>sha256:0b67497cb4c0f2ed954b7988ecc321b481e7d173c4fc201adeb86591b2fd6310</code> (computed by <code>record.RootWitnessRecordID()</code>, never hardcoded in implementation code).</li>
+<li><b>Corpus discipline:</b> <code>testdata/corpus</code> is frozen Phase 0 ground truth. Phase 1 adds no corpus cases, modifies none, and <code>scripts/check-phase0.sh</code> must stay green at every commit.</li>
+<li><b>Append-only:</b> no API deletes or rewrites a record. Revert is projection-only (spec §5). The single exception is garbage collection under Decision 4(c), which may remove only records unreachable from the retention roots and must never remove a record a frontier, published cut, or milestone can reach.</li>
+<li><b>Mode-filter law:</b> causal closure first, mode filter second — a filtered Slice is the filter applied to the full causally closed Slice, never a closure computed over the filtered subset. Records with schema_ref <code>replaycore.milestone.v1</code> or <code>replaycore.cut.v1</code> are exempt from mode filtering (Decision 4(b)).</li>
+<li><b>Reserved schema_refs:</b> <code>replaycore.milestone.v1</code> (body <code>{task_id, snapshot_ref}</code>), <code>replaycore.cut.v1</code> (body <code>{owner_path, through_fact_id, through_owner_ordinal}</code>), <code>replaycore.abandon.v1</code> (body <code>{abandoned}</code>), alongside Phase 0's <code>kernel.witness.root.v1</code>. Owner paths beginning <code>replaycore.</code> are reserved; <code>AppendBatch</code> rejects them (the root witness record lives on the reserved path <code>replaycore.system</code>).</li>
+<li><b>Task boundaries are claimed, not enforced (directive X1):</b> the store accepts a milestone naming any task id and exposes no API that validates, mints, or rejects task boundaries (AC-F2-9). Epochs are per owner path only; no Phase 1 API accepts a set of per-path cuts as an epoch (AC-F3-7).</li>
+<li><b>Dependencies:</b> exactly one new module requirement in Phase 1 — <code>github.com/mattn/go-sqlite3 v1.14.53</code> (Decision 1; the current v1.14.x patch, verified against the module proxy at plan time). Everything else is stdlib plus Phase 0 packages. Builds are CGO builds: <code>CGO_ENABLED=1</code>.</li>
+<li><b>Environment:</b> this sandbox has ~1.5 GiB effective memory. Verification commands run package tests sequentially (one package per <code>go test</code> invocation in gate scripts), with <code>GOTMPDIR=$HOME/.gotmp</code> and <code>PATH</code> including <code>$HOME/sdk/go/bin</code>. Fixtures are generated in-test under <code>t.TempDir()</code>; no binary fixtures are committed.</li>
+<li><b>Hygiene:</b> this repo is public. Plan and code cite the design evidence by the roadmap's aliases (“the features plan”, findings sections, “the reference suite/design”) only.</li>
+</ul>
+
+<h2>Review Focus</h2>
+<p>The five input classes / failure modes the spec implies but the acceptance criteria do not directly exercise, most likely to bite first. Each is pinned to its owning task with a test in that task's steps.</p>
+<ol>
+<li><b>Unclean shutdown and reopen.</b> A lane process killed between runs leaves a WAL behind; on reopen the store must recover with every committed record intact, frontiers consistent, and no ordinal reuse. AC-F2-1 covers a kill <i>during</i> a batch; nothing covers reopen-after-crash as a routine operation. → Task 1, <code>TestStoreReopenAfterUncleanClose</code>.</li>
+<li><b>Hostile causal citations in a draft.</b> A draft that cites a nonexistent record, cites itself, or forms a cycle inside its own batch would corrupt closure computation (Task 7) or hang it. A reasonable caller expects rejection at append time, not a poisoned store. → Task 1, <code>TestAppendBatchRejectsUnknownAndSelfCitations</code>.</li>
+<li><b>Degenerate appends.</b> An empty batch, an empty intent id, or an empty owner path are the inputs every caller eventually produces by accident; a silent success would mint receipts for nothing or file records under no path. → Task 2, <code>TestAppendBatchRejectsDegenerateInputs</code>.</li>
+<li><b>Workspace entries that are not plain files.</b> A snapshot walk that follows a symlink snapshots bytes outside the workspace (a correctness and containment failure); an unreadable file silently skipped produces a snapshot that claims completeness it does not have. Expected: symlinks are stored as links, never followed; unreadable entries fail the snapshot loudly, naming the path. → Task 13, <code>TestSnapshotStoresSymlinksAsLinks</code> and <code>TestSnapshotFailsOnUnreadableFile</code>.</li>
+<li><b>Very deep causal chains.</b> Real traces are long; a recursive closure over a 10,000-record chain overflows the goroutine stack or turns resolution quadratic. Expected: closure is iterative and resolution of a deep cut completes with the full prefix. → Task 7, <code>TestResolveCutDeepChain</code>.</li>
+</ol>
+
+<h2>File Structure</h2>
+<table>
+<tr><th>File</th><th>Responsibility</th><th>Task</th></tr>
+<tr><td><code>internal/store/store.go</code></td><td>Store type, <code>Open</code>/<code>Close</code>, schema DDL, reserved schema constants, shared error types.</td><td>1</td></tr>
+<tr><td><code>internal/store/append.go</code></td><td><code>AppendBatch</code> / <code>AppendFact</code>: digest computation, BEGIN IMMEDIATE transaction, ordinal allocation, intent recording; the unexported append crash hook used by the fault-injection test.</td><td>1, 2</td></tr>
+<tr><td><code>internal/store/read.go</code></td><td><code>GetRecord</code> (with witness-chain validation), <code>PathRecords</code>, <code>Frontier</code>.</td><td>1, 4</td></tr>
+<tr><td><code>internal/store/milestone.go</code></td><td><code>AppendMilestone</code> and the milestone body shape.</td><td>5</td></tr>
+<tr><td><code>internal/store/gc.go</code></td><td><code>CollectGarbage</code>: retention-root closure and collection of unreachable records.</td><td>10</td></tr>
+<tr><td><code>internal/store/*_test.go</code></td><td>Store tests; <code>fault_injection_test.go</code> is package <code>store</code> (internal) for hook access, the rest package <code>store_test</code>.</td><td>1–6, 10</td></tr>
+<tr><td><code>internal/slice/slice.go</code></td><td><code>Slice</code> type, <code>Digest</code>, <code>Order</code>, <code>EffectAt</code> (the E3-A cursor surface).</td><td>7, 11</td></tr>
+<tr><td><code>internal/slice/cut.go</code></td><td><code>PublishCut</code>, <code>ReadCut</code>, <code>ResolveCut</code>, closure and mode-filter machinery.</td><td>7, 8</td></tr>
+<tr><td><code>internal/slice/project.go</code></td><td><code>Abandon</code>, <code>ProjectEffectiveHistory</code>.</td><td>9</td></tr>
+<tr><td><code>internal/slice/epoch.go</code></td><td><code>EpochSlice</code>.</td><td>11</td></tr>
+<tr><td><code>internal/slice/*_test.go</code></td><td>Slice tests, including the API-surface scope guard (package <code>slice_test</code>).</td><td>7–9, 11, 12</td></tr>
+<tr><td><code>internal/snapshot/snapshot.go</code></td><td>Git-backed store: <code>Open</code> (with plumbing probe), <code>Snapshot</code> (dual-tree, incremental).</td><td>13, 14</td></tr>
+<tr><td><code>internal/snapshot/refs.go</code></td><td><code>Fork</code>, <code>ListScopes</code>, refs-layout constants and scope-name validation.</td><td>15</td></tr>
+<tr><td><code>internal/snapshot/cite.go</code></td><td><code>MilestoneBody</code>, <code>SnapshotAt</code> (milestone citation resolution).</td><td>16</td></tr>
+<tr><td><code>internal/snapshot/*_test.go</code></td><td>Snapshot tests (package <code>snapshot_test</code>).</td><td>13–16</td></tr>
+<tr><td><code>internal/conformance/phase1_gate_test.go</code></td><td>The Phase 1 gate demonstration: synthetic run end-to-end through store + slice + snapshot.</td><td>17</td></tr>
+<tr><td><code>scripts/check-phase1.sh</code></td><td>One-command Phase 1 gate, mirroring <code>check-phase0.sh</code>.</td><td>17</td></tr>
+<tr><td><code>go.mod</code> / <code>go.sum</code></td><td>The single new requirement (Decision 1).</td><td>1</td></tr>
+</table>
+
+<h2>Acceptance-Criteria Mapping</h2>
+<p>Every Phase 1 acceptance criterion maps to exactly one owning plan task (the roadmap's mapping, kept); T-GATE-P1 additionally re-discharges the three gate-evidence criteria as assembled evidence. No roadmap task is split or merged — the decomposition was already at implementation depth, and each roadmap task carries its own test cycle and review gate.</p>
+<table>
+<tr><th>Plan task</th><th>Roadmap task</th><th>Acceptance criteria</th><th>Depends on</th></tr>
+<tr><td>1</td><td>T-F2-1</td><td>AC-F2-1 (atomic batch), AC-F2-4 (per-owner ordinals)</td><td>—</td></tr>
+<tr><td>2</td><td>T-F2-2</td><td>AC-F2-2 (intent idempotency)</td><td>1</td></tr>
+<tr><td>3</td><td>T-F2-3</td><td>AC-F2-3 (DB identity backstop, safety-bearing)</td><td>1</td></tr>
+<tr><td>4</td><td>T-F2-4</td><td>AC-F2-5 (witness-chain reads, safety-bearing)</td><td>1</td></tr>
+<tr><td>5</td><td>T-F2-7</td><td>AC-F2-8 (milestone surface), AC-F2-9 (claimed, not enforced)</td><td>1</td></tr>
+<tr><td>6</td><td>T-F2-5</td><td>AC-F2-6 (concurrent appends, gate evidence)</td><td>1, 2</td></tr>
+<tr><td>7</td><td>T-F3-1</td><td>AC-F3-1 (cut = causally closed prefix), AC-F3-2 (slice immutability)</td><td>1</td></tr>
+<tr><td>8</td><td>T-F3-2</td><td>AC-F3-3 (mode-filter purity law)</td><td>7</td></tr>
+<tr><td>9</td><td>T-F3-3</td><td>AC-F3-4 (abandon projection)</td><td>7</td></tr>
+<tr><td>10</td><td>T-F2-6</td><td>AC-F2-7 (GC survival, gate evidence)</td><td>1, 7</td></tr>
+<tr><td>11</td><td>T-F3-4</td><td>AC-F3-5 (epoch slicing), AC-F3-6 (E3-A cursor contract)</td><td>5, 7</td></tr>
+<tr><td>12</td><td>T-F3-5</td><td>AC-F3-7 (epoch scope guard)</td><td>11</td></tr>
+<tr><td>13</td><td>T-F4-1</td><td>AC-F4-1 (dual-tree snapshot)</td><td>—</td></tr>
+<tr><td>14</td><td>T-F4-2</td><td>AC-F4-2 (incremental build, ≤20 new objects)</td><td>13</td></tr>
+<tr><td>15</td><td>T-F4-3</td><td>AC-F4-3 (zero-copy fork), AC-F4-5 (refs layout)</td><td>13</td></tr>
+<tr><td>16</td><td>T-F4-4</td><td>AC-F4-4 (milestone citation resolves)</td><td>5, 15</td></tr>
+<tr><td>17</td><td>T-GATE-P1</td><td>AC-GATE-1 (end-to-end round-trip, gate evidence); assembled evidence for AC-F2-6, AC-F2-7</td><td>6, 10, 12, 16</td></tr>
+</table>
+
+<h2>Tasks</h2>
+
+<h3>Task 1 (T-F2-1): Store schema and atomic write core</h3>
+<p><b>Files:</b> Modify <code>go.mod</code>, create <code>go.sum</code> (via <code>go get</code>); Create <code>internal/store/store.go</code>, <code>internal/store/append.go</code>, <code>internal/store/read.go</code>; Test <code>internal/store/store_test.go</code>, <code>internal/store/append_test.go</code> (package <code>store_test</code>), <code>internal/store/fault_injection_test.go</code> (package <code>store</code>).</p>
+<p><b>Interfaces:</b> Consumes — Phase 0: <code>record.RecordInput(schemaRef, mode string, body canonical.Value, causedBy []string, witness string) (canonical.Value, error)</code>, <code>record.RecordDigest(...) (string, error)</code>, <code>record.WitnessBodyDigest(schemaRef string, body canonical.Value) (string, error)</code>, <code>record.ValidateWitnessBody(body canonical.Value) error</code>, <code>record.RootWitnessBody() canonical.Value</code>, <code>record.RootWitnessRecordID() string</code>, <code>record.RootWitnessSchemaRef</code>, <code>canonical.MarshalKernel / DecodeKernel / DigestKernel</code>. Produces — package <code>store</code>:</p>
+<pre>const (
+    MilestoneSchemaRef = "replaycore.milestone.v1"
+    CutSchemaRef       = "replaycore.cut.v1"
+    AbandonSchemaRef   = "replaycore.abandon.v1"
+    SystemPath         = "replaycore.system"
+)
+type RecordDraft struct {
+    SchemaRef, Mode  string
+    Body             canonical.Value
+    CausedBy         []string
+    WitnessSchemaRef string
+    WitnessBody      canonical.Value
+}
+type Receipt struct { RecordID string; OwnerOrdinal int64 }
+type StoredRecord struct {
+    ID           string
+    OwnerPath    string
+    OwnerOrdinal int64
+    Record       canonical.Value // the full record object
+    WitnessBody  canonical.Value
+}
+var ErrNotFound = errors.New("store: record not found")
+func Open(path string) (*Store, error)
+func (s *Store) Close() error
+func (s *Store) AppendBatch(ownerPath, intentID string, drafts []RecordDraft) ([]Receipt, error)
+func (s *Store) AppendFact(ownerPath string, draft RecordDraft) (Receipt, error)
+func (s *Store) GetRecord(recordID string) (StoredRecord, error) // existence + parse only; validation hardens in Task 4
+func (s *Store) PathRecords(ownerPath string) ([]StoredRecord, error) // ordinal order
+func (s *Store) Frontier(ownerPath string) (string, error) // tail record ID; root witness record ID for an empty path</pre>
+<ul>
+<li>[ ] <b>Step 1 — Add the dependency:</b> <code>go get github.com/mattn/go-sqlite3@v1.14.53</code> (Decision 1); <code>go mod tidy</code>. Run: <code>go build ./...</code> — Expected: PASS (existing packages unaffected).</li>
+<li>[ ] <b>Step 2 — Failing tests (core behavior):</b> in <code>store_test.go</code> / <code>append_test.go</code>, with a helper <code>draft(t, schemaRef, bodyJSON)</code> building a <code>RecordDraft</code> via <code>canonical.FromJSON</code> whose witness material is the root witness fields under <code>record.RootWitnessSchemaRef</code> — the tests define <code>rootFields(t)</code> extracting the <code>body</code> field of <code>record.RootWitnessBody()</code>, since Phase 0 exports the fields only in that wrapped form, and <code>rootWitnessDigest(t)</code> as <code>record.WitnessBodyDigest(record.RootWitnessSchemaRef, rootFields(t))</code>:
+<pre>func TestStoreBootstrapRootWitness(t *testing.T) {
+    s := openTemp(t)
+    rec, err := s.GetRecord(record.RootWitnessRecordID())
+    if err != nil { t.Fatalf("root witness record missing after Open: %v", err) }
+    if rec.ID != "sha256:0b67497cb4c0f2ed954b7988ecc321b481e7d173c4fc201adeb86591b2fd6310" { t.Fatalf("root ID = %s", rec.ID) }
+    tail, err := s.Frontier("runs/a")
+    if err != nil || tail != rec.ID { t.Fatalf("empty path frontier = %q, %v; want root ID", tail, err) }
+}
+func TestAppendBatchOrdinalsGapFreePerOwner(t *testing.T) { // AC-F2-4
+    s := openTemp(t)
+    // interleave batches on two owner paths; each path's ordinals must be exactly 0..n-1
+    var a, b []store.Receipt
+    for i := 0; i &lt; 3; i++ {
+        ra, _ := s.AppendBatch("runs/a", fmt.Sprintf("a-%d", i), []store.RecordDraft{draft(t, "test.fact", `{"n":1}`), draft(t, "test.fact", `{"n":2}`)})
+        rb, _ := s.AppendBatch("runs/b", fmt.Sprintf("b-%d", i), []store.RecordDraft{draft(t, "test.fact", `{"n":1}`)})
+        a = append(a, ra...); b = append(b, rb...)
+    }
+    for i, r := range a { if r.OwnerOrdinal != int64(i) { t.Fatalf("runs/a ordinal[%d] = %d", i, r.OwnerOrdinal) } }
+    for i, r := range b { if r.OwnerOrdinal != int64(i) { t.Fatalf("runs/b ordinal[%d] = %d", i, r.OwnerOrdinal) } }
+}
+func TestAppendBatchRejectsUnknownAndSelfCitations(t *testing.T) { // Review Focus 2
+    s := openTemp(t)
+    bad := draft(t, "test.fact", `{"n":1}`); bad.CausedBy = []string{"sha256:0000000000000000000000000000000000000000000000000000000000000000"}
+    if _, err := s.AppendBatch("runs/a", "x-1", []store.RecordDraft{bad}); err == nil { t.Fatal("unknown citation accepted") }
+    // a draft citing a later draft in the same batch (self/cycle class) is rejected the same way
+    d0 := draft(t, "test.fact", `{"n":1}`); d1 := draft(t, "test.fact", `{"n":2}`); d0.CausedBy = nil
+    id1, _ := record.RecordDigest(d1.SchemaRef, d1.Mode, d1.Body, nil, rootWitnessDigest(t))
+    d0.CausedBy = []string{id1} // cites a record that does not exist yet at its position
+    if _, err := s.AppendBatch("runs/a", "x-2", []store.RecordDraft{d0, d1}); err == nil { t.Fatal("forward citation accepted") }
+    if recs, _ := s.PathRecords("runs/a"); len(recs) != 0 { t.Fatalf("rejected batches left %d records", len(recs)) }
+}</pre>
+Run: <code>go test ./internal/store/</code> — Expected: FAIL (package does not exist).</li>
+<li>[ ] <b>Step 3 — Failing test (atomicity, AC-F2-1):</b> in <code>fault_injection_test.go</code> (package <code>store</code>): a child-process test — when env <code>REPLAYCORE_CRASH_AT</code> is set, the child opens the store at <code>REPLAYCORE_STORE_PATH</code>, sets the unexported <code>appendCrashHook</code> to <code>os.Exit(3)</code> on the Nth <code>"insert"</code> stage, and appends a 6-record batch; the parent runs the child (expect exit 3), reopens the store, and asserts <code>PathRecords</code> is empty and <code>Frontier</code> is still the root ID. Plus <code>TestStoreReopenAfterUncleanClose</code> (Review Focus 1): child appends and <code>os.Exit(0)</code>s without <code>Close</code>; parent reopens and asserts every record readable, frontier at the last receipt, and the next append continues ordinals without reuse. Run: FAIL.</li>
+<li>[ ] <b>Step 4 — Implement the schema and write core:</b> <code>store.go</code> holds the DDL (executed idempotently at <code>Open</code>; table names from the design evidence, findings-kernel §1) —
+<pre>CREATE TABLE IF NOT EXISTS records (
+  record_id TEXT PRIMARY KEY, digest TEXT NOT NULL,
+  owner_path TEXT NOT NULL, owner_ordinal INTEGER NOT NULL,
+  schema_ref TEXT NOT NULL, mode TEXT NOT NULL,
+  canonical_bytes BLOB NOT NULL, witness_digest TEXT NOT NULL,
+  UNIQUE(owner_path, owner_ordinal), CHECK (record_id = digest));
+CREATE TABLE IF NOT EXISTS witness_bodies (
+  witness_digest TEXT PRIMARY KEY, schema_ref TEXT NOT NULL, body_bytes BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS record_edges (
+  record_id TEXT NOT NULL, caused_by TEXT NOT NULL, PRIMARY KEY (record_id, caused_by));
+CREATE TABLE IF NOT EXISTS path_entries (
+  owner_path TEXT NOT NULL, owner_ordinal INTEGER NOT NULL, record_id TEXT NOT NULL,
+  PRIMARY KEY (owner_path, owner_ordinal));
+CREATE TABLE IF NOT EXISTS append_intents (
+  intent_id TEXT PRIMARY KEY, owner_path TEXT NOT NULL,
+  batch_digest TEXT NOT NULL, receipts TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS frontiers (
+  owner_path TEXT PRIMARY KEY, tail_record_id TEXT NOT NULL, tail_ordinal INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS owner_ordinals (
+  owner_path TEXT PRIMARY KEY, next_ordinal INTEGER NOT NULL);</pre>
+<code>Open</code> opens <code>database/sql</code> with DSN <code>file:&lt;path&gt;?_pragma=busy_timeout(5000)&amp;_pragma=journal_mode(WAL)</code>, applies the DDL, and bootstraps the root witness record on <code>SystemPath</code> at ordinal 0 if absent. The root record's body is the witness <i>fields</i> object itself — the <code>body</code> field of <code>record.RootWitnessBody()</code> — because Phase 0's root-record validation requires exactly that body, mode <code>record.ModeCapture</code>, no causal parents, and the empty witness sentinel: build it via <code>record.RecordInput(record.RootWitnessSchemaRef, record.ModeCapture, rootFields, nil, "")</code>; its computed ID must equal <code>record.RootWitnessRecordID()</code> — assert at bootstrap, fail Open otherwise. Its <code>records</code> row stores an empty <code>witness_digest</code> and it has no <code>witness_bodies</code> row. <code>AppendBatch</code> takes a dedicated <code>*sql.Conn</code> and issues <code>BEGIN IMMEDIATE</code> explicitly; inside the transaction, per draft in order: validate the witness body (<code>record.ValidateWitnessBody</code>), compute the witness digest (<code>record.WitnessBodyDigest</code>), verify every <code>CausedBy</code> entry names an existing record or an earlier draft in this batch (else roll back with a citation error), build the record (<code>record.RecordInput</code>), compute its digest, allocate the owner's next ordinal, insert record + witness body + edges + path entry, and call <code>appendCrashHook("insert")</code>; then update frontier and ordinal counter, record the intent row (plain insert — replay/conflict semantics are Task 2; the batch digest is <code>DigestKernel</code> over the array of the batch's record digests, receipts stored as canonical JSON), call <code>appendCrashHook("pre-commit")</code>, and <code>COMMIT</code>. Any error rolls back whole. <code>AppendFact</code> is <code>AppendBatch</code> with a generated intent ID and one draft. <code>read.go</code>: <code>GetRecord</code> (SELECT by ID, decode stored bytes; <code>ErrNotFound</code> if absent), <code>PathRecords</code> (by path, ordinal order), <code>Frontier</code> (frontiers table; root ID when the path has no frontier row).</li>
+<li>[ ] <b>Step 5 — Run tests:</b> <code>go test ./internal/store/</code> — Expected: PASS, including the fault-injection and reopen tests; then <code>go test ./...</code> and <code>bash scripts/check-phase0.sh</code> — Expected: PASS / PHASE 0 GATE: GREEN.</li>
+<li>[ ] <b>Step 6 — Commit:</b> <code>feat(store): trace store schema and atomic append core</code>.</li>
+</ul>
+
+<h3>Task 2 (T-F2-2): Intent-idempotent appends</h3>
+<p><b>Files:</b> Modify <code>internal/store/append.go</code>; Test <code>internal/store/intent_test.go</code> (package <code>store_test</code>).</p>
+<p><b>Interfaces:</b> Consumes — Task 1's <code>AppendBatch</code> and the <code>append_intents</code> table. Produces —</p>
+<pre>type IntentConflictError struct { IntentID, ExistingDigest, IncomingDigest string }
+func (e *IntentConflictError) Error() string // "store: append intent %q already recorded with a different batch digest"</pre>
+<p>Semantics: same intent ID + same batch digest → the stored receipts, nothing appended; same intent ID + different batch digest → <code>*IntentConflictError</code>, nothing appended.</p>
+<ul>
+<li>[ ] <b>Step 1 — Failing tests:</b>
+<pre>func TestAppendIntentReplayReturnsPriorReceipt(t *testing.T) { // AC-F2-2, first leg
+    s := openTemp(t)
+    drafts := []store.RecordDraft{draft(t, "test.fact", `{"n":1}`), draft(t, "test.fact", `{"n":2}`)}
+    first, err := s.AppendBatch("runs/a", "intent-1", drafts)
+    if err != nil { t.Fatal(err) }
+    again, err := s.AppendBatch("runs/a", "intent-1", drafts)
+    if err != nil { t.Fatalf("replay errored: %v", err) }
+    if !reflect.DeepEqual(first, again) { t.Fatalf("receipts differ: %v vs %v", first, again) }
+    if recs, _ := s.PathRecords("runs/a"); len(recs) != 2 { t.Fatalf("store grew on replay: %d records", len(recs)) }
+}
+func TestAppendIntentConflictAppendsNothing(t *testing.T) { // AC-F2-2, second leg
+    s := openTemp(t)
+    _, _ = s.AppendBatch("runs/a", "intent-1", []store.RecordDraft{draft(t, "test.fact", `{"n":1}`)})
+    _, err := s.AppendBatch("runs/a", "intent-1", []store.RecordDraft{draft(t, "test.fact", `{"n":2}`)})
+    var conflict *store.IntentConflictError
+    if !errors.As(err, &amp;conflict) { t.Fatalf("err = %v, want IntentConflictError", err) }
+    if recs, _ := s.PathRecords("runs/a"); len(recs) != 1 { t.Fatalf("conflict appended: %d records", len(recs)) }
+}
+func TestAppendBatchRejectsDegenerateInputs(t *testing.T) { // Review Focus 3
+    s := openTemp(t)
+    d := draft(t, "test.fact", `{"n":1}`)
+    if _, err := s.AppendBatch("runs/a", "i", nil); !errors.Is(err, store.ErrEmptyBatch) { t.Fatalf("empty batch err = %v", err) }
+    if _, err := s.AppendBatch("runs/a", "", []store.RecordDraft{d}); err == nil { t.Fatal("empty intent accepted") }
+    if _, err := s.AppendBatch("", "i", []store.RecordDraft{d}); err == nil { t.Fatal("empty owner path accepted") }
+    if _, err := s.AppendBatch("replaycore.system", "i", []store.RecordDraft{d}); err == nil { t.Fatal("reserved path accepted") }
+}</pre>
+Run: <code>go test ./internal/store/ -run 'Intent|Degenerate'</code> — Expected: FAIL (replay currently re-appends or errors on the intent PK; degenerate inputs accepted).</li>
+<li>[ ] <b>Step 2 — Implement:</b> in <code>AppendBatch</code>, before opening the write transaction: reject degenerate inputs (empty batch → <code>ErrEmptyBatch</code>; empty intent ID, empty owner path, or an owner path with prefix <code>replaycore.</code> → descriptive errors). Compute the batch digest from the drafts (record digests are deterministic — compute them before the transaction). SELECT the intent row: if present and its digest equals the incoming batch digest, decode and return the stored receipts; if present and different, return <code>*IntentConflictError</code>. Otherwise proceed with Task 1's transaction, which now inserts the intent row it has already checked. (Two racing identical intents in one process serialize on <code>BEGIN IMMEDIATE</code>; the in-transaction re-check of the intent row before insert is required — a same-intent insert that loses the race returns the winner's receipts, never a PK error.)</li>
+<li>[ ] <b>Step 3 — Run tests:</b> <code>go test ./internal/store/</code> — Expected: PASS (Tasks 1–2 tests).</li>
+<li>[ ] <b>Step 4 — Commit:</b> <code>feat(store): intent-idempotent appends with conflict error</code>.</li>
+</ul>
+
+<h3>Task 3 (T-F2-3): Database identity backstop — mutation sweep</h3>
+<p><b>Files:</b> Test <code>internal/store/identity_sweep_test.go</code> (package <code>store_test</code>); Modify <code>internal/store/store.go</code> only if a sweep case finds a real hole.</p>
+<p><b>Interfaces:</b> Consumes — Task 1's schema (the <code>CHECK (record_id = digest)</code> constraint) and store file format. Produces — the adversarial evidence for AC-F2-3 (safety-bearing; the R3-review P2-3 build-phase remediation, write-side leg). The sweep opens a <i>second</i>, raw <code>database/sql</code> handle on the same store file — the bypass attempts are real SQL, not calls into the store's own API.</p>
+<ul>
+<li>[ ] <b>Step 1 — Failing tests (the sweep):</b>
+<pre>func TestIdentityCheckRejectsMismatchedInsert(t *testing.T) { // AC-F2-3, as written
+    path := seedStore(t) // a store with one valid record, closed
+    raw := openRaw(t, path)
+    _, err := raw.Exec(`INSERT INTO records (record_id, digest, owner_path, owner_ordinal, schema_ref, mode, canonical_bytes, witness_digest)
+        VALUES ('sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                'sha256:2222222222222222222222222222222222222222222222222222222222222222',
+                'runs/a', 99, 'test.fact', 'capture', x'00', 'sha256:22e3bf15914b5007dea08a1079d1542470a369bcbed067687f345e7e85721130')`)
+    if err == nil || !strings.Contains(err.Error(), "constraint") { t.Fatalf("mismatched INSERT err = %v, want CHECK constraint violation", err) }
+}
+func TestIdentityMutationSweep(t *testing.T) {
+    // every insert path that could create a row with record_id != digest must fail:
+    cases := []string{
+        `UPDATE records SET record_id = 'sha256:3333333333333333333333333333333333333333333333333333333333333333'`,
+        `UPDATE records SET digest = 'sha256:4444444444444444444444444444444444444444444444444444444444444444'`,
+        `INSERT INTO records SELECT 'sha256:5555555555555555555555555555555555555555555555555555555555555555', digest, owner_path, 100, schema_ref, mode, canonical_bytes, witness_digest FROM records LIMIT 1`,
+    }
+    // each executed against a freshly seeded store; each must error with a constraint violation
+    // by-construction leg: every row AppendBatch writes satisfies record_id == digest AND sha256-of-canonical-bytes == record_id
+}</pre>
+Run: <code>go test ./internal/store/ -run 'Identity'</code> — Expected: the direct-INSERT case PASSES already (Task 1's CHECK); the sweep is written to prove all cases — if any case succeeds in mutating identity, that is the finding this task exists to catch: fix the schema (e.g. an overlooked column path) before proceeding, do not weaken the test.</li>
+<li>[ ] <b>Step 2 — Implement:</b> no production change is expected. If the sweep exposes a hole, the fix lands in the DDL in <code>store.go</code> with the failing case kept as the regression test.</li>
+<li>[ ] <b>Step 3 — Run tests:</b> <code>go test ./internal/store/</code> — Expected: PASS.</li>
+<li>[ ] <b>Step 4 — Commit:</b> <code>test(store): database identity backstop mutation sweep</code>.</li>
+</ul>
+
+<h3>Task 4 (T-F2-4): Witness-chain validation on reads</h3>
+<p><b>Files:</b> Modify <code>internal/store/read.go</code>; Test <code>internal/store/corruption_test.go</code> (package <code>store_test</code>).</p>
+<p><b>Interfaces:</b> Consumes — Task 1's stored form (record canonical bytes, <code>witness_digest</code> column, witness body bytes). Produces —</p>
+<pre>type CorruptionError struct { RecordID, Reason string }
+func (e *CorruptionError) Error() string // "store: record %s failed validation: %s"</pre>
+<p><code>GetRecord</code> (and <code>PathRecords</code>, which shares its row-decoding path) now validates, in order: (1) the stored canonical bytes decode and re-digest to the row's <code>record_id</code>; (2) the row's <code>witness_digest</code> column equals the record object's <code>witness</code> field; (3) the stored witness body re-digests via <code>record.WitnessBodyDigest</code> to that same digest and passes <code>record.ValidateWitnessBody</code>. The root witness record is the sole exception to (2)–(3): its witness is the empty sentinel, its ID must equal <code>record.RootWitnessRecordID()</code>, it has no <code>witness_bodies</code> row, and its <code>StoredRecord.WitnessBody</code> is its own body (the root witness fields). Any failure → <code>*CorruptionError</code>, never the record.</p>
+<ul>
+<li>[ ] <b>Step 1 — Failing tests (the corruption suite, AC-F2-5):</b> seed a 5-record fixture trace through the public API, close, then tamper via a raw handle, one subtest per case, reopening through <code>store.Open</code> and asserting <code>GetRecord</code> on the affected record returns <code>*CorruptionError</code>:
+<pre>func TestGetRecordRejectsTamperedBody(t *testing.T)     // (a) flip one byte in records.canonical_bytes
+func TestGetRecordRejectsTamperedWitnessBody(t *testing.T) // (b) flip one byte in witness_bodies.body_bytes
+func TestGetRecordRejectsTamperedWitnessCitation(t *testing.T) // (c) UPDATE records SET witness_digest = 'sha256:9999...'
+func TestGetRecordAcceptsUntamperedFixture(t *testing.T) // control: all 5 records read back, digests intact</pre>
+Run: <code>go test ./internal/store/ -run 'GetRecord'</code> — Expected: FAIL (Task 1's read path returns tampered records).</li>
+<li>[ ] <b>Step 2 — Implement validation</b> in <code>read.go</code>'s row decoder, exactly as the Interfaces block orders it. Byte flips in canonical bytes are caught at (1) by re-digest; a body flip that still parsed is impossible to distinguish from a different valid record except by digest — that is the point of (1).</li>
+<li>[ ] <b>Step 3 — Run tests:</b> <code>go test ./internal/store/</code> — Expected: PASS, including all prior tasks' tests (validation must not reject any legitimately written record, the root witness included).</li>
+<li>[ ] <b>Step 4 — Commit:</b> <code>feat(store): witness-chain validation on reads</code>.</li>
+</ul>
+
+<h3>Task 5 (T-F2-7): Milestone records — consumer-declared, never enforced</h3>
+<p><b>Files:</b> Create <code>internal/store/milestone.go</code>; Test <code>internal/store/milestone_test.go</code> (package <code>store_test</code>).</p>
+<p><b>Interfaces:</b> Consumes — Task 1's <code>AppendFact</code>, <code>MilestoneSchemaRef</code>. Produces —</p>
+<pre>func (s *Store) AppendMilestone(ownerPath, taskID, snapshotRef string, causedBy []string) (Receipt, error)</pre>
+<p>which appends, in <code>declaration</code> mode under <code>MilestoneSchemaRef</code> with the root witness body as witness (Decision 4(a)), a record whose body is the canonical object <code>{"snapshot_ref": &lt;snapshotRef&gt;, "task_id": &lt;taskID&gt;}</code>.</p>
+<ul>
+<li>[ ] <b>Step 1 — Failing tests:</b>
+<pre>func TestAppendMilestoneRoundTrip(t *testing.T) { // AC-F2-8
+    s := openTemp(t)
+    r, err := s.AppendMilestone("runs/a", "task-7", "c0ffee1234", nil)
+    if err != nil { t.Fatal(err) }
+    rec, err := s.GetRecord(r.RecordID)
+    if err != nil { t.Fatalf("milestone not addressable by digest: %v", err) }
+    body := mustObject(t, rec.Record, "body")
+    if got := mustString(t, body, "task_id"); got != "task-7" { t.Fatalf("task_id = %q", got) }
+    if got := mustString(t, body, "snapshot_ref"); got != "c0ffee1234" { t.Fatalf("snapshot_ref = %q", got) }
+    next, err := s.AppendFact("runs/a", draftCiting(t, "test.fact", `{"n":1}`, []string{r.RecordID}))
+    if err != nil { t.Fatalf("successor cannot cite milestone: %v", err) }
+    _ = next
+}
+func TestMilestoneUnknownTaskAccepted(t *testing.T) { // AC-F2-9: claimed, not enforced
+    s := openTemp(t)
+    if _, err := s.AppendMilestone("runs/a", "task-that-exists-in-no-registry", "abc", nil); err != nil {
+        t.Fatalf("store enforced a task boundary: %v", err)
+    }
+}</pre>
+(<code>draftCiting</code> is Task 1's <code>draft</code> helper with a <code>CausedBy</code> parameter — add it beside <code>draft</code>.) Run: <code>go test ./internal/store/ -run Milestone</code> — Expected: FAIL (no <code>AppendMilestone</code>).</li>
+<li>[ ] <b>Step 2 — Implement</b> <code>AppendMilestone</code> as specified; it must contain no validation of <code>taskID</code> against anything — that absence is the AC-F2-9 contract, and the code review for this task checks for it explicitly.</li>
+<li>[ ] <b>Step 3 — Run tests:</b> <code>go test ./internal/store/</code> — Expected: PASS.</li>
+<li>[ ] <b>Step 4 — Commit:</b> <code>feat(store): milestone records as consumer-declared data</code>.</li>
+</ul>
+
+<h3>Task 6 (T-F2-5): Concurrent appends under multi-process contention</h3>
+<p><b>Files:</b> Test <code>internal/store/concurrent_test.go</code> (package <code>store_test</code>); Modify <code>internal/store/append.go</code> / <code>store.go</code> only if the proof finds a real defect.</p>
+<p><b>Interfaces:</b> Consumes — Tasks 1–2 (BEGIN IMMEDIATE appends, <code>busy_timeout(5000)</code>, intent receipts) and Task 4's validating <code>GetRecord</code> (the audit's digest check). Produces — the ported concurrent-append evidence for AC-F2-6 (gate evidence). The mechanism under test is the one the evidence prescribes: writers serialize on <code>BEGIN IMMEDIATE</code>; a <code>database is locked</code> error reaching a caller is a failure of this task, not an acceptable outcome.</p>
+<ul>
+<li>[ ] <b>Step 1 — Failing test:</b> a re-exec helper, <code>TestAppenderProcess</code> (skips unless env <code>REPLAYCORE_APPENDER_ID</code> is set): opens the store at <code>REPLAYCORE_STORE_PATH</code> and appends 25 batches × 4 records to the shared path <code>runs/shared</code> with intent IDs <code>app&lt;id&gt;-&lt;i&gt;</code>, exiting non-zero on any error. The parent test spawns 4 children concurrently against one store file, waits for all to exit 0, then audits:
+<pre>func TestConcurrentAppendsAcrossProcesses(t *testing.T) { // AC-F2-6
+    // spawn 4 x TestAppenderProcess (25 batches x 4 records each, one shared owner path)
+    // audit after all children exit 0:
+    recs, err := s.PathRecords("runs/shared")
+    if err != nil { t.Fatal(err) }
+    if len(recs) != 400 { t.Fatalf("records = %d, want 400 (lost batches)", len(recs)) }
+    for i, r := range recs { // ordinals exactly 0..399, no collisions, no gaps
+        if r.OwnerOrdinal != int64(i) { t.Fatalf("ordinal[%d] = %d", i, r.OwnerOrdinal) }
+        if _, err := s.GetRecord(r.ID); err != nil { t.Fatalf("record %s fails validation: %v", r.ID, err) }
+    }
+    // every intent receipted: replaying one intent per appender returns its original receipts
+}</pre>
+Run: <code>go test ./internal/store/ -run Concurrent -count=1</code> — Expected: unknown — this is a proof task; if it passes against Tasks 1–4 unmodified, record that (the protocol was already sufficient) and proceed to Step 3.</li>
+<li>[ ] <b>Step 2 — Fix what the proof finds</b> (expected candidates, in order: busy-timeout too small under 4-way contention → raise the pragma in the DSN; a same-intent race surfacing a PK error → the in-transaction intent re-check from Task 2). Any fix keeps the AC's terms: no caller-visible locking errors, no lost batches.</li>
+<li>[ ] <b>Step 3 — Run tests:</b> <code>go test ./internal/store/ -count=1</code> — Expected: PASS, the concurrent test included, three runs in a row (<code>-count=3</code> on the concurrent test alone) without a flake.</li>
+<li>[ ] <b>Step 4 — Commit:</b> <code>test(store): concurrent-append proof under multi-process contention</code> (or <code>fix(store): …</code> naming the defect, if Step 2 changed production code).</li>
+</ul>
+
+<h3>Task 7 (T-F3-1): Cut publication and immutable slice resolution</h3>
+<p><b>Files:</b> Create <code>internal/slice/slice.go</code>, <code>internal/slice/cut.go</code>; Test <code>internal/slice/cut_test.go</code> (package <code>slice_test</code>).</p>
+<p><b>Interfaces:</b> Consumes — <code>store.Store</code> (<code>GetRecord</code>, <code>PathRecords</code>, <code>AppendFact</code>), <code>store.CutSchemaRef</code>. Produces —</p>
+<pre>type Slice struct {
+    CutID    string             // "" for projections (Task 9)
+    Records  []store.StoredRecord // causal (topological) order, deterministic tie-break
+    Edges    [][2]string        // {record, cause} pairs among the selected records
+    Frontier string             // the cut's through-fact (or path tail for projections)
+}
+func (sl Slice) Digest() (string, error) // DigestKernel over {"cut": CutID, "kind": "slice", "records": [IDs in Order()]}
+func (sl Slice) Order() []string
+type Cut struct { OwnerPath, ThroughFactID string; ThroughOrdinal int64 }
+func PublishCut(s *store.Store, ownerPath, throughFactID string) (string, error) // returns the cut record's ID
+func ReadCut(s *store.Store, cutID string) (Cut, error)
+func ResolveCut(s *store.Store, cutID string, modeFilter []string) (Slice, error) // filter machinery: Task 8; nil admits all</pre>
+<p><code>PublishCut</code> appends the cut record on the target owner path itself (mode <code>declaration</code>, schema <code>CutSchemaRef</code>, body <code>{owner_path, through_fact_id, through_owner_ordinal}</code> with the ordinal read from the through-fact's stored record, <code>caused_by = [throughFactID]</code>, root witness body as witness). Closure is computed <b>iteratively</b> (explicit stack — Review Focus 5): start from the target path's records with ordinal ≤ through-ordinal, then walk <code>caused_by</code> transitively via <code>GetRecord</code>, pulling cross-path ancestors in. Record order is a topological sort with ties broken by <code>(OwnerPath, OwnerOrdinal, ID)</code>, so a Slice's <code>Digest</code> is stable across resolutions.</p>
+<ul>
+<li>[ ] <b>Step 1 — Failing tests:</b>
+<pre>func TestPublishCutResolvesCausalClosure(t *testing.T) { // AC-F3-1
+    // fixture: path runs/a: r1 -&gt; r2 -&gt; r3 -&gt; r4; path runs/b: x1 citing r1 (cross-path ancestor class)
+    // cut at r3 on runs/a; expected = independently computed closure of r3 = {root, r1, r2, r3}
+    // assert: r4 absent; every ancestor present; Edges match the caused_by pairs among the selected
+}
+func TestResolvedSliceImmutable(t *testing.T) { // AC-F3-2
+    // resolve cut; append r5, r6 on the same path; re-resolve
+    // assert: identical record ID sets and identical Slice.Digest()
+}
+func TestResolveCutDeepChain(t *testing.T) { // Review Focus 5
+    // 10,000-record linear chain (batches of 500, each record citing the previous; first cites the root)
+    // cut at the tail; assert resolution returns 10,001 records (chain + root) with no error
+}</pre>
+Run: <code>go test ./internal/slice/</code> — Expected: FAIL (package does not exist).</li>
+<li>[ ] <b>Step 2 — Implement</b> <code>slice.go</code> and <code>cut.go</code> as specified. One honesty rule for the intermediate state: in this task <code>ResolveCut</code> implements closure for the nil filter and <b>rejects a non-empty filter with a descriptive error</b> — silently treating a filter as nil would be a false claim. Task 8 removes the rejection and implements the filter. The rejection is covered by a test so its removal is visible in Task 8's diff.</li>
+<li>[ ] <b>Step 3 — Run tests:</b> <code>go test ./internal/slice/ ./internal/store/</code> — Expected: PASS.</li>
+<li>[ ] <b>Step 4 — Commit:</b> <code>feat(slice): cut publication and immutable slice resolution</code>.</li>
+</ul>
+
+<h3>Task 8 (T-F3-2): Mode filters applied after causal closure</h3>
+<p><b>Files:</b> Modify <code>internal/slice/cut.go</code>; Test <code>internal/slice/filter_test.go</code> (package <code>slice_test</code>).</p>
+<p><b>Interfaces:</b> Consumes — Task 7's closure. Produces — the filter law: for a mode set <code>F</code>, <code>filtered(closure) = drop(records with mode ∉ F)</code>, except records whose schema_ref is <code>store.MilestoneSchemaRef</code> or <code>store.CutSchemaRef</code>, which are always retained (Decision 4(b)); edges are restricted to the retained records. An empty filter admits all. A filter naming a mode other than <code>capture</code>/<code>declaration</code> → <code>ErrUnknownMode</code>.</p>
+<pre>var ErrUnknownMode = errors.New("slice: unknown mode in filter")</pre>
+<ul>
+<li>[ ] <b>Step 1 — Failing tests (the purity-law suite, AC-F3-3):</b> deterministic fixture traces (fixed-seed generation: interleaved capture/declaration records with cross-citations, plus a milestone and a cut inside the range). For each filter in <code>{capture}</code>, <code>{declaration}</code>, <code>{capture, declaration}</code>: compute the expected set in the test by filtering the unfiltered resolution with the law's own drop rule, and assert <code>ResolveCut(cut, filter)</code> equals it exactly (IDs and order). Plus:
+<pre>func TestModeFilterRejectsUnknownMode(t *testing.T) {
+    if _, err := slice.ResolveCut(s, cutID, []string{"bogus"}); !errors.Is(err, slice.ErrUnknownMode) {
+        t.Fatalf("err = %v, want ErrUnknownMode", err)
+    }
+}</pre>
+Run: <code>go test ./internal/slice/ -run 'ModeFilter'</code> — Expected: FAIL (Task 7 rejects non-empty filters).</li>
+<li>[ ] <b>Step 2 — Implement</b> the filter inside <code>ResolveCut</code> after closure, per the Interfaces law; remove Task 7's rejection and its test.</li>
+<li>[ ] <b>Step 3 — Run tests:</b> <code>go test ./internal/slice/</code> — Expected: PASS, purity laws included.</li>
+<li>[ ] <b>Step 4 — Commit:</b> <code>feat(slice): mode filters applied after causal closure</code>.</li>
+</ul>
+
+<h3>Task 9 (T-F3-3): Effective-history projection over abandon facts</h3>
+<p><b>Files:</b> Create <code>internal/slice/project.go</code>; Test <code>internal/slice/project_test.go</code> (package <code>slice_test</code>).</p>
+<p><b>Interfaces:</b> Consumes — Tasks 1, 7. Produces —</p>
+<pre>func Abandon(s *store.Store, ownerPath, abandonedRootID string, causedBy []string) (store.Receipt, error)
+func ProjectEffectiveHistory(s *store.Store, ownerPath string) (Slice, error) // CutID == ""; Frontier == path tail</pre>
+<p><code>Abandon</code> appends a record under <code>store.AbandonSchemaRef</code> (mode <code>declaration</code>, body <code>{"abandoned": &lt;abandonedRootID&gt;}</code>, root witness body as witness). Projection = the path's full closure to its frontier, minus every abandoned root and all its descendants within the closure (descendants computed over the closure's reversed edges). Bytes are never deleted (spec §5): abandoned records remain readable via <code>GetRecord</code>.</p>
+<ul>
+<li>[ ] <b>Step 1 — Failing test (AC-F3-4):</b>
+<pre>func TestProjectionExcludesAbandonedSubtree(t *testing.T) {
+    // fixture: main chain m1 -&gt; m2 -&gt; m3; subtree off m1: s1 -&gt; s2 (s1 cites m1, s2 cites s1)
+    // Abandon(s1); ProjectEffectiveHistory:
+    //   assert s1, s2 absent; m1, m2, m3 present
+    //   assert GetRecord(s1) still succeeds — projection, never deletion
+}</pre>
+Run: <code>go test ./internal/slice/ -run Projection</code> — Expected: FAIL.</li>
+<li>[ ] <b>Step 2 — Implement</b> <code>project.go</code> as specified, reusing Task 7's closure machinery (factor the closure walk into an internal helper both files use; do not duplicate it).</li>
+<li>[ ] <b>Step 3 — Run tests:</b> <code>go test ./internal/slice/</code> — Expected: PASS.</li>
+<li>[ ] <b>Step 4 — Commit:</b> <code>feat(slice): effective-history projection over abandon facts</code>.</li>
+</ul>
+
+<h3>Task 10 (T-F2-6): Garbage collection with survival guarantee</h3>
+<p><b>Files:</b> Create <code>internal/store/gc.go</code>; Test <code>internal/store/gc_test.go</code> (package <code>store_test</code>).</p>
+<p><b>Interfaces:</b> Consumes — Tasks 1, 7 (published cuts exist as records). Produces —</p>
+<pre>type GarbageReport struct { Collected, Kept int }
+func (s *Store) CollectGarbage() (GarbageReport, error)</pre>
+<p>Retention roots (Decision 4(c)): every frontier tail, every record with schema <code>CutSchemaRef</code>, every record with schema <code>MilestoneSchemaRef</code>. Kept = the <code>caused_by</code> closure of the roots. Everything else is collected in one transaction: the record rows, their edges and path entries, witness bodies left unreferenced by any surviving record, and intent rows whose every receipted record was collected. Ordinals of surviving records never change (no renumbering); frontiers are roots and are never collected.</p>
+<ul>
+<li>[ ] <b>Step 1 — Failing test (AC-F2-7):</b>
+<pre>func TestGCSurvival(t *testing.T) {
+    // fixture: main path with a published cut mid-chain; resolve the cut, record Slice.Digest()
+    // side branch: 3 records citing a main-path record but cited by nothing (unreachable from any root)
+    // CollectGarbage:
+    //   assert report.Collected == 3
+    //   re-resolve the cut: digest identical to pre-GC; every sliced record still GetRecord-able
+    //   assert each side-branch record now returns ErrNotFound
+    //   assert the frontier tail and a milestone record survive
+}</pre>
+Run: <code>go test ./internal/store/ -run GC</code> — Expected: FAIL (no <code>CollectGarbage</code>).</li>
+<li>[ ] <b>Step 2 — Implement</b> <code>gc.go</code>: compute the kept set iteratively in Go (load edges, walk from roots — the same iterative discipline as Task 7), then delete the complement in a single <code>BEGIN IMMEDIATE</code> transaction.</li>
+<li>[ ] <b>Step 3 — Run tests:</b> <code>go test ./internal/store/ ./internal/slice/</code> — Expected: PASS (GC must not break any slice or store behavior for surviving records).</li>
+<li>[ ] <b>Step 4 — Commit:</b> <code>feat(store): garbage collection with frontier and cut survival</code>.</li>
+</ul>
+
+<h3>Task 11 (T-F3-4): Epoch slicing and the positional cursor contract</h3>
+<p><b>Files:</b> Create <code>internal/slice/epoch.go</code>, modify <code>internal/slice/slice.go</code> (add <code>EffectAt</code>); Test <code>internal/slice/epoch_test.go</code> (package <code>slice_test</code>).</p>
+<p><b>Interfaces:</b> Consumes — Tasks 5, 7. Produces —</p>
+<pre>func (sl Slice) EffectAt(i int) (string, bool) // ID of the i-th capture-mode record in slice order; ("", false) out of range
+func EpochSlice(s *store.Store, ownerPath, fromMilestoneID, toMilestoneID string) (Slice, error)</pre>
+<p><code>EpochSlice</code> = (causal closure of the owner-path prefix up to and including the <code>to</code> milestone) minus (the same closure up to and including the <code>from</code> milestone) — <code>from</code> excluded, <code>to</code> included; order is the prefix closure's order restricted to the difference; the result's <code>Frontier</code> is the <code>to</code> milestone ID and <code>CutID</code> is empty (an epoch is not a published cut). Errors: either ID is not a milestone record, the milestones sit on different owner paths, <code>from == to</code>, or <code>from</code> comes after <code>to</code> on the path. <code>EffectAt</code> is the whole E3-A contract (ruling, DECIDED): positional access over the slice — no cache, no store, no new type.</p>
+<ul>
+<li>[ ] <b>Step 1 — Failing tests:</b>
+<pre>func TestEpochSliceBetweenMilestones(t *testing.T) { // AC-F3-5
+    // fixture: r1, M1, r2, r3, M2, r4 on one path (M = milestones)
+    // epoch(M1, M2) == {r2, r3, M2} exactly (M1 and r1 excluded, M2 included)
+    // partition law: epoch(root..M1] ∪ epoch(M1, M2] == prefix closure at M2, disjoint
+}
+func TestEffectAtCursorContract(t *testing.T) { // AC-F3-6
+    // over a mixed-mode slice: walking i = 0,1,2,... until ok == false yields exactly
+    // the slice's capture-mode record IDs, in slice order — and nothing else
+}
+func TestEpochSliceRejectsBadMilestones(t *testing.T) // cross-path pair, from == to, reversed pair: all error</pre>
+Run: <code>go test ./internal/slice/ -run 'Epoch|EffectAt'</code> — Expected: FAIL.</li>
+<li>[ ] <b>Step 2 — Implement</b> both functions, reusing the Task 7/9 closure helper (prefix closure by ordinal bound, then set difference by record ID).</li>
+<li>[ ] <b>Step 3 — Run tests:</b> <code>go test ./internal/slice/</code> — Expected: PASS.</li>
+<li>[ ] <b>Step 4 — Commit:</b> <code>feat(slice): epoch slicing and positional cursor contract</code>.</li>
+</ul>
+
+<h3>Task 12 (T-F3-5): Epoch scope guard — the negative claim, machine-checked</h3>
+<p><b>Files:</b> Test <code>internal/slice/api_surface_test.go</code> (package <code>slice_test</code>). No production files.</p>
+<p><b>Interfaces:</b> Consumes — the compiled <code>internal/slice</code> package sources. Produces — the standing evidence for AC-F3-7: an AST walk (<code>go/parser</code>) over the package's non-test sources asserting (1) every exported top-level identifier is on the allowlist <code>{Slice, Cut, PublishCut, ReadCut, ResolveCut, Abandon, ProjectEffectiveHistory, EpochSlice, ErrUnknownMode}</code> plus <code>Slice</code>'s exported methods <code>{Digest, Order, EffectAt}</code>, and (2) no exported identifier's name contains <code>effect</code> (case-insensitive) except <code>EffectAt</code>, and none contains <code>cache</code> or <code>replay</code>.</p>
+<ul>
+<li>[ ] <b>Step 1 — Failing test:</b> write the guard with a built-in negative control: the walker first runs against a synthetic source string declaring <code>func EffectCache() {}</code> and must flag it — a walker that cannot flag its own control case fails the test, so the guard cannot pass vacuously. Run: <code>go test ./internal/slice/ -run APIGuard</code> — Expected: PASS against the current package (Tasks 7–11 built nothing out of scope) — if it FAILS, the finding is real: an earlier task grew surface the ruling forbids; remove or rename before proceeding, do not extend the allowlist silently (an allowlist change needs the rationale recorded in the commit message).</li>
+<li>[ ] <b>Step 2 — Run tests:</b> <code>go test ./internal/slice/</code> — Expected: PASS.</li>
+<li>[ ] <b>Step 3 — Commit:</b> <code>test(slice): epoch scope guard over the public API surface</code>.</li>
+</ul>
+
+<h3>Task 13 (T-F4-1): Dual-tree snapshot commits over Git plumbing</h3>
+<p><b>Files:</b> Create <code>internal/snapshot/snapshot.go</code>; Test <code>internal/snapshot/snapshot_test.go</code> (package <code>snapshot_test</code>).</p>
+<p><b>Interfaces:</b> Consumes — the <code>git</code> binary (Decision 2), <code>canonical.MarshalKernel</code> for deterministic meta bytes. Produces —</p>
+<pre>type Store struct { /* unexported: bare repo dir, last snapshot commit */ }
+func Open(dir string) (*Store, error) // creates a bare repo if absent; probes the plumbing (below)
+func (s *Store) Snapshot(workspaceDir string, meta map[string]string) (string, error) // returns the commit ID</pre>
+<p>Snapshot layout inside the commit: a root tree with exactly two subtrees — <code>files/</code> (the workspace tree) and <code>meta/</code> (<code>manifest.json</code>: per-entry kind/size/mtime/blob; <code>snapshot.json</code>: creation time plus the caller's <code>meta</code> map verbatim). Each snapshot commit's parent is the store's previous snapshot commit; the commit is referenced under <code>refs/vcscore/ops/</code> and also as <code>refs/vcscore/ops/latest</code>, which is how a reopened store finds its last snapshot and continues the chain. Walk law: directories named <code>.git</code> are skipped; symlinks are stored as mode-<code>120000</code> blobs containing the link target, never followed; any entry that is not a regular file, directory, or symlink — or a regular file that cannot be read — fails the whole snapshot with an error naming the path. The <code>Open</code> probe: <code>git hash-object -w --stdin</code> over empty input must return <code>e69de29bb2d1d6434b8b29ae775ad8c2e48c5391</code> (the empty blob), proving the plumbing works in this repo before any caller depends on it.</p>
+<ul>
+<li>[ ] <b>Step 1 — Failing tests:</b>
+<pre>func TestSnapshotDualTree(t *testing.T) { // AC-F4-1
+    // workspace: hello.txt ("hello\n"), sub/nested.txt, empty dir
+    // Snapshot(ws, map[string]string{"run": "synthetic-1"}); then via git plumbing on the store:
+    //   cat-file -t &lt;commit&gt; == "commit"
+    //   ls-tree &lt;commit&gt; == exactly {files, meta}
+    //   blob at files/hello.txt == "hello\n"; meta/snapshot.json contains "synthetic-1"
+    //   meta/manifest.json parses and lists both files
+}
+func TestSnapshotStoresSymlinksAsLinks(t *testing.T) { // Review Focus 4a
+    // symlink inside the workspace pointing at a file OUTSIDE it
+    // assert: tree entry mode 120000; blob content == the target path string, not the target's bytes
+}
+func TestSnapshotFailsOnUnreadableFile(t *testing.T) { // Review Focus 4b
+    // the test suite in this sandbox runs as uid 0, where permission bits do not block reads —
+    // so the unreadable case is exercised with a workspace nested (level-by-level, via Chdir)
+    // until a file's absolute path exceeds the 4096-byte PATH_MAX: opening it by its walked
+    // path fails even for root. Snapshot must surface that failure as an error naming the path.
+}
+func TestSnapshotRejectsSpecialFiles(t *testing.T) // a FIFO in the workspace: error naming the path</pre>
+Run: <code>go test ./internal/snapshot/</code> — Expected: FAIL (package does not exist).</li>
+<li>[ ] <b>Step 2 — Implement</b> <code>snapshot.go</code>: all Git access through <code>os/exec</code> with argument vectors (never a shell), <code>-C &lt;dir&gt;</code> on every call, committer identity pinned per invocation (<code>-c user.name=replay-core -c user.email=replay-core@localhost</code>), and a temporary index file (<code>GIT_INDEX_FILE</code>) so no real index is touched. Build: walk → manifest; for each file, <code>hash-object -w</code> (Task 14 makes this incremental; here, hash everything); <code>update-index --add --cacheinfo &lt;mode&gt;,&lt;sha&gt;,files/&lt;rel&gt;</code> (symlinks: hash the target string as a blob, mode <code>120000</code>); write <code>meta/</code> blobs the same way; <code>write-tree</code>; <code>commit-tree</code> with the previous snapshot as parent when one exists; <code>update-ref refs/vcscore/ops/snapshot-&lt;commit-prefix&gt;</code> and <code>update-ref refs/vcscore/ops/latest</code> to the new commit.</li>
+<li>[ ] <b>Step 3 — Run tests:</b> <code>go test ./internal/snapshot/</code> — Expected: PASS.</li>
+<li>[ ] <b>Step 4 — Commit:</b> <code>feat(snapshot): dual-tree snapshot commits over git plumbing</code>.</li>
+</ul>
+
+<h3>Task 14 (T-F4-2): Incremental snapshot builds</h3>
+<p><b>Files:</b> Modify <code>internal/snapshot/snapshot.go</code>; Test <code>internal/snapshot/incremental_test.go</code> (package <code>snapshot_test</code>).</p>
+<p><b>Interfaces:</b> Consumes — Task 13's manifest. Produces — the O(changed) build: an entry whose <code>(size, mtime)</code> pair matches the previous snapshot's manifest reuses its blob SHA without the file being read or re-hashed; only new/changed entries are hashed.</p>
+<ul>
+<li>[ ] <b>Step 1 — Failing test (AC-F4-2, the ≤20 bound):</b>
+<pre>func TestSnapshotIncrementalObjectBound(t *testing.T) {
+    // workspace of 1,000 small files; snap1; count objects (git count-objects -v: count + in-pack)
+    // modify exactly 1 file; snap2; count again
+    // assert: new objects &lt;= 20 (changed blob + rewritten trees + meta + commit, with slack)
+    // assert: the two snapshots' files/ trees differ only in the modified file's entry
+}</pre>
+Run: <code>go test ./internal/snapshot/ -run Incremental</code> — Expected: FAIL (Task 13 hashes everything; the object delta is ~1,000+).</li>
+<li>[ ] <b>Step 2 — Implement</b> manifest reuse as specified: load the previous manifest from the last snapshot commit's <code>meta/manifest.json</code> at <code>Snapshot</code> time, locating that commit via <code>refs/vcscore/ops/latest</code> (not from memory — a reopened store must stay incremental).</li>
+<li>[ ] <b>Step 3 — Run tests:</b> <code>go test ./internal/snapshot/</code> — Expected: PASS, dual-tree and symlink laws intact.</li>
+<li>[ ] <b>Step 4 — Commit:</b> <code>feat(snapshot): incremental builds reuse unchanged blobs</code>.</li>
+</ul>
+
+<h3>Task 15 (T-F4-3): World refs layout and zero-copy fork</h3>
+<p><b>Files:</b> Create <code>internal/snapshot/refs.go</code>; Test <code>internal/snapshot/refs_test.go</code> (package <code>snapshot_test</code>).</p>
+<p><b>Interfaces:</b> Consumes — Task 13's store. Produces —</p>
+<pre>type ScopeRef struct { Scope, CommitID string }
+func (s *Store) Fork(scope, commitID string) error // one update-ref; validates scope name and that commitID is a commit
+func (s *Store) ListScopes() ([]ScopeRef, error)   // refs/vcscore/scopes/*, sorted by scope</pre>
+<p>Refs layout law (AC-F4-5): every ref in the store lives under <code>refs/vcscore/</code> with second component one of <code>ground</code>, <code>materialized</code>, <code>scopes</code>, <code>ops</code>, <code>archive</code>. Scope names must match <code>^[a-z0-9][a-z0-9-]*$</code>.</p>
+<ul>
+<li>[ ] <b>Step 1 — Failing tests:</b>
+<pre>func TestForkIsZeroCopy(t *testing.T) { // AC-F4-3
+    // object count before == object count after Fork("lane-a", commit)
+    // for-each-ref: refs/vcscore/scopes/lane-a resolves to commit; ListScopes returns it
+}
+func TestRefsLayoutLaw(t *testing.T) { // AC-F4-5
+    // after Open + Snapshot + Fork: every ref from for-each-ref matches the layout law
+}
+func TestForkRejectsBadInputs(t *testing.T) // scope "../escape", scope "Has Caps", a blob SHA as commitID: all error</pre>
+Run: <code>go test ./internal/snapshot/ -run 'Fork|Refs'</code> — Expected: FAIL.</li>
+<li>[ ] <b>Step 2 — Implement</b> <code>refs.go</code> as specified.</li>
+<li>[ ] <b>Step 3 — Run tests:</b> <code>go test ./internal/snapshot/</code> — Expected: PASS.</li>
+<li>[ ] <b>Step 4 — Commit:</b> <code>feat(snapshot): world refs layout and zero-copy fork</code>.</li>
+</ul>
+
+<h3>Task 16 (T-F4-4): Milestone citations resolve snapshots at a cut</h3>
+<p><b>Files:</b> Create <code>internal/snapshot/cite.go</code>; Test <code>internal/snapshot/cite_test.go</code> (package <code>snapshot_test</code>).</p>
+<p><b>Interfaces:</b> Consumes — Tasks 5, 7, 15; <code>slice.ReadCut</code>, <code>store.GetRecord</code>. Produces —</p>
+<pre>func MilestoneBody(taskID, commitID string) canonical.Value // the exact body store.AppendMilestone writes
+func SnapshotAt(st *store.Store, cutID string) (string, error)</pre>
+<p><code>MilestoneBody</code> is the single construction site for the citation body (Decision 4(d)): <code>store.AppendMilestone</code> is refactored in this task to build its body through it, so the body shape cannot drift between writer and resolver. <code>SnapshotAt</code>: read the cut → take its through-fact → require the through-fact's schema_ref to be <code>store.MilestoneSchemaRef</code> (else a descriptive error: the cut does not terminate at a milestone) → return the body's <code>snapshot_ref</code>. Never "the latest snapshot" — the citation, and only the citation, decides.</p>
+<ul>
+<li>[ ] <b>Step 1 — Failing test (AC-F4-4):</b>
+<pre>func TestSnapshotAtResolvesCitedCommit(t *testing.T) {
+    // workspace v1 -&gt; snap1 = c1; modify workspace -&gt; snap2 = c2 (c1 != c2)
+    // milestone := AppendMilestone(path, "task-1", c1, nil); cut := PublishCut(path, milestone)
+    // got, err := snapshot.SnapshotAt(traceStore, cut)
+    // assert got == c1 — the cited commit, not the newer c2
+}
+func TestSnapshotAtRejectsNonMilestoneCut(t *testing.T) // cut through a plain fact: descriptive error</pre>
+Run: <code>go test ./internal/snapshot/ -run SnapshotAt</code> — Expected: FAIL.</li>
+<li>[ ] <b>Step 2 — Implement</b> <code>cite.go</code> and the <code>AppendMilestone</code> refactor (behavior unchanged; Task 5's tests are the regression net).</li>
+<li>[ ] <b>Step 3 — Run tests:</b> <code>go test ./...</code> — Expected: PASS everywhere.</li>
+<li>[ ] <b>Step 4 — Commit:</b> <code>feat(snapshot): milestone citations resolve snapshots at a cut</code>.</li>
+</ul>
+
+<h3>Task 17 (T-GATE-P1): Phase gate — synthetic run end-to-end</h3>
+<p><b>Files:</b> Create <code>internal/conformance/phase1_gate_test.go</code> (package <code>conformance_test</code>), <code>scripts/check-phase1.sh</code>.</p>
+<p><b>Interfaces:</b> Consumes — everything above. Produces — the assembled gate evidence for AC-GATE-1 (with AC-F2-6 and AC-F2-7 re-discharged in assembled form) and the one-command gate script.</p>
+<ul>
+<li>[ ] <b>Step 1 — Failing test (the gate demonstration):</b> <code>TestPhase1Gate</code> runs one synthetic run through all three features, in a temp dir:
+<pre>// 1. workspace: 3 files + a subdirectory; snapshot store + trace store opened
+// 2. run records appended: start batch (2 records), step batch (3 records)
+// 3. snap1 := Snapshot(ws, {"run": "gate"}); milestone M1 citing snap1 (task "gate-run")
+// 4. more step records; an experiment side-branch (2 records citing a step record, cited by nothing)
+// 5. an abandoned draft record + Abandon fact over it
+// 6. cut := PublishCut(path, M1); slice1 := ResolveCut(cut, nil); digest1 := slice1.Digest()
+// 7. two appender processes x 10 batches onto a second path (the AC-F2-6 shape, assembled)
+// 8. CollectGarbage(); slice2 := ResolveCut(cut, nil)
+//    assert slice2.Digest() == digest1 and every sliced record still reads (AC-F2-7, assembled)
+// 9. assert SnapshotAt(traceStore, cut) == snap1
+// 10. ProjectEffectiveHistory excludes the abandoned record; EpochSlice + EffectAt walk the M1 epoch
+// 11. byte-fidelity close: re-encode every record in slice2 via canonical.MarshalKernel and
+//     assert the bytes equal the store's stored canonical bytes for that record</pre>
+Run: <code>go test ./internal/conformance/ -run TestPhase1Gate -count=1</code> — Expected: PASS against the completed tasks (this is an assembly proof; a failure here is a cross-feature integration finding — fix the owning feature task's code, not the gate test's expectations).</li>
+<li>[ ] <b>Step 2 — Write <code>scripts/check-phase1.sh</code></b> mirroring <code>check-phase0.sh</code>: gofmt check over the whole tree; <code>go vet ./...</code>; per-package <code>go test -count=1</code> in the order canonical, record, conformance, store, slice, snapshot; the same zero-skip scan per package; a presence check for <code>TestPhase1Gate</code>; then run <code>scripts/check-phase0.sh</code> and require its GREEN line (Phase 1 must not regress Phase 0); final line <code>PHASE 1 GATE: GREEN</code>.</li>
+<li>[ ] <b>Step 3 — Run the gate:</b> <code>bash scripts/check-phase1.sh</code> — Expected: <code>PHASE 1 GATE: GREEN</code>, zero skips in every package.</li>
+<li>[ ] <b>Step 4 — Full-battery verification:</b> <code>go test -race ./... </code> — Expected: PASS, race-clean; <code>go vet ./...</code> clean (already in the script; run once more standalone for the record).</li>
+<li>[ ] <b>Step 5 — Commit:</b> <code>test(gate): phase 1 gate demonstration and check script</code>.</li>
+</ul>
+
+<h2>Phase Gate</h2>
+<p>Phase 1 — F2+F3+F4: trace store, cuts/slices, Git snapshot store — gated on: <b>"record/replay a synthetic run's data end-to-end; GC-survival and concurrent-append tests ported from upstream's suite."</b> (Source plan §6, verbatim; "replay" read as data round-trip per Global Constraints.) Task 17 discharges it: AC-GATE-1's synthetic run round-trips through store, slice, and snapshot; the concurrent-append suite (Task 6) and the GC-survival suite (Task 10) are re-exercised in assembled form inside the gate test; <code>scripts/check-phase1.sh</code> is the one-command proof, and it additionally requires the Phase 0 gate to still be green. Exit from Phase 1 = gate green + whole-branch independent review + hygiene pass, per the feature-to-PR pipeline; the PR and its merge are the owner's per-PR decision, as in Phase 0.</p>
+
+<h2>Plan Self-Review</h2>
+<ul>
+<li><b>Spec coverage:</b> all 22 Phase 1 acceptance criteria (AC-F2-1…9, AC-F3-1…7, AC-F4-1…5, AC-GATE-1) map to exactly one owning task in the mapping table; the three safety-bearing criteria (AC-F2-3, AC-F2-5, and AC-GATE-1 as gate evidence) carry dedicated adversarial or assembly tests; of the DECIDED rulings, E3-A is discharged by Task 11's cursor contract and the X1 graph directive by Tasks 5, 11, and 16; D3-B and E1-C bind Phases 2–3, and E2-A constrains Phase 3's fork-replay design — it has no Phase 1 surface, and Task 12's scope guard keeps it that way. Verified against <code>matrix.json</code> v1.3 programmatically during planning.</li>
+<li><b>Step scan:</b> every task's steps name the test, the run command, and the expected result before the implementation; no step defers a decision the Interfaces block should have made (the four sub-decisions found during planning are pinned in Decision 4, not left in steps).</li>
+<li><b>Type consistency:</b> signatures were cross-checked across tasks — <code>store.StoredRecord</code> fields are the ones Tasks 7–11 consume; <code>slice.Slice</code>'s fields are the ones Tasks 9, 11, and 17 consume; <code>snapshot.MilestoneBody</code> (Task 16) matches the body shape Task 5 writes, with the refactor step making them one construction site; the golden digests quoted in Task 1 are the corpus ground truths from Phase 0.</li>
+<li><b>Review Focus:</b> all five failure modes are pinned — reopen durability and hostile citations to Task 1, degenerate appends to Task 2, symlink/unreadable workspace entries to Task 13, deep chains to Task 7 — each with a named test in that task's steps.</li>
+<li><b>Proportion:</b> 17 tasks, one per roadmap task (no splits or merges — the roadmap decomposition was already at implementation depth); the largest tasks (1 and 13) are foundation builds whose size the phase's risk justifies; test-only tasks (3, 6, 12) are proof tasks whose deliverable is evidence, stated as such.</li>
+</ul>
+
+</body>
+</html>
