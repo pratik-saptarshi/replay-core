@@ -5,6 +5,11 @@
 # go to a temp dir). Exit 0 and a final "PHASE 0 GATE: GREEN" line
 # mean every check passed.
 #
+# Note: corpus generation tooling lives outside this repo (corpus
+# governance, testdata/corpus/README.md). This gate therefore verifies
+# the committed corpus by manifest hashes + full digest recomputation
+# rather than by regeneration; drift against the external reference law
+# is caught at reviewed corpus regenerations, not here.
 # Checks: gofmt, go vet, the full test suite, zero SKIP lines in the
 # corpus-driven suites, corpus file hashes against the manifest, and
 # the three named golden digests asserted independently of the corpus

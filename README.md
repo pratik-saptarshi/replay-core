@@ -1,9 +1,10 @@
 # replay-core
 
-Native (Go) replay capability for AEP: an execution store that records a
-run's effects by value and can replay them by digest match, fork a run at
-any recorded cut with one input amended, and settle workspace changes
-fail-closed.
+Native (Go) replay capability for AEP. Design intent: an execution store
+that records a run's effects by value and can replay them by digest match,
+fork a run at any recorded cut with one input amended, and settle workspace
+changes fail-closed. Phase 0 (current) builds only the canonical-digest
+law and its conformance corpus — no runtime exists yet; see Status.
 
 Charter: replay-core is an **execution store**, not a memory system.
 NeuroStrata remains the memory of record; replay-core inscribes pointers
