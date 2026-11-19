@@ -26,6 +26,15 @@ func draft(t *testing.T, schemaRef, bodyJSON string) store.RecordDraft {
 	}
 }
 
+// draftCiting is draft with a CausedBy parameter: the record cites
+// the given parents.
+func draftCiting(t *testing.T, schemaRef, bodyJSON string, causedBy []string) store.RecordDraft {
+	t.Helper()
+	d := draft(t, schemaRef, bodyJSON)
+	d.CausedBy = causedBy
+	return d
+}
+
 func TestAppendBatchOrdinalsGapFreePerOwner(t *testing.T) { // AC-F2-4
 	s := openTemp(t)
 	// Interleave batches on two owner paths; each path's ordinals must be
