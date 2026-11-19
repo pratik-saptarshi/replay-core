@@ -1,18 +1,18 @@
 package slice
 
 import (
-	"errors"
 	"fmt"
 
 	"github.com/pratik-saptarshi/replay-core/internal/canonical"
-	"github.com/pratik-saptarshi/replay-core/internal/record"
 	"github.com/pratik-saptarshi/replay-core/internal/store"
 )
 
 // Abandon appends an abandon fact to ownerPath and returns its
 // receipt: a declaration-mode record under store.AbandonSchemaRef
 // with body {"abandoned": abandonedRootID}, citing causedBy, with
-// the root witness body as witness (plan Decision 4(a)).
+// the root witness body as witness (plan Decision 4(a)). The
+// record is minted by store.MintAbandon, the constructor the
+// reserved AbandonSchemaRef belongs to.
 //
 // Abandoning is a fact, not an edit (spec §5, §7): the append
 // deletes and rewrites nothing, and the abandoned records stay
@@ -20,20 +20,7 @@ import (
 // projection — ProjectEffectiveHistory omits the abandoned root
 // and its descendants from the path's effective history.
 func Abandon(s *store.Store, ownerPath, abandonedRootID string, causedBy []string) (store.Receipt, error) {
-	fields, ok := rootFields()
-	if !ok {
-		return store.Receipt{}, errors.New("slice: root witness body has no body field")
-	}
-	receipt, err := s.AppendFact(ownerPath, store.RecordDraft{
-		SchemaRef: store.AbandonSchemaRef,
-		Mode:      record.ModeDeclaration,
-		Body: canonical.ObjectOf(
-			canonical.Pair{Key: "abandoned", Value: canonical.StringOf(abandonedRootID)},
-		),
-		CausedBy:         causedBy,
-		WitnessSchemaRef: record.RootWitnessSchemaRef,
-		WitnessBody:      fields,
-	})
+	receipt, err := s.MintAbandon(ownerPath, abandonedRootID, causedBy)
 	if err != nil {
 		return store.Receipt{}, fmt.Errorf("slice: abandon %s on %q: %w", abandonedRootID, ownerPath, err)
 	}

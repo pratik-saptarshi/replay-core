@@ -19,18 +19,6 @@ type Cut struct {
 	ThroughOrdinal           int64
 }
 
-// rootFields returns the root witness fields object: the body field
-// of record.RootWitnessBody(). Phase 0 exports the fields only in
-// that wrapped form (plan Decision 4(a)).
-func rootFields() (canonical.Value, bool) {
-	for _, p := range record.RootWitnessBody().Pairs {
-		if p.Key == "body" {
-			return p.Value, true
-		}
-	}
-	return canonical.Value{}, false
-}
-
 // fieldOf returns the value of key in an object value.
 func fieldOf(obj canonical.Value, key string) (canonical.Value, bool) {
 	for _, p := range obj.Pairs {
@@ -66,6 +54,11 @@ func causedByOf(rec canonical.Value) ([]string, error) {
 // witness body as witness (plan Decision 4(a)). A published cut is
 // a retention root (plan Decision 4(c)).
 //
+// The record is minted by store.MintCut, the constructor the
+// reserved CutSchemaRef belongs to: the store re-reads the
+// through-fact and builds the body from the stored record, so the
+// body's claims are never caller assertions.
+//
 // The through-fact must live on ownerPath: the body's
 // through_owner_ordinal is that fact's ordinal, and ordinals are
 // per-owner (AC-F2-4), so a through-fact from another path would
@@ -78,26 +71,7 @@ func PublishCut(s *store.Store, ownerPath, throughFactID string) (string, error)
 	if through.OwnerPath != ownerPath {
 		return "", fmt.Errorf("slice: publish cut on %q: through-fact %s is on owner path %q, not %q", ownerPath, throughFactID, through.OwnerPath, ownerPath)
 	}
-	fields, ok := rootFields()
-	if !ok {
-		return "", errors.New("slice: root witness body has no body field")
-	}
-	ordinal, err := canonical.IntOf(strconv.FormatInt(through.OwnerOrdinal, 10))
-	if err != nil {
-		return "", fmt.Errorf("slice: publish cut on %q: encode ordinal: %w", ownerPath, err)
-	}
-	receipt, err := s.AppendFact(ownerPath, store.RecordDraft{
-		SchemaRef: store.CutSchemaRef,
-		Mode:      record.ModeDeclaration,
-		Body: canonical.ObjectOf(
-			canonical.Pair{Key: "owner_path", Value: canonical.StringOf(ownerPath)},
-			canonical.Pair{Key: "through_fact_id", Value: canonical.StringOf(throughFactID)},
-			canonical.Pair{Key: "through_owner_ordinal", Value: ordinal},
-		),
-		CausedBy:         []string{throughFactID},
-		WitnessSchemaRef: record.RootWitnessSchemaRef,
-		WitnessBody:      fields,
-	})
+	receipt, err := s.MintCut(ownerPath, throughFactID)
 	if err != nil {
 		return "", fmt.Errorf("slice: publish cut on %q: %w", ownerPath, err)
 	}

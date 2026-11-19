@@ -36,7 +36,7 @@ func (s *Store) AppendMilestone(ownerPath, taskID, snapshotRef string, causedBy 
 	if !ok {
 		return Receipt{}, errors.New("store: root witness body has no body field")
 	}
-	return s.AppendFact(ownerPath, RecordDraft{
+	return s.appendFact(ownerPath, RecordDraft{
 		SchemaRef:        MilestoneSchemaRef,
 		Mode:             record.ModeDeclaration,
 		Body:             MilestoneBody(taskID, snapshotRef),

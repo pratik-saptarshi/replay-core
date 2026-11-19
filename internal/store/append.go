@@ -26,6 +26,27 @@ var appendCrashHook func(stage string)
 // intent and mint receipts for nothing.
 var ErrEmptyBatch = errors.New("store: append batch is empty")
 
+// ErrReservedSchemaRef is returned by AppendFact and AppendBatch
+// when a caller draft carries one of the system schema refs
+// (CutSchemaRef, MilestoneSchemaRef, AbandonSchemaRef). Those refs
+// may be minted only by their constructors — AppendMilestone,
+// MintCut, MintAbandon — which derive the record body from
+// validated records; a caller-built body under a system ref could
+// claim placements the store never checked (a cut naming an
+// arbitrary through_owner_ordinal, resolving a slice that grows as
+// the store grows).
+var ErrReservedSchemaRef = errors.New("store: schema ref is reserved to its constructor")
+
+// isReservedSchemaRef reports whether ref is one of the system
+// schema refs the public append boundary must refuse.
+func isReservedSchemaRef(ref string) bool {
+	switch ref {
+	case CutSchemaRef, MilestoneSchemaRef, AbandonSchemaRef:
+		return true
+	}
+	return false
+}
+
 // IntentConflictError reports an append whose intent ID was already
 // recorded with a different batch digest: the intent names a
 // different batch than the one being appended, so nothing is
@@ -176,8 +197,24 @@ func resolveIntent(ctx context.Context, q rowQuerier, intentID, batchDigest stri
 // appends nothing; the same intent ID with different drafts fails
 // with *IntentConflictError and appends nothing. Degenerate inputs
 // — an empty batch, an empty intent ID, an empty owner path, or a
-// reserved replaycore. owner path — are rejected before any work.
+// reserved replaycore. owner path — are rejected before any work,
+// as is any draft carrying a reserved system schema ref
+// (ErrReservedSchemaRef): those records are minted only through
+// their constructors, via appendBatch.
 func (s *Store) AppendBatch(ownerPath, intentID string, drafts []RecordDraft) ([]Receipt, error) {
+	for i := range drafts {
+		if isReservedSchemaRef(drafts[i].SchemaRef) {
+			return nil, fmt.Errorf("store: draft %d: %w: %s", i, ErrReservedSchemaRef, drafts[i].SchemaRef)
+		}
+	}
+	return s.appendBatch(ownerPath, intentID, drafts)
+}
+
+// appendBatch is AppendBatch without the reserved-schema-ref
+// check: the internal append path the system records' own
+// constructors (AppendMilestone, MintCut, MintAbandon) mint
+// through, after building their bodies from validated records.
+func (s *Store) appendBatch(ownerPath, intentID string, drafts []RecordDraft) ([]Receipt, error) {
 	if len(drafts) == 0 {
 		return nil, ErrEmptyBatch
 	}
@@ -349,12 +386,23 @@ func (s *Store) AppendBatch(ownerPath, intentID string, drafts []RecordDraft) ([
 }
 
 // AppendFact appends a single draft under a generated intent ID.
+// A draft carrying a reserved system schema ref is rejected with
+// ErrReservedSchemaRef, exactly as in AppendBatch.
 func (s *Store) AppendFact(ownerPath string, draft RecordDraft) (Receipt, error) {
+	if isReservedSchemaRef(draft.SchemaRef) {
+		return Receipt{}, fmt.Errorf("%w: %s", ErrReservedSchemaRef, draft.SchemaRef)
+	}
+	return s.appendFact(ownerPath, draft)
+}
+
+// appendFact is AppendFact without the reserved-schema-ref check:
+// the constructors' internal single-append path.
+func (s *Store) appendFact(ownerPath string, draft RecordDraft) (Receipt, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return Receipt{}, fmt.Errorf("store: generate intent ID: %w", err)
 	}
-	receipts, err := s.AppendBatch(ownerPath, "fact-"+hex.EncodeToString(b[:]), []RecordDraft{draft})
+	receipts, err := s.appendBatch(ownerPath, "fact-"+hex.EncodeToString(b[:]), []RecordDraft{draft})
 	if err != nil {
 		return Receipt{}, err
 	}
