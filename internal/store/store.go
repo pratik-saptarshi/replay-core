@@ -8,9 +8,12 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 
@@ -118,15 +121,87 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
 	}
 	s := &Store{db: db}
-	if _, err := db.Exec(schemaDDL); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("store: apply schema: %w", err)
-	}
-	if err := s.bootstrapRoot(); err != nil {
+	if err := s.init(); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return s, nil
+}
+
+// init applies the schema and bootstraps the root witness
+// record, serialized under the write lock: both steps run
+// inside one BEGIN IMMEDIATE transaction on a dedicated
+// connection. Concurrent first-open of a fresh store is a
+// supported shape (the store's contract is multi-process), and
+// the pre-fix shape raced it twice over — the schema went
+// through the connection pool with no lock, so a second opener
+// could fail "apply schema: database is locked" while the
+// first held the file mid-initialization, and bootstrapRoot's
+// existence check ran outside its insertion transaction, so
+// two openers that both observed "no root yet" collided on the
+// root record's uniqueness constraint (Codex P2 on PR #2,
+// 2026-11-19). Under BEGIN IMMEDIATE a second opener waits for
+// the first opener's commit, then observes the applied schema
+// and the committed root, and proceeds.
+//
+// One contention point sits before the store's own lock
+// discipline can apply: the driver runs the DSN pragmas —
+// journal_mode=WAL above all — when it establishes each
+// physical connection, and the WAL transition on a fresh file
+// can answer "database is locked" in a way busy_timeout does
+// not cover (observed: racing openers failing at connection
+// acquisition while another opener was mid-init). init
+// therefore retries the whole attempt on lock errors, with a
+// bounded backoff: initOnce is transactional and idempotent
+// (schema is IF NOT EXISTS; the bootstrap check runs inside
+// the transaction), so a retry observes either the pre-init
+// state or a peer's committed init, never a partial one. The
+// bound is generous against an init that takes milliseconds;
+// exhausting it surfaces the lock error rather than hiding it.
+func (s *Store) init() error {
+	var err error
+	for attempt := 0; ; attempt++ {
+		if err = s.initOnce(); err == nil || !isLockError(err) || attempt >= 100 {
+			return err
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// isLockError reports whether err is a SQLite locking failure
+// (SQLITE_BUSY / SQLITE_LOCKED, as the driver surfaces them).
+func isLockError(err error) bool {
+	return strings.Contains(err.Error(), "database is locked") ||
+		strings.Contains(err.Error(), "database table is locked")
+}
+
+func (s *Store) initOnce() error {
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("store: init acquire connection: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("store: init begin immediate: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		}
+	}()
+	if _, err := conn.ExecContext(ctx, schemaDDL); err != nil {
+		return fmt.Errorf("store: apply schema: %w", err)
+	}
+	if err := bootstrapRoot(ctx, conn); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return fmt.Errorf("store: init commit: %w", err)
+	}
+	committed = true
+	return nil
 }
 
 // Close closes the store's database handle.
@@ -147,17 +222,22 @@ func rootFields() (canonical.Value, bool) {
 }
 
 // bootstrapRoot inserts the root witness record on SystemPath at
-// ordinal 0 if absent. The root record's body is the witness fields
-// object itself, because Phase 0's root-record validation requires
-// exactly that body, mode capture, no causal parents, and the empty
+// ordinal 0 if absent. It runs on Open's init connection inside
+// the caller's BEGIN IMMEDIATE transaction, so the existence
+// check and the insertion are atomic against concurrent
+// openers: a second opener's check runs only after the first
+// opener commits, and observes the root already present. The
+// root record's body is the witness fields object itself,
+// because Phase 0's root-record validation requires exactly
+// that body, mode capture, no causal parents, and the empty
 // witness sentinel; its computed ID must equal
 // record.RootWitnessRecordID() — Open fails otherwise. Its records
 // row stores an empty witness_digest and it has no witness_bodies
 // row.
-func (s *Store) bootstrapRoot() error {
+func bootstrapRoot(ctx context.Context, conn *sql.Conn) error {
 	rootID := record.RootWitnessRecordID()
 	var n int
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM records WHERE record_id = ?", rootID).Scan(&n); err != nil {
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM records WHERE record_id = ?", rootID).Scan(&n); err != nil {
 		return fmt.Errorf("store: check root witness record: %w", err)
 	}
 	if n > 0 {
@@ -182,11 +262,6 @@ func (s *Store) bootstrapRoot() error {
 	if err != nil {
 		return fmt.Errorf("store: marshal root witness record: %w", err)
 	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return fmt.Errorf("store: bootstrap begin: %w", err)
-	}
-	defer tx.Rollback()
 	inserts := []struct {
 		query string
 		args  []any
@@ -201,12 +276,9 @@ func (s *Store) bootstrapRoot() error {
 			[]any{SystemPath, 1}},
 	}
 	for _, in := range inserts {
-		if _, err := tx.Exec(in.query, in.args...); err != nil {
+		if _, err := conn.ExecContext(ctx, in.query, in.args...); err != nil {
 			return fmt.Errorf("store: bootstrap root witness record: %w", err)
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("store: bootstrap commit: %w", err)
 	}
 	return nil
 }
