@@ -66,7 +66,7 @@
 <p>The five input classes / failure modes the spec implies but the acceptance criteria do not directly exercise, most likely to bite first. Each is pinned to its owning task with a test in that task's steps.</p>
 <ol>
 <li><b>Unclean shutdown and reopen.</b> A lane process killed between runs leaves a WAL behind; on reopen the store must recover with every committed record intact, frontiers consistent, and no ordinal reuse. AC-F2-1 covers a kill <i>during</i> a batch; nothing covers reopen-after-crash as a routine operation. → Task 1, <code>TestStoreReopenAfterUncleanClose</code>.</li>
-<li><b>Hostile causal citations in a draft.</b> A draft that cites a nonexistent record, cites itself, or forms a cycle inside its own batch would corrupt closure computation (Task 7) or hang it. A reasonable caller expects rejection at append time, not a poisoned store. → Task 1, <code>TestAppendBatchRejectsUnknownAndSelfCitations</code>.</li>
+<li><b>Hostile causal citations in a draft.</b> A draft that cites a nonexistent record, cites itself, or forms a cycle inside its own batch would corrupt closure computation (Task 7) or hang it. A reasonable caller expects rejection at append time, not a poisoned store. → Task 1, <code>TestAppendBatchRejectsUnknownAndForwardCitations</code>.</li>
 <li><b>Degenerate appends.</b> An empty batch, an empty intent id, or an empty owner path are the inputs every caller eventually produces by accident; a silent success would mint receipts for nothing or file records under no path. → Task 2, <code>TestAppendBatchRejectsDegenerateInputs</code>.</li>
 <li><b>Workspace entries that are not plain files.</b> A snapshot walk that follows a symlink snapshots bytes outside the workspace (a correctness and containment failure); an unreadable file silently skipped produces a snapshot that claims completeness it does not have. Expected: symlinks are stored as links, never followed; unreadable entries fail the snapshot loudly, naming the path. → Task 13, <code>TestSnapshotStoresSymlinksAsLinks</code> and <code>TestSnapshotFailsOnUnreadableFile</code>.</li>
 <li><b>Very deep causal chains.</b> Real traces are long; a recursive closure over a 10,000-record chain overflows the goroutine stack or turns resolution quadratic. Expected: closure is iterative and resolution of a deep cut completes with the full prefix. → Task 7, <code>TestResolveCutDeepChain</code>.</li>
@@ -175,7 +175,7 @@ func TestAppendBatchOrdinalsGapFreePerOwner(t *testing.T) { // AC-F2-4
     for i, r := range a { if r.OwnerOrdinal != int64(i) { t.Fatalf("runs/a ordinal[%d] = %d", i, r.OwnerOrdinal) } }
     for i, r := range b { if r.OwnerOrdinal != int64(i) { t.Fatalf("runs/b ordinal[%d] = %d", i, r.OwnerOrdinal) } }
 }
-func TestAppendBatchRejectsUnknownAndSelfCitations(t *testing.T) { // Review Focus 2
+func TestAppendBatchRejectsUnknownAndForwardCitations(t *testing.T) { // Review Focus 2
     s := openTemp(t)
     bad := draft(t, "test.fact", `{"n":1}`); bad.CausedBy = []string{"sha256:0000000000000000000000000000000000000000000000000000000000000000"}
     if _, err := s.AppendBatch("runs/a", "x-1", []store.RecordDraft{bad}); err == nil { t.Fatal("unknown citation accepted") }
