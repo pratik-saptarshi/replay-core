@@ -312,10 +312,14 @@ func (s *Store) CollectGarbage() (GarbageReport, error) {
 
 // gcPrefixIDs returns the IDs of every record on ownerPath with
 // ordinal at most throughOrdinal — one root class's addressed
-// prefix set.
+// prefix set. Membership is decided by the records table's
+// placement columns, the same source ResolveCut resolves the
+// cut's prefix from: seeding from the denormalized path_entries
+// copy instead let a tampered row shrink the retained set below
+// the set the published cut still resolves (panel W3-2).
 func gcPrefixIDs(ctx context.Context, conn *sql.Conn, ownerPath string, throughOrdinal int64) ([]string, error) {
 	return gcScanIDs(ctx, conn, "path prefix records",
-		"SELECT record_id FROM path_entries WHERE owner_path = ? AND owner_ordinal <= ?",
+		"SELECT record_id FROM records WHERE owner_path = ? AND owner_ordinal <= ?",
 		ownerPath, throughOrdinal)
 }
 

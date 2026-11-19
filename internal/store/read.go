@@ -135,9 +135,19 @@ func (s *Store) GetRecord(recordID string) (StoredRecord, error) {
 // PathRecords returns every record on ownerPath in ordinal order.
 // Each record goes through GetRecord, so reads are validated the
 // same way.
+//
+// Membership and order are read from the records table's
+// placement columns — the same source GetRecord reports as a
+// record's placement, and the source the slice layer's cut
+// cross-check validates against. path_entries is a denormalized
+// copy of that placement, still written by append and bootstrap
+// but consulted by no read path: when the two disagreed (a
+// tampered path_entries row), resolution silently followed the
+// copy while validation followed the records table, and a cut
+// could resolve without its own through record (panel W3-3).
 func (s *Store) PathRecords(ownerPath string) ([]StoredRecord, error) {
 	rows, err := s.db.Query(
-		"SELECT record_id FROM path_entries WHERE owner_path = ? ORDER BY owner_ordinal ASC",
+		"SELECT record_id FROM records WHERE owner_path = ? ORDER BY owner_ordinal ASC",
 		ownerPath)
 	if err != nil {
 		return nil, fmt.Errorf("store: list path %q: %w", ownerPath, err)
