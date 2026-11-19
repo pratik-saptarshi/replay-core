@@ -86,9 +86,13 @@ func writeValue(buf *bytes.Buffer, v Value, p profile, path string) error {
 		if p == profileCommons {
 			return &FloatForbiddenError{Path: path}
 		}
-		// Placeholder rendering; Python-repr float formatting is
-		// Task 3's law (see internal/canonical/number.go when it lands).
-		buf.WriteString(strconv.FormatFloat(v.Float, 'g', -1, 64))
+		// Python-repr rendering (number.go). Non-finite floats were
+		// rejected above, so FormatFloat's own error is a backstop.
+		fs, err := FormatFloat(v.Float)
+		if err != nil {
+			return err
+		}
+		buf.WriteString(fs)
 	case KindArray:
 		buf.WriteByte('[')
 		for i, e := range v.Elems {

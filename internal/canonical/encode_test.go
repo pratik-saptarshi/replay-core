@@ -174,30 +174,9 @@ func loadCorpus(t *testing.T, file string) []corpusCase {
 	return cases
 }
 
-// containsFloat reports whether the value holds a float anywhere; float
-// formatting is Task 3's law, so such cases are skipped, never weakened.
-func containsFloat(v canonical.Value) bool {
-	switch v.Kind {
-	case canonical.KindFloat:
-		return true
-	case canonical.KindArray:
-		for _, e := range v.Elems {
-			if containsFloat(e) {
-				return true
-			}
-		}
-	case canonical.KindObject:
-		for _, p := range v.Pairs {
-			if containsFloat(p.Value) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // runDigestCases checks every digest case in a corpus file against one
-// profile's Marshal/Digest pair, skipping float-bearing cases per Task 3.
+// profile's Marshal/Digest pair. No case is skipped: float formatting
+// (Task 3's law) is implemented, so float-bearing cases run and pass.
 func runDigestCases(t *testing.T, file string, marshal func(canonical.Value) ([]byte, error), digest func(canonical.Value) (string, error)) {
 	t.Helper()
 	for _, c := range loadCorpus(t, file) {
@@ -208,9 +187,6 @@ func runDigestCases(t *testing.T, file string, marshal func(canonical.Value) ([]
 			v, err := canonical.FromJSON(c.Input)
 			if err != nil {
 				t.Fatalf("FromJSON(input): %v", err)
-			}
-			if containsFloat(v) {
-				t.Skip("float formatting is Task 3's law; case skipped, not weakened")
 			}
 			got, err := marshal(v)
 			if err != nil {
@@ -249,8 +225,8 @@ func TestEncodeCorpusCommons(t *testing.T) {
 }
 
 func TestEncodeCorpusNumbers(t *testing.T) {
-	// Integer cases must pass now; float cases are skipped per case
-	// (Task 3 owns float formatting) and never weakened.
+	// All thirteen cases run: the four integer cases (Task 2) and the
+	// nine float cases under the Python-repr number law (Task 3).
 	runDigestCases(t, "numbers.json", canonical.MarshalKernel, canonical.DigestKernel)
 }
 
