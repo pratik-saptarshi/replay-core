@@ -28,13 +28,31 @@ func draft(t *testing.T, schemaRef, bodyJSON string) store.RecordDraft {
 
 func TestAppendBatchOrdinalsGapFreePerOwner(t *testing.T) { // AC-F2-4
 	s := openTemp(t)
-	// interleave batches on two owner paths; each path's ordinals must be exactly 0..n-1
+	// Interleave batches on two owner paths; each path's ordinals must be
+	// exactly 0..n-1 across all of its batches. Draft bodies are distinct
+	// per (path, iteration, slot): record identity is content-derived and
+	// the owner path is not part of it, so reusing a body would collide on
+	// records.record_id instead of exercising ordinal allocation.
 	var a, b []store.Receipt
 	for i := 0; i < 3; i++ {
-		ra, _ := s.AppendBatch("runs/a", fmt.Sprintf("a-%d", i), []store.RecordDraft{draft(t, "test.fact", `{"n":1}`), draft(t, "test.fact", `{"n":2}`)})
-		rb, _ := s.AppendBatch("runs/b", fmt.Sprintf("b-%d", i), []store.RecordDraft{draft(t, "test.fact", `{"n":1}`)})
+		ra, err := s.AppendBatch("runs/a", fmt.Sprintf("a-%d", i), []store.RecordDraft{
+			draft(t, "test.fact", fmt.Sprintf(`{"path":"a","batch":%d,"slot":0}`, i)),
+			draft(t, "test.fact", fmt.Sprintf(`{"path":"a","batch":%d,"slot":1}`, i)),
+		})
+		if err != nil {
+			t.Fatalf("runs/a batch %d: %v", i, err)
+		}
+		rb, err := s.AppendBatch("runs/b", fmt.Sprintf("b-%d", i), []store.RecordDraft{
+			draft(t, "test.fact", fmt.Sprintf(`{"path":"b","batch":%d,"slot":0}`, i)),
+		})
+		if err != nil {
+			t.Fatalf("runs/b batch %d: %v", i, err)
+		}
 		a = append(a, ra...)
 		b = append(b, rb...)
+	}
+	if len(a) != 6 || len(b) != 3 {
+		t.Fatalf("receipt counts: runs/a = %d (want 6), runs/b = %d (want 3)", len(a), len(b))
 	}
 	for i, r := range a {
 		if r.OwnerOrdinal != int64(i) {
