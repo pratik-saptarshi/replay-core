@@ -1,11 +1,18 @@
 package snapshot
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
 	"strings"
 )
+
+// ErrScopeExists is returned by Fork when the target scope ref
+// already exists: Fork creates a scope, it never repoints one —
+// a scope name may be cited by other work, so moving it silently
+// would rewrite what those citations name.
+var ErrScopeExists = errors.New("snapshot: fork scope already exists")
 
 // Refs layout law (AC-F4-5): every ref in the store lives under
 // refs/vcscore/, with second component one of ground, materialized,
@@ -59,7 +66,10 @@ var scopeNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 // at commitID. It is zero-copy: a single update-ref, no new objects
 // (AC-F4-3). The scope name must match the scope-name law and
 // commitID must name a commit; both are validated before the ref is
-// written, so a rejected fork creates nothing.
+// written, so a rejected fork creates nothing. A scope that
+// already exists is refused with ErrScopeExists and left
+// untouched: the ref is written with a create-only update-ref
+// (zero old value), so the refusal is atomic, not check-then-write.
 func (s *Store) Fork(scope, commitID string) error {
 	if !scopeNamePattern.MatchString(scope) {
 		return fmt.Errorf("snapshot: fork: invalid scope name %q (must match %s)", scope, scopeNamePattern)
@@ -67,7 +77,18 @@ func (s *Store) Fork(scope, commitID string) error {
 	if _, err := s.git(nil, "rev-parse", "--verify", "--quiet", commitID+"^{commit}"); err != nil {
 		return fmt.Errorf("snapshot: fork: %q does not name a commit: %w", commitID, err)
 	}
-	if _, err := s.git(nil, "update-ref", scopesRefPrefix+scope, commitID); err != nil {
+	ref := scopesRefPrefix + scope
+	if _, err := s.git(nil, "rev-parse", "--verify", "--quiet", ref); err == nil {
+		return fmt.Errorf("%w: %q", ErrScopeExists, scope)
+	}
+	if _, err := s.git(nil, "update-ref", ref, commitID, zeroOID); err != nil {
+		// The create-only write failed: a peer created the ref
+		// after the check above, or the write itself failed.
+		// Distinguish the two so an existing scope always reports
+		// as ErrScopeExists.
+		if _, cerr := s.git(nil, "rev-parse", "--verify", "--quiet", ref); cerr == nil {
+			return fmt.Errorf("%w: %q", ErrScopeExists, scope)
+		}
 		return fmt.Errorf("snapshot: fork: update-ref: %w", err)
 	}
 	return nil

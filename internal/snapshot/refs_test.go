@@ -1,6 +1,7 @@
 package snapshot_test
 
 import (
+	"errors"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -26,6 +27,38 @@ func setupStore(t *testing.T) (*snapshot.Store, string, string) {
 		t.Fatalf("Snapshot: %v", err)
 	}
 	return s, dir, commit
+}
+
+// TestForkRefusesToOverwriteExistingScope (ADV-7): Fork creates a
+// scope ref; a second Fork of the same name at a different commit
+// used to succeed silently and repoint the scope. It must fail and
+// leave the ref at its first target.
+func TestForkRefusesToOverwriteExistingScope(t *testing.T) {
+	s, dir, commit := setupStore(t)
+
+	ws := t.TempDir()
+	writeFile(t, filepath.Join(ws, "hello.txt"), "hello v2\n")
+	other, err := s.Snapshot(ws, map[string]string{"run": "refs-test-2"})
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if other == commit {
+		t.Fatal("second snapshot returned the first commit ID; need two distinct targets")
+	}
+
+	if err := s.Fork("lane-a", commit); err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+	err = s.Fork("lane-a", other)
+	if err == nil {
+		t.Fatal("second Fork of lane-a succeeded; want a refusal that changes nothing")
+	}
+	if !errors.Is(err, snapshot.ErrScopeExists) {
+		t.Fatalf("second Fork error = %v, want ErrScopeExists", err)
+	}
+	if got := git(t, dir, "rev-parse", "refs/vcscore/scopes/lane-a"); got != commit {
+		t.Fatalf("refs/vcscore/scopes/lane-a = %s after refused Fork, want unchanged %s", got, commit)
+	}
 }
 
 func TestForkIsZeroCopy(t *testing.T) { // AC-F4-3
