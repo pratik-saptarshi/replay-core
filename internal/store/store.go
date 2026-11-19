@@ -99,7 +99,20 @@ CREATE TABLE IF NOT EXISTS owner_ordinals (
 // Open opens (creating if needed) the store at path, applies the
 // schema, and bootstraps the root witness record if absent.
 func Open(path string) (*Store, error) {
-	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	// The DSN uses the driver's named parameters, not _pragma=:
+	// mattn/go-sqlite3 silently ignores _pragma, so the original
+	// "_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)" never
+	// took effect — connections actually ran with journal_mode=
+	// delete and the driver's built-in busy_timeout of 5000. The
+	// Task 6 multi-process proof exposed this: a caller's BEGIN
+	// IMMEDIATE failed "database is locked" after exactly 5000ms
+	// under 4-way contention. Named parameters verified by pragma
+	// probe: journal_mode=wal, busy_timeout=30000. The timeout is
+	// generous because concurrent writers serialize on BEGIN
+	// IMMEDIATE and a caller-visible locking error is a defect
+	// (AC-F2-6): a waiter must outlast a lock holder descheduled
+	// under load.
+	dsn := "file:" + path + "?_busy_timeout=30000&_journal_mode=WAL"
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)

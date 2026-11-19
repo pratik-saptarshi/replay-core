@@ -1,8 +1,11 @@
 package store_test
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
+
+	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/pratik-saptarshi/replay-core/internal/canonical"
 	"github.com/pratik-saptarshi/replay-core/internal/record"
@@ -48,6 +51,40 @@ func rootWitnessDigest(t *testing.T) string {
 		t.Fatalf("WitnessBodyDigest: %v", err)
 	}
 	return d
+}
+
+// TestStoreOpensInWALMode is the regression pin for the defect
+// Task 6's concurrent-append proof found: the store's DSN was
+// written with _pragma= parameters, which mattn/go-sqlite3
+// silently ignores, so the database actually ran in the default
+// delete journal mode with the driver's built-in busy_timeout of
+// 5000 — not WAL with the configured timeout. Journal mode
+// persists in the database file, so a fresh raw connection can
+// audit it after Close. (The timeout half of the fix is pinned
+// behaviorally by TestConcurrentAppendsAcrossProcesses: at a
+// 5000ms ceiling, 4-way contention surfaces caller-visible
+// "database is locked" errors in this environment.)
+func TestStoreOpensInWALMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "trace.db")
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	raw, err := sql.Open("sqlite3", "file:"+path)
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	defer raw.Close()
+	var jm string
+	if err := raw.QueryRow("PRAGMA journal_mode").Scan(&jm); err != nil {
+		t.Fatalf("PRAGMA journal_mode: %v", err)
+	}
+	if jm != "wal" {
+		t.Fatalf("journal_mode = %s, want wal (the store DSN must use the driver's named parameters)", jm)
+	}
 }
 
 func TestStoreBootstrapRootWitness(t *testing.T) {
