@@ -102,8 +102,10 @@ type preparedDraft struct {
 	witnessRaw    []byte
 }
 
-// prepareDrafts validates each draft's witness body and computes
-// its record digest and canonical bytes, in draft order.
+// prepareDrafts validates each draft's witness body, computes
+// its record digest and canonical bytes, and round-trips both
+// byte strings through the kernel decoder the read path uses,
+// in draft order.
 func prepareDrafts(drafts []RecordDraft) ([]preparedDraft, error) {
 	prepared := make([]preparedDraft, len(drafts))
 	for i := range drafts {
@@ -137,6 +139,29 @@ func prepareDrafts(drafts []RecordDraft) ([]preparedDraft, error) {
 		witnessRaw, err := canonical.MarshalKernel(d.WitnessBody)
 		if err != nil {
 			return nil, fmt.Errorf("store: draft %d witness marshal: %w", i, err)
+		}
+		// Round-trip law (panel W3-1): everything the append
+		// persists must survive the readers' own validation.
+		// GetRecord, PathRecords and CollectGarbage all decode
+		// stored bytes with canonical.DecodeKernel, and the read
+		// path re-validates the decoded witness body — but the
+		// canonical constructors admit values that decoder
+		// refuses: ObjectOf keeps duplicate keys, StringOf
+		// accepts invalid UTF-8. Without this check a draft can
+		// compute and marshal cleanly here yet land as a record
+		// no read can decode, poisoning its path and wedging GC
+		// for the whole store. Decode both byte strings exactly
+		// as the readers do, and refuse the draft before any
+		// write if either fails.
+		if _, err := canonical.DecodeKernel(raw); err != nil {
+			return nil, fmt.Errorf("store: draft %d: record bytes do not round-trip through the kernel decoder: %w", i, err)
+		}
+		decodedWitness, err := canonical.DecodeKernel(witnessRaw)
+		if err != nil {
+			return nil, fmt.Errorf("store: draft %d: witness body does not round-trip through the kernel decoder: %w", i, err)
+		}
+		if err := record.ValidateWitnessBody(decodedWitness); err != nil {
+			return nil, fmt.Errorf("store: draft %d: witness body does not round-trip: %w", i, err)
 		}
 		prepared[i] = preparedDraft{id: id, recRaw: raw, witnessDigest: witnessDigest, witnessRaw: witnessRaw}
 	}
