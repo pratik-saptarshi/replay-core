@@ -411,8 +411,18 @@ func (s *Store) Snapshot(workspaceDir string, meta map[string]string) (string, e
 
 // resolveWorkspaceRoot returns the absolute, symlink-free form
 // of a workspace root directory, or a descriptive error naming
-// the path as given when it cannot be resolved.
+// the path as given when it cannot be resolved. The root must
+// name a directory: an empty path is refused outright —
+// filepath.Abs("") is the process working directory, so an
+// empty root from a missing flag or config value would snapshot
+// whatever directory the process runs in (panel W3-5) — and a
+// root that resolves to a non-directory is refused here rather
+// than deep in the git plumbing, where it died with a raw
+// Invalid path error (panel W3-8).
 func resolveWorkspaceRoot(dir string) (string, error) {
+	if dir == "" {
+		return "", errors.New("snapshot: workspace root is empty")
+	}
 	abs, err := filepath.Abs(dir)
 	if err != nil {
 		return "", fmt.Errorf("snapshot: resolve workspace root %s: %w", dir, err)
@@ -420,6 +430,13 @@ func resolveWorkspaceRoot(dir string) (string, error) {
 	resolved, err := filepath.EvalSymlinks(abs)
 	if err != nil {
 		return "", fmt.Errorf("snapshot: resolve workspace root %s: %w", dir, err)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("snapshot: stat workspace root %s: %w", dir, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("snapshot: workspace root %s is not a directory", dir)
 	}
 	return resolved, nil
 }
