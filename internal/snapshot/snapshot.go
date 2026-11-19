@@ -8,7 +8,6 @@ package snapshot
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -117,21 +116,71 @@ func Open(dir string) (*Store, error) {
 }
 
 // validateChainHead checks that head — the commit
-// refs/vcscore/ops/latest names — is a snapshot commit: its tree
-// must carry meta/snapshot.json, and its meta/manifest.json must
-// parse as a snapshot manifest, read through previousManifestOf —
-// the same read Snapshot performs on its parent. A foreign commit
+// refs/vcscore/ops/latest names — is a snapshot commit: its
+// meta/snapshot.json must parse as the snapshot metadata the
+// writer emits, and its meta/manifest.json must parse as a
+// snapshot manifest, read through previousManifestOf — the same
+// read Snapshot performs on its parent. A foreign commit
 // (well-formed, but not a snapshot) adopted as chain head would
 // otherwise pass Open and then fail every later Snapshot
 // permanently on the manifest it lacks.
 func (s *Store) validateChainHead(head string) error {
-	if _, err := s.git(nil, "cat-file", "-e", head+":meta/snapshot.json"); err != nil {
+	rawMeta, err := s.git(nil, "cat-file", "-p", head+":meta/snapshot.json")
+	if err != nil {
 		return fmt.Errorf("snapshot: chain head %s names commit %s, which is not a snapshot commit (no meta/snapshot.json): %w", latestRef, head, err)
+	}
+	if err := parseSnapshotMeta([]byte(rawMeta)); err != nil {
+		return fmt.Errorf("snapshot: chain head %s names commit %s, whose meta/snapshot.json does not parse as snapshot metadata: %w", latestRef, head, err)
 	}
 	if _, err := s.previousManifestOf(head); err != nil {
 		return fmt.Errorf("snapshot: chain head %s names commit %s, whose meta/manifest.json does not parse as a snapshot manifest: %w", latestRef, head, err)
 	}
 	return nil
+}
+
+// parseSnapshotMeta validates raw meta/snapshot.json bytes
+// against the shape snapshotMetaBytes emits: canonical-kernel
+// bytes of an object whose "created" is a timestamp string and
+// whose "meta" is an object of strings. The check is a content
+// check, not the existence check it replaces: a garbage blob, a
+// tree, a gitlink, or a symlink at that path cannot produce
+// bytes of this shape, so none of them can be adopted as a chain
+// head no real Snapshot could have written (panel W3-6).
+func parseSnapshotMeta(raw []byte) error {
+	v, err := canonical.DecodeKernel(raw)
+	if err != nil {
+		return err
+	}
+	if v.Kind != canonical.KindObject {
+		return errors.New("snapshot metadata is not an object")
+	}
+	created, ok := metaField(v, "created")
+	if !ok || created.Kind != canonical.KindString {
+		return errors.New("snapshot metadata has no created string")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, created.Str); err != nil {
+		return fmt.Errorf("snapshot metadata created %q is not a timestamp: %w", created.Str, err)
+	}
+	meta, ok := metaField(v, "meta")
+	if !ok || meta.Kind != canonical.KindObject {
+		return errors.New("snapshot metadata has no meta object")
+	}
+	for _, p := range meta.Pairs {
+		if p.Value.Kind != canonical.KindString {
+			return fmt.Errorf("snapshot metadata value for %q is not a string", p.Key)
+		}
+	}
+	return nil
+}
+
+// metaField returns the value of key in a decoded object value.
+func metaField(obj canonical.Value, key string) (canonical.Value, bool) {
+	for _, p := range obj.Pairs {
+		if p.Key == key {
+			return p.Value, true
+		}
+	}
+	return canonical.Value{}, false
 }
 
 // resolveChainHead returns the commit refs/vcscore/ops/latest
@@ -319,10 +368,10 @@ func snapshotMetaBytes(meta map[string]string) ([]byte, error) {
 // prevEntry is one entry of a previous snapshot's manifest, as
 // recorded in meta/manifest.json.
 type prevEntry struct {
-	Blob  string `json:"blob"`
-	Kind  string `json:"kind"`
-	Mtime int64  `json:"mtime"`
-	Size  int64  `json:"size"`
+	Blob  string
+	Kind  string
+	Mtime int64
+	Size  int64
 }
 
 // previousManifestOf loads the manifest of the given snapshot
@@ -340,17 +389,150 @@ func (s *Store) previousManifestOf(commit string) (map[string]prevEntry, error) 
 	if err != nil {
 		return nil, fmt.Errorf("snapshot: read previous manifest: %w", err)
 	}
-	// The manifest is canonical-kernel bytes: the law's prefix
-	// tag on the first line, then the canonical JSON document.
-	doc := raw
-	if i := strings.Index(doc, "\n"); i >= 0 {
-		doc = doc[i+1:]
+	manifest, err := parseManifest([]byte(raw))
+	if err != nil {
+		return nil, err
 	}
-	var manifest map[string]prevEntry
-	if err := json.Unmarshal([]byte(doc), &manifest); err != nil {
-		return nil, fmt.Errorf("snapshot: parse previous manifest: %w", err)
+	if err := s.checkManifestBlobs(manifest); err != nil {
+		return nil, err
 	}
 	return manifest, nil
+}
+
+// parseManifest decodes a manifest's bytes and validates the
+// shape of every entry. The decode is canonical.DecodeKernel —
+// the same law the manifest writer encodes under — so the
+// canonical prefix tag is required, not stripped and assumed,
+// and a null or otherwise non-object document is refused rather
+// than read as an empty manifest. Each entry must be an object
+// carrying a well-formed blob ID, a kind of "file" or "symlink",
+// an integer mtime, and a non-negative integer size (panel
+// W3-7).
+func parseManifest(raw []byte) (map[string]prevEntry, error) {
+	v, err := canonical.DecodeKernel(raw)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot: parse previous manifest: %w", err)
+	}
+	if v.Kind != canonical.KindObject {
+		return nil, errors.New("snapshot: parse previous manifest: manifest is not an object")
+	}
+	manifest := make(map[string]prevEntry, len(v.Pairs))
+	for _, p := range v.Pairs {
+		entry, err := parsePrevEntry(p.Value)
+		if err != nil {
+			return nil, fmt.Errorf("snapshot: parse previous manifest: entry %q: %w", p.Key, err)
+		}
+		manifest[p.Key] = entry
+	}
+	return manifest, nil
+}
+
+// parsePrevEntry validates one manifest entry's shape and
+// converts it to a prevEntry.
+func parsePrevEntry(v canonical.Value) (prevEntry, error) {
+	if v.Kind != canonical.KindObject {
+		return prevEntry{}, errors.New("manifest entry is not an object")
+	}
+	var e prevEntry
+	var haveBlob, haveKind, haveMtime, haveSize bool
+	for _, p := range v.Pairs {
+		switch p.Key {
+		case "blob":
+			if p.Value.Kind != canonical.KindString {
+				return prevEntry{}, errors.New("blob is not a string")
+			}
+			e.Blob, haveBlob = p.Value.Str, true
+		case "kind":
+			if p.Value.Kind != canonical.KindString {
+				return prevEntry{}, errors.New("kind is not a string")
+			}
+			e.Kind, haveKind = p.Value.Str, true
+		case "mtime":
+			if p.Value.Kind != canonical.KindInt {
+				return prevEntry{}, errors.New("mtime is not an integer")
+			}
+			n, err := strconv.ParseInt(p.Value.Int, 10, 64)
+			if err != nil {
+				return prevEntry{}, fmt.Errorf("mtime: %w", err)
+			}
+			e.Mtime, haveMtime = n, true
+		case "size":
+			if p.Value.Kind != canonical.KindInt {
+				return prevEntry{}, errors.New("size is not an integer")
+			}
+			n, err := strconv.ParseInt(p.Value.Int, 10, 64)
+			if err != nil {
+				return prevEntry{}, fmt.Errorf("size: %w", err)
+			}
+			if n < 0 {
+				return prevEntry{}, errors.New("size is negative")
+			}
+			e.Size, haveSize = n, true
+		}
+	}
+	if !haveBlob || !haveKind || !haveMtime || !haveSize {
+		return prevEntry{}, errors.New("manifest entry lacks one of blob, kind, mtime, size")
+	}
+	if e.Kind != "file" && e.Kind != "symlink" {
+		return prevEntry{}, fmt.Errorf("kind %q is neither \"file\" nor \"symlink\"", e.Kind)
+	}
+	if !isObjectID(e.Blob) {
+		return prevEntry{}, fmt.Errorf("blob %q is not a well-formed object ID", e.Blob)
+	}
+	return e, nil
+}
+
+// isObjectID reports whether s is a full lowercase-hex SHA-1
+// object ID, the only form git's plumbing emits.
+func isObjectID(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for _, c := range s {
+		if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// checkManifestBlobs verifies that every blob a manifest names
+// exists in the repository as a blob object. snapshotOnce's
+// reuse law trusts a manifest entry's blob whenever kind, size
+// and mtime match the workspace file; an entry naming a missing
+// or non-blob object would otherwise pass Open and then fail
+// every later Snapshot permanently, deep in the plumbing,
+// instead of being refused here as the corruption it is (panel
+// W3-7). One batch-check call covers the whole manifest.
+func (s *Store) checkManifestBlobs(manifest map[string]prevEntry) error {
+	if len(manifest) == 0 {
+		return nil
+	}
+	rels := make([]string, 0, len(manifest))
+	for rel := range manifest {
+		rels = append(rels, rel)
+	}
+	sort.Strings(rels)
+	var in strings.Builder
+	for _, rel := range rels {
+		in.WriteString(manifest[rel].Blob)
+		in.WriteByte('\n')
+	}
+	out, err := s.git([]byte(in.String()), "cat-file", "--batch-check")
+	if err != nil {
+		return fmt.Errorf("snapshot: check manifest blobs: %w", err)
+	}
+	lines := strings.Split(out, "\n")
+	if len(lines) != len(rels) {
+		return fmt.Errorf("snapshot: check manifest blobs: batch-check returned %d lines for %d entries", len(lines), len(rels))
+	}
+	for i, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[1] != "blob" {
+			return fmt.Errorf("snapshot: manifest entry %q names blob %s, which is not a blob in the repository (%s)", rels[i], manifest[rels[i]].Blob, line)
+		}
+	}
+	return nil
 }
 
 // Snapshot captures workspaceDir as a new dual-tree commit: the
