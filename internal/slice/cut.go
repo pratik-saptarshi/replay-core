@@ -241,14 +241,22 @@ func applyModeFilter(ordered []store.StoredRecord, edges [][2]string, admit map[
 	return kept, keptEdges, nil
 }
 
-// closure computes a cut's record set iteratively (explicit stack —
-// Review Focus 5): seed with the target path's records at ordinal ≤
-// the through-ordinal, then walk caused_by transitively, fetching
-// cross-path ancestors via GetRecord. It returns the selected
-// records and each selected record's caused_by list; in a closed
-// set every cause is itself selected.
+// closure computes a cut's record set: the closure walk over the
+// cut's owner path through the cut's through-ordinal.
 func closure(s *store.Store, cut Cut) (map[string]store.StoredRecord, map[string][]string, error) {
-	pathRecs, err := s.PathRecords(cut.OwnerPath)
+	return closureWalk(s, cut.OwnerPath, cut.ThroughOrdinal)
+}
+
+// closureWalk computes a path prefix's record set iteratively
+// (explicit stack — Review Focus 5): seed with the path's records
+// at ordinal ≤ throughOrdinal, then walk caused_by transitively,
+// fetching cross-path ancestors via GetRecord. It returns the
+// selected records and each selected record's caused_by list; in a
+// closed set every cause is itself selected. Cut resolution
+// (cut.go) and the effective-history projection (project.go) share
+// this one walk.
+func closureWalk(s *store.Store, ownerPath string, throughOrdinal int64) (map[string]store.StoredRecord, map[string][]string, error) {
+	pathRecs, err := s.PathRecords(ownerPath)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -256,7 +264,7 @@ func closure(s *store.Store, cut Cut) (map[string]store.StoredRecord, map[string
 	causes := make(map[string][]string)
 	var stack []string
 	for _, rec := range pathRecs {
-		if rec.OwnerOrdinal <= cut.ThroughOrdinal {
+		if rec.OwnerOrdinal <= throughOrdinal {
 			if _, ok := selected[rec.ID]; !ok {
 				selected[rec.ID] = rec
 				stack = append(stack, rec.ID)
