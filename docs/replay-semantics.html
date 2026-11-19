@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Replay Semantics — replay-core (Phase 0 spec, 2026-11-18)</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 24px auto; max-width: 960px; padding: 0 16px; line-height: 1.55; color: #1a2332; }
+  h1 { font-size: 1.45rem; } h2 { font-size: 1.15rem; border-bottom: 2px solid #dbe3ee; padding-bottom: 4px; margin-top: 30px; }
+  code { font-family: ui-monospace, Menlo, monospace; font-size: 0.88em; }
+  .warn { background: #fdf1f1; border: 1px solid #e5b4b4; border-radius: 8px; padding: 10px 14px; }
+  .note { background: #fff7e8; border: 1px solid #ecd9a8; border-radius: 8px; padding: 10px 14px; }
+  .ok { background: #eefaf0; border: 1px solid #b5dcbc; border-radius: 8px; padding: 10px 14px; }
+  ul { margin: 6px 0; }
+  .src { color: #5a6478; font-size: 0.88rem; }
+</style>
+</head>
+<body>
+<h1>Replay Semantics — replay-core</h1>
+<p><b>Status:</b> normative spec for Phase 0; the statement Tasks 2–5 and all later phases argue from. <b>Source of semantics:</b> the features development plan for the replay capability (AEP goal workspace, 2026-11-18) §2 (and §3 for the charter and accounting rules). This page introduces no semantics beyond that plan. A reference design study found that the prior art's shipped kernel is an append-only record store that explicitly excludes replay, and its only replay implementation is a language-calculus prototype — so the semantics below are the ones replay-core defines and builds, at the provider boundary, for AEP's real workloads (orch-driven runs, SDD lanes, ESF executions).</p>
+
+<h2>1. Effect boundary</h2>
+<p>Replay is defined at the <b>provider boundary</b>, the only place nondeterminism enters a run. A run is a sequence of <b>declared effects</b>:</p>
+<ul>
+<li>model calls,</li>
+<li>tool executions,</li>
+<li>filesystem settlements.</li>
+</ul>
+<p>Everything inside the task program between effects is its own business; everything that crosses the boundary is an effect and is governed by the rules below. The shape is a request/completion pair — the program performs an effect request, the host completes it with an observation — generalized from a language-calculus prototype to a subprocess boundary.</p>
+
+<h2>2. Record by value</h2>
+<p>Each effect is recorded as a trace record carrying:</p>
+<ul>
+<li>its <b>request digest</b> — the canonical-digest identity of the request (Phase 0 digest law), and</li>
+<li>its <b>full result payload, captured by value</b> — for model calls, the exact request bytes and the exact response bytes.</li>
+</ul>
+<div class="warn"><b>Explicitly rejected:</b> capture by digest only. A reference design's jailed path records a prompt digest and not the prompt itself, which makes its traces non-replayable — the exact model input cannot be re-derived from the trace. replay-core does not repeat that: a trace that cannot answer an effect from its own records is not a replayable trace.</div>
+
+<h2>3. Replay by digest match</h2>
+<p>Replay is the re-execution of the same task program in a fresh workspace fork, where <b>every effect whose request digest matches the recording is answered from the trace instead of the world</b>. The task program runs; when it reaches an effect, the replayer compares the effect's request digest against the recorded effect at that position:</p>
+<ul>
+<li><b>Digest match</b> — the recorded result payload is re-fed to the program; no live call is made.</li>
+<li><b>First divergent effect</b> — its digest does not match the recording. This effect <b>marks the fork point</b>; from there on, the run is live and its effects execute against the world (and are recorded as the new run's own trace).</li>
+</ul>
+
+<h2>4. Fork at a Cut</h2>
+<p>A <b>Cut</b> is an immutable read address over a trace. Fork-replay (counterfactual replay) starts from any Cut:</p>
+<ul>
+<li>restore the workspace snapshot at that cut,</li>
+<li>seed the effect cache from the trace prefix up to that cut,</li>
+<li>optionally <b>amend one recorded input</b>,</li>
+<li>and run.</li>
+</ul>
+<p>Everything before the cut is inherited by reference; nothing is copied. Amending one input is the counterfactual: the run replays identically up to the amended effect and diverges live from there, under §3. This is the mechanism for re-running a failed or surprising run from the step before the failure with one input changed.</p>
+
+<h2>5. Projection-only revert</h2>
+<p>The trace store is append-only, and revert is <b>projection-only</b>, exactly as upstream defines it:</p>
+<ul>
+<li><b>Abandon is a fact</b> — abandoning a run appends an abandon fact to the trace; it edits nothing.</li>
+<li><b>Effective history excludes abandoned runs</b> — readers project the effective history from the facts, and abandoned runs are excluded from that projection.</li>
+<li><b>Bytes are never deleted</b> — there is no rollback and no deletion; selecting an earlier Cut is the only form of "going back".</li>
+</ul>
+
+<h2>6. Honesty rule</h2>
+<div class="note"><b>Replay guarantees identical <i>inputs</i> to the task program — not identical model behavior on live segments.</b></div>
+<ul>
+<li>Clocks and RNG are <b>recorded as effects when the program declares them</b>; a declared clock or RNG read replays by digest match like any other effect.</li>
+<li><b>Undeclared nondeterminism is a program bug</b> — it is surfaced by digest mismatch at the next effect, not hidden by the replayer.</li>
+<li>Consistent with the claims discipline of this phase: capability statements about replay cite the tests that prove them; measurement (for example, provider-reported cache-token counts) is recorded as measurement and never restated as a reuse guarantee.</li>
+</ul>
+
+<h2>7. Memory charter</h2>
+<div class="ok"><b>replay-core is an execution store, not a memory system.</b> NeuroStrata remains the memory of record. No second memory system is created.</div>
+<ul>
+<li>At run close, replay-core inscribes <b>pointers only</b> — trace ids and cut addresses — into NeuroStrata.</li>
+<li>The direction is one-way: replay-core writes pointers into NeuroStrata, <b>never the reverse</b>.</li>
+<li>replay-core has <b>no search or semantic APIs</b> — retrieval over what a run meant is NeuroStrata's job; replay-core's job is what a run did, byte for byte.</li>
+</ul>
+
+<h2>8. Accounting note</h2>
+<ul>
+<li>A replayed effect that <b>diverges is a live effect by definition</b> — an effect that would re-fire a real-world action does so only because it diverged, and it is accounted as live.</li>
+<li>All <b>GitHub effects</b> of replayed runs still pass through <b>ghg</b>, exactly as for a first run.</li>
+<li>The <b>settlement gates apply before anything touches a real tree</b>: fail-closed settlement (fast-forward-only select, path-disjoint apply, archive-on-discard) governs the live segment of a replay just as it governs any run.</li>
+</ul>
+
+<p class="src"><b>Sources:</b> features development plan (AEP goal workspace, 2026-11-18) §2 (effect boundary, record by value, replay by digest match, fork-replay, projection-only revert, honesty rule) and §3 (memory rule, ghg accounting, settlement gates); Phase 0 plan <code>docs/plans/2026-11-18-replay-core-phase-0-plan.html</code> (Global Constraints: claims discipline, memory rule); reverse-engineering findings held in the AEP goal workspace (Cut/Slice and projection-only revert in the reference store; replay excluded from the reference kernel's frozen scope).</p>
+</body>
+</html>

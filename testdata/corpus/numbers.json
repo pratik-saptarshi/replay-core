@@ -1,0 +1,119 @@
+[
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"value\":-0.0}",
+  "digest": "sha256:30c041d23d391b79eeece5acbf3bcada5f966bfd2131567d1067b46b5e6ef4e5",
+  "input": {
+   "value": -0.0
+  },
+  "name": "float/-0.0",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"value\":0.1}",
+  "digest": "sha256:4fce75bb9e1ebe464b1ee9443179b4a3422f1f69f98df690448794771d4b598e",
+  "input": {
+   "value": 0.1
+  },
+  "name": "float/0.1",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"value\":1.0}",
+  "digest": "sha256:7df711de3714dad345f4452c24709284a2aae0bd7be04442b809203bcdb079a1",
+  "input": {
+   "value": 1.0
+  },
+  "name": "float/1.0",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"value\":1.7976931348623157e+308}",
+  "digest": "sha256:37b55b0e88d7676b4edefef126ba95ac5b325ae9df1a3825402bc30e18726980",
+  "input": {
+   "value": 1.7976931348623157e+308
+  },
+  "name": "float/1.7976931348623157e308",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"value\":123456789.12345679}",
+  "digest": "sha256:fcd71a98e18636805228094a084835b14697fe0d13f02d6e571bfa32f8d8b56c",
+  "input": {
+   "value": 123456789.12345679
+  },
+  "name": "float/123456789.123456789",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"value\":1e-07}",
+  "digest": "sha256:a154894ccb2592601bdeef573f86e80d8a43eca8ca297cc57037ea446b67d2d4",
+  "input": {
+   "value": 1e-07
+  },
+  "name": "float/1e-7",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"value\":1e+20}",
+  "digest": "sha256:d249b295bfec6eb7423e60389c82a3de02c2b4c0d612a94e72bf13c75b93564e",
+  "input": {
+   "value": 1e+20
+  },
+  "name": "float/1e20",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"value\":1e+21}",
+  "digest": "sha256:ac2d83be8ad192914d04f39fae22ff476a7bc07924f2fb5e57904f443840f9cc",
+  "input": {
+   "value": 1e+21
+  },
+  "name": "float/1e21",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"value\":5e-324}",
+  "digest": "sha256:e118562e6cef653a3ab9a9f26ce40a54752f38ce701b77b16a651410bd2827cf",
+  "input": {
+   "value": 5e-324
+  },
+  "name": "float/5e-324",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"value\":-9223372036854775809}",
+  "digest": "sha256:94b3d738e0a6371e51e949a198cf8a3b2cbe53218849f02b0459ed7d0282bfb7",
+  "input": {
+   "value": -9223372036854775809
+  },
+  "name": "int/-(2^63)-1",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"value\":9223372036854775808}",
+  "digest": "sha256:aff7ea773d5c92bc9727ac4bfa2b6f172e72415b527db6dabbbeab4c74aa0916",
+  "input": {
+   "value": 9223372036854775808
+  },
+  "name": "int/2^63",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"value\":18446744073709551616}",
+  "digest": "sha256:2ef985af69f4175b3b6925135ab1198e1c314a49463db9dd961c624fadafa496",
+  "input": {
+   "value": 18446744073709551616
+  },
+  "name": "int/2^64",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"value\":9007199254740993}",
+  "digest": "sha256:4eb613baa86049261c3ffa082fe1681483619096e98282ba94903fd8c354ecfc",
+  "input": {
+   "value": 9007199254740993
+  },
+  "name": "int/9007199254740993",
+  "profile": "replaycore.kernel.canonical.v1"
+ }
+]
