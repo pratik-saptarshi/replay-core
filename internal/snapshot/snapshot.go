@@ -637,6 +637,28 @@ func resolveWorkspaceRoot(dir string) (string, error) {
 	return resolved, nil
 }
 
+// attachEmptyWorkspaceTree returns root — a write-tree result
+// holding only meta/, the empty-workspace case — with git's
+// empty tree attached as its workspace/ subtree. The rebuilt
+// tree's entries are meta plus the workspace line, already in
+// tree order.
+func (s *Store) attachEmptyWorkspaceTree(root string) (string, error) {
+	emptyTree, err := s.git(nil, "mktree")
+	if err != nil {
+		return "", fmt.Errorf("snapshot: create empty tree: %w", err)
+	}
+	listing, err := s.git(nil, "ls-tree", root)
+	if err != nil {
+		return "", fmt.Errorf("snapshot: list root tree: %w", err)
+	}
+	input := listing + "\n040000 tree " + emptyTree + "\tworkspace\n"
+	newRoot, err := s.git([]byte(input), "mktree")
+	if err != nil {
+		return "", fmt.Errorf("snapshot: attach empty workspace tree: %w", err)
+	}
+	return newRoot, nil
+}
+
 // snapshotOnce makes one attempt at extending the chain: it
 // resolves the current head, builds a snapshot commit on it, and
 // tries to advance refs/vcscore/ops/latest to the new commit with
@@ -723,6 +745,21 @@ func (s *Store) snapshotOnce(workspaceDir string, entries []entry, snapMeta []by
 	tree, err := s.gitEnv(nil, idxEnv, "write-tree")
 	if err != nil {
 		return "", false, nil, fmt.Errorf("snapshot: write-tree: %w", err)
+	}
+	if len(entries) == 0 {
+		// The root tree is always exactly {workspace, meta}
+		// (plan Task 13): with no workspace entries staged, the
+		// index holds only meta/, so write-tree produced a root
+		// with no workspace subtree, and consumers resolving
+		// that subtree cannot read the snapshot (Codex P2 on
+		// PR #2). Attach git's empty tree as workspace/. The
+		// walk law stands — empty directories leave no entries
+		// under workspace/; only the subtree itself is
+		// guaranteed.
+		tree, err = s.attachEmptyWorkspaceTree(tree)
+		if err != nil {
+			return "", false, nil, err
+		}
 	}
 
 	commitArgs := []string{"commit-tree", tree}
