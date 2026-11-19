@@ -373,6 +373,20 @@ func (s *Store) Snapshot(workspaceDir string, meta map[string]string) (string, e
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// The workspace root is resolved once, here, and the
+	// resolved path is used for the walk and every file read:
+	// WalkDir does not follow a symlinked root — it visits the
+	// link itself as the workspace's single entry, and the tree
+	// build then fails deep in the plumbing with a raw git error
+	// naming a nonsense path (panel P3). Resolving ancestor
+	// symlinks along the way changes nothing else: entries are
+	// recorded relative to the root either way.
+	resolved, err := resolveWorkspaceRoot(workspaceDir)
+	if err != nil {
+		return "", err
+	}
+	workspaceDir = resolved
+
 	entries, err := walk(workspaceDir)
 	if err != nil {
 		return "", err
@@ -393,6 +407,21 @@ func (s *Store) Snapshot(workspaceDir string, meta map[string]string) (string, e
 		lastCAS = casErr
 	}
 	return "", fmt.Errorf("snapshot: chain head %s kept moving under contention after %d attempts: %w", latestRef, maxChainAttempts, lastCAS)
+}
+
+// resolveWorkspaceRoot returns the absolute, symlink-free form
+// of a workspace root directory, or a descriptive error naming
+// the path as given when it cannot be resolved.
+func resolveWorkspaceRoot(dir string) (string, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("snapshot: resolve workspace root %s: %w", dir, err)
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", fmt.Errorf("snapshot: resolve workspace root %s: %w", dir, err)
+	}
+	return resolved, nil
 }
 
 // snapshotOnce makes one attempt at extending the chain: it
