@@ -58,15 +58,15 @@ func TestIdentityCheckRejectsMismatchedInsert(t *testing.T) { // AC-F2-3, as wri
 		VALUES ('sha256:1111111111111111111111111111111111111111111111111111111111111111',
 			'sha256:2222222222222222222222222222222222222222222222222222222222222222',
 			'runs/a', 99, 'test.fact', 'capture', x'00', 'sha256:22e3bf15914b5007dea08a1079d1542470a369bcbed067687f345e7e85721130')`)
-	if err == nil || !strings.Contains(err.Error(), "constraint") {
-		t.Fatalf("mismatched INSERT err = %v, want CHECK constraint violation", err)
+	if err == nil || !strings.Contains(err.Error(), "CHECK constraint failed: record_id = digest") {
+		t.Fatalf("mismatched INSERT err = %v, want the identity CHECK itself to reject", err)
 	}
 }
 
 func TestIdentityMutationSweep(t *testing.T) {
 	// every insert path that could create a row with record_id != digest must fail:
 	cases := []string{
-		`UPDATE records SET record_id = 'sha256:3333333333333333333333333333333333333333333333333333333333333333'`,
+		`UPDATE records SET record_id = 'sha256:3333333333333333333333333333333333333333333333333333333333333333' WHERE record_id IN (SELECT record_id FROM records LIMIT 1)`,
 		`UPDATE records SET digest = 'sha256:4444444444444444444444444444444444444444444444444444444444444444'`,
 		`INSERT INTO records SELECT 'sha256:5555555555555555555555555555555555555555555555555555555555555555', digest, owner_path, 100, schema_ref, mode, canonical_bytes, witness_digest FROM records LIMIT 1`,
 	}
@@ -74,8 +74,8 @@ func TestIdentityMutationSweep(t *testing.T) {
 	for i, stmt := range cases {
 		path := seedStore(t)
 		raw := openRaw(t, path)
-		if _, err := raw.Exec(stmt); err == nil || !strings.Contains(err.Error(), "constraint") {
-			t.Errorf("case %d: err = %v, want CHECK constraint violation\nstatement: %s", i, err, stmt)
+		if _, err := raw.Exec(stmt); err == nil || !strings.Contains(err.Error(), "CHECK constraint failed: record_id = digest") {
+			t.Errorf("case %d: err = %v, want the identity CHECK itself to reject\nstatement: %s", i, err, stmt)
 			continue
 		}
 		// the rejected statement must leave no row behind with record_id != digest
