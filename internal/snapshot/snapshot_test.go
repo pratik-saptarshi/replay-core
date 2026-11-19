@@ -237,6 +237,58 @@ func TestSnapshotFailsOnUnreadableFile(t *testing.T) { // Review Focus 4b
 	}
 }
 
+// TestOpenRejectsCorruptChainHead pins Open's chain-recovery law:
+// a refs/vcscore/ops/latest ref that exists but does not resolve
+// to a commit is corruption, and Open must fail loudly — naming
+// the ref — instead of silently starting a fresh chain over the
+// existing snapshots. A genuinely absent ref stays lawful (it is
+// how every store begins; see the other tests).
+func TestOpenRejectsCorruptChainHead(t *testing.T) {
+	setup := func(t *testing.T) (string, string) {
+		t.Helper()
+		ws := t.TempDir()
+		writeFile(t, filepath.Join(ws, "hello.txt"), "hello\n")
+		dir := filepath.Join(t.TempDir(), "snap.git")
+		s, err := snapshot.Open(dir)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		commit, err := s.Snapshot(ws, map[string]string{"run": "corrupt-head"})
+		if err != nil {
+			t.Fatalf("Snapshot: %v", err)
+		}
+		return dir, commit
+	}
+
+	t.Run("latest ref names a non-commit object", func(t *testing.T) {
+		dir, commit := setup(t)
+		blob := git(t, dir, "rev-parse", commit+":workspace/hello.txt")
+		git(t, dir, "update-ref", "refs/vcscore/ops/latest", blob)
+		_, err := snapshot.Open(dir)
+		if err == nil {
+			t.Fatal("Open accepted a chain head naming a blob; want a loud failure")
+		}
+		if !strings.Contains(err.Error(), "refs/vcscore/ops/latest") {
+			t.Fatalf("Open error = %q, want it to name the corrupt ref", err)
+		}
+	})
+
+	t.Run("latest ref contents are garbage", func(t *testing.T) {
+		dir, _ := setup(t)
+		refPath := filepath.Join(dir, "refs", "vcscore", "ops", "latest")
+		if err := os.WriteFile(refPath, []byte("not-an-object-id\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, err := snapshot.Open(dir)
+		if err == nil {
+			t.Fatal("Open accepted a chain head with garbage contents; want a loud failure")
+		}
+		if !strings.Contains(err.Error(), "refs/vcscore/ops/latest") {
+			t.Fatalf("Open error = %q, want it to name the corrupt ref", err)
+		}
+	})
+}
+
 func TestSnapshotRejectsSpecialFiles(t *testing.T) {
 	ws := t.TempDir()
 	writeFile(t, filepath.Join(ws, "real.txt"), "real\n")

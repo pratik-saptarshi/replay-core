@@ -1,6 +1,7 @@
 package store_test
 
 import (
+	"bytes"
 	"database/sql"
 	"path/filepath"
 	"testing"
@@ -95,6 +96,21 @@ func TestStoreBootstrapRootWitness(t *testing.T) {
 	}
 	if rec.ID != "sha256:0b67497cb4c0f2ed954b7988ecc321b481e7d173c4fc201adeb86591b2fd6310" {
 		t.Fatalf("root ID = %s", rec.ID)
+	}
+	// The root's WitnessBody is its own body — the root witness
+	// fields object (read.go's root exception). Pinned directly
+	// here, by canonical encoding; the corruption suite pins the
+	// non-root witness path.
+	gotBody, err := canonical.MarshalKernel(rec.WitnessBody)
+	if err != nil {
+		t.Fatalf("marshal root WitnessBody: %v", err)
+	}
+	wantBody, err := canonical.MarshalKernel(rootFields(t))
+	if err != nil {
+		t.Fatalf("marshal root witness fields: %v", err)
+	}
+	if !bytes.Equal(gotBody, wantBody) {
+		t.Fatalf("root WitnessBody = %s, want the root witness fields %s", gotBody, wantBody)
 	}
 	tail, err := s.Frontier("runs/a")
 	if err != nil || tail != rec.ID {

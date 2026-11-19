@@ -75,14 +75,14 @@ func TestAppendBatchOrdinalsGapFreePerOwner(t *testing.T) { // AC-F2-4
 	}
 }
 
-func TestAppendBatchRejectsUnknownAndSelfCitations(t *testing.T) { // Review Focus 2
+func TestAppendBatchRejectsUnknownAndForwardCitations(t *testing.T) { // Review Focus 2
 	s := openTemp(t)
 	bad := draft(t, "test.fact", `{"n":1}`)
 	bad.CausedBy = []string{"sha256:0000000000000000000000000000000000000000000000000000000000000000"}
 	if _, err := s.AppendBatch("runs/a", "x-1", []store.RecordDraft{bad}); err == nil {
 		t.Fatal("unknown citation accepted")
 	}
-	// a draft citing a later draft in the same batch (self/cycle class) is rejected the same way
+	// a draft citing a later draft in the same batch (a forward citation) is rejected the same way
 	d0 := draft(t, "test.fact", `{"n":1}`)
 	d1 := draft(t, "test.fact", `{"n":2}`)
 	d0.CausedBy = nil

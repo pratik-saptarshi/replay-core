@@ -72,9 +72,15 @@ for pkg in canonical record conformance store slice snapshot; do
     bad "go test -count=1 ./internal/$pkg/ (log: $log)"; cat "$log"
   fi
 
-  # 4. Zero skips in this package, apart from the two named
-  # store re-exec helpers documented in the header.
-  unexpected="$(grep -- '--- SKIP' "$log" | grep -vE -- '--- SKIP: (TestAppenderProcess|TestRaceProcess) \(' || true)"
+  # 4. Zero skips in this package. The two named re-exec
+  # helpers documented in the header are excluded only from
+  # the store package's log — that is where they live; in any
+  # other package's log, every SKIP line is unexpected.
+  if [ "$pkg" = "store" ]; then
+    unexpected="$(grep -- '--- SKIP' "$log" | grep -vE -- '--- SKIP: (TestAppenderProcess|TestRaceProcess) \(' || true)"
+  else
+    unexpected="$(grep -- '--- SKIP' "$log" || true)"
+  fi
   if [ -z "$unexpected" ]; then
     say "PASS zero skipped tests in ./internal/$pkg/"
   else
@@ -82,8 +88,10 @@ for pkg in canonical record conformance store slice snapshot; do
   fi
 done
 
-# 5. The Phase 1 gate demonstration ran and passed.
-if grep -q -- '--- PASS: TestPhase1Gate' "$tmp/test-conformance.log"; then
+# 5. The Phase 1 gate demonstration ran and passed. The
+# pattern is anchored to the test's own PASS line ("... ("),
+# so a subtest's PASS line cannot satisfy the check.
+if grep -qE -- '--- PASS: TestPhase1Gate \(' "$tmp/test-conformance.log"; then
   say "PASS TestPhase1Gate present and passing"
 else
   bad "TestPhase1Gate PASS line missing from the conformance run"

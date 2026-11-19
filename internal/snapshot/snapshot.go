@@ -79,9 +79,27 @@ func Open(dir string) (*Store, error) {
 	if got != emptyBlobID {
 		return nil, fmt.Errorf("%w: probe hash-object returned %q, want %q", ErrGitUnavailable, got, emptyBlobID)
 	}
-	// Recover the chain head, if any.
-	if head, err := s.git(nil, "rev-parse", "--verify", "--quiet", latestRef+"^{commit}"); err == nil {
+	// Recover the chain head, if any. A missing latest ref means
+	// no chain yet. A latest ref that exists but does not resolve
+	// to a commit is corruption, and Open fails loudly rather
+	// than silently starting a fresh chain over the existing
+	// snapshots: the ref may name a non-commit object or a
+	// dangling object ID (the unpeeled rev-parse below still
+	// resolves it), or its contents may be unparseable — git
+	// reports that as a "broken ref" warning on the failing
+	// rev-parse's stderr while treating the ref as absent, so
+	// the warning text is the only signal separating a broken
+	// ref from a genuinely absent one.
+	head, err := s.git(nil, "rev-parse", "--verify", "--quiet", latestRef+"^{commit}")
+	switch {
+	case err == nil:
 		s.last = head
+	default:
+		if _, uerr := s.git(nil, "rev-parse", "--verify", "--quiet", latestRef); uerr == nil {
+			return nil, fmt.Errorf("snapshot: chain head %s does not resolve to a commit", latestRef)
+		} else if strings.Contains(err.Error(), "broken ref") || strings.Contains(uerr.Error(), "broken ref") {
+			return nil, fmt.Errorf("snapshot: chain head %s is corrupt: %v", latestRef, err)
+		}
 	}
 	return s, nil
 }
