@@ -1,0 +1,484 @@
+[
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"a\":{\"snowman\":\"snowman-☃\"},\"z\":1}",
+  "digest": "sha256:d370e6ba6d4f561c741a6c486cb063c37b5baf0e4536c928ff9099027b66e236",
+  "input": {
+   "a": {
+    "snowman": "snowman-☃"
+   },
+   "z": 1
+  },
+  "name": "bytes/canonical_json_is_stable_and_utf8",
+  "profile": "replaycore.kernel.canonical.v1",
+  "raw_canonical_json_b64": "eyJhIjp7InNub3dtYW4iOiJzbm93bWFuLeKYgyJ9LCJ6IjoxfQ=="
+ },
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"body\":{\"active_binding_refs\":[\"binding:task\"],\"actor_ref\":\"runtime:test\",\"authority_refs\":[\"trusted:internal\"],\"containment\":\"contained\",\"provenance_policy_refs\":[],\"semantic_environment_refs\":[\"schema-set:test\"],\"substrate_ref\":\"fs.local.v1\",\"visibility_policy_refs\":[\"visibility:payload\"]},\"kind\":\"witness\",\"schema_ref\":\"kernel.witness.v1\"}",
+  "digest": "sha256:455f6ae4bcbe692ae73408c82ea93681c7df71a0c7b40330aae0ff0a074aa2fd",
+  "input": {
+   "body": {
+    "active_binding_refs": [
+     "binding:task"
+    ],
+    "actor_ref": "runtime:test",
+    "authority_refs": [
+     "trusted:internal"
+    ],
+    "containment": "contained",
+    "provenance_policy_refs": [],
+    "semantic_environment_refs": [
+     "schema-set:test"
+    ],
+    "substrate_ref": "fs.local.v1",
+    "visibility_policy_refs": [
+     "visibility:payload"
+    ]
+   },
+   "kind": "witness",
+   "schema_ref": "kernel.witness.v1"
+  },
+  "name": "golden/alternate_witness.body_digest",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"body\":{\"active_binding_refs\":[\"binding:task\"],\"actor_ref\":\"runtime:test\",\"authority_refs\":[\"trusted:internal\"],\"containment\":\"contained\",\"provenance_policy_refs\":[],\"semantic_environment_refs\":[\"schema-set:test\"],\"substrate_ref\":\"fs.local.v1\",\"visibility_policy_refs\":[\"visibility:payload\"]},\"caused_by\":[],\"kind\":\"record\",\"mode\":\"capture\",\"schema_ref\":\"kernel.witness.v1\",\"witness\":\"sha256:4826dd37b9ecc0c00121d77ccb9247d2e70b4f5386d6e3d464f2811fbc739777\"}",
+  "digest": "sha256:c630a1b1bba81de0517712a8348c161134289fda84968c33bf9ed900689bbf9e",
+  "input": {
+   "body": {
+    "active_binding_refs": [
+     "binding:task"
+    ],
+    "actor_ref": "runtime:test",
+    "authority_refs": [
+     "trusted:internal"
+    ],
+    "containment": "contained",
+    "provenance_policy_refs": [],
+    "semantic_environment_refs": [
+     "schema-set:test"
+    ],
+    "substrate_ref": "fs.local.v1",
+    "visibility_policy_refs": [
+     "visibility:payload"
+    ]
+   },
+   "caused_by": [],
+   "kind": "record",
+   "mode": "capture",
+   "schema_ref": "kernel.witness.v1",
+   "witness": "sha256:4826dd37b9ecc0c00121d77ccb9247d2e70b4f5386d6e3d464f2811fbc739777"
+  },
+  "name": "golden/alternate_witness.record",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"body\":{\"name\":\"alpha\",\"value\":1},\"caused_by\":[],\"kind\":\"record\",\"mode\":\"capture\",\"schema_ref\":\"example.kernel.item.v1\",\"witness\":\"sha256:bf611d809144f8ae32be5f25b7ff5982f54fcc777e8a4a3c559423b4dbcb5738\"}",
+  "digest": "sha256:1ab04f21ad19d17109188eff86e3d2b7398bedb4c77f9fb6e6c97088a8364767",
+  "input": {
+   "body": {
+    "name": "alpha",
+    "value": 1
+   },
+   "caused_by": [],
+   "kind": "record",
+   "mode": "capture",
+   "schema_ref": "example.kernel.item.v1",
+   "witness": "sha256:bf611d809144f8ae32be5f25b7ff5982f54fcc777e8a4a3c559423b4dbcb5738"
+  },
+  "name": "golden/alternate_witness_record",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"body\":{\"name\":\"alpha\",\"value\":1},\"caused_by\":[],\"kind\":\"record\",\"mode\":\"capture\",\"schema_ref\":\"example.kernel.item.v1\",\"witness\":\"sha256:8872c210b2476cb0a9c2ab06d303d39d785393b761c0a24c3172317c19ba4bf1\"}",
+  "digest": "sha256:c1130f7072093a8a923135960f418ce2259bfe2050190bf0a464e97ee80c9df5",
+  "input": {
+   "body": {
+    "name": "alpha",
+    "value": 1
+   },
+   "caused_by": [],
+   "kind": "record",
+   "mode": "capture",
+   "schema_ref": "example.kernel.item.v1",
+   "witness": "sha256:8872c210b2476cb0a9c2ab06d303d39d785393b761c0a24c3172317c19ba4bf1"
+  },
+  "name": "golden/capture_record",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"body\":{\"name\":\"alpha\",\"value\":1},\"caused_by\":[],\"kind\":\"record\",\"mode\":\"declaration\",\"schema_ref\":\"example.kernel.item.v1\",\"witness\":\"sha256:8872c210b2476cb0a9c2ab06d303d39d785393b761c0a24c3172317c19ba4bf1\"}",
+  "digest": "sha256:21cdb1f83bc4aadad0dae78498bd47c23cd5bb87ba3036aefabec79a87ad0407",
+  "input": {
+   "body": {
+    "name": "alpha",
+    "value": 1
+   },
+   "caused_by": [],
+   "kind": "record",
+   "mode": "declaration",
+   "schema_ref": "example.kernel.item.v1",
+   "witness": "sha256:8872c210b2476cb0a9c2ab06d303d39d785393b761c0a24c3172317c19ba4bf1"
+  },
+  "name": "golden/declaration_record",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"body\":{\"name\":\"alpha\",\"value\":1},\"caused_by\":[\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"sha256:2222222222222222222222222222222222222222222222222222222222222222\"],\"kind\":\"record\",\"mode\":\"capture\",\"schema_ref\":\"example.kernel.item.v1\",\"witness\":\"sha256:8872c210b2476cb0a9c2ab06d303d39d785393b761c0a24c3172317c19ba4bf1\"}",
+  "digest": "sha256:8220f74fa4352443bb3e08977d368a9094a417746c20139331c8c51f06bb299a",
+  "input": {
+   "body": {
+    "name": "alpha",
+    "value": 1
+   },
+   "caused_by": [
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+   ],
+   "kind": "record",
+   "mode": "capture",
+   "schema_ref": "example.kernel.item.v1",
+   "witness": "sha256:8872c210b2476cb0a9c2ab06d303d39d785393b761c0a24c3172317c19ba4bf1"
+  },
+  "name": "golden/ordered_parent_record",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"body\":{\"active_binding_refs\":[\"binding:task\"],\"actor_ref\":\"runtime:test\",\"authority_refs\":[\"trusted:internal\"],\"containment\":\"contained\",\"provenance_policy_refs\":[],\"semantic_environment_refs\":[\"schema-set:test\"],\"substrate_ref\":\"sqlite.local.v1\",\"visibility_policy_refs\":[\"visibility:payload\"]},\"kind\":\"witness\",\"schema_ref\":\"kernel.witness.v1\"}",
+  "digest": "sha256:66f9e7b7cdfe45ed7bbaee41181f85564a2c7c87eaa88d5ae3492ae4a7581227",
+  "input": {
+   "body": {
+    "active_binding_refs": [
+     "binding:task"
+    ],
+    "actor_ref": "runtime:test",
+    "authority_refs": [
+     "trusted:internal"
+    ],
+    "containment": "contained",
+    "provenance_policy_refs": [],
+    "semantic_environment_refs": [
+     "schema-set:test"
+    ],
+    "substrate_ref": "sqlite.local.v1",
+    "visibility_policy_refs": [
+     "visibility:payload"
+    ]
+   },
+   "kind": "witness",
+   "schema_ref": "kernel.witness.v1"
+  },
+  "name": "golden/ordinary_witness.body_digest",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"body\":{\"active_binding_refs\":[\"binding:task\"],\"actor_ref\":\"runtime:test\",\"authority_refs\":[\"trusted:internal\"],\"containment\":\"contained\",\"provenance_policy_refs\":[],\"semantic_environment_refs\":[\"schema-set:test\"],\"substrate_ref\":\"sqlite.local.v1\",\"visibility_policy_refs\":[\"visibility:payload\"]},\"caused_by\":[],\"kind\":\"record\",\"mode\":\"capture\",\"schema_ref\":\"kernel.witness.v1\",\"witness\":\"sha256:4826dd37b9ecc0c00121d77ccb9247d2e70b4f5386d6e3d464f2811fbc739777\"}",
+  "digest": "sha256:0966f03954e0895cc48b548cd08eaffb3299813016ffedb84adac0385e106e79",
+  "input": {
+   "body": {
+    "active_binding_refs": [
+     "binding:task"
+    ],
+    "actor_ref": "runtime:test",
+    "authority_refs": [
+     "trusted:internal"
+    ],
+    "containment": "contained",
+    "provenance_policy_refs": [],
+    "semantic_environment_refs": [
+     "schema-set:test"
+    ],
+    "substrate_ref": "sqlite.local.v1",
+    "visibility_policy_refs": [
+     "visibility:payload"
+    ]
+   },
+   "caused_by": [],
+   "kind": "record",
+   "mode": "capture",
+   "schema_ref": "kernel.witness.v1",
+   "witness": "sha256:4826dd37b9ecc0c00121d77ccb9247d2e70b4f5386d6e3d464f2811fbc739777"
+  },
+  "name": "golden/ordinary_witness.record",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"body\":{\"name\":\"alpha\",\"value\":1},\"caused_by\":[\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"sha256:1111111111111111111111111111111111111111111111111111111111111111\"],\"kind\":\"record\",\"mode\":\"capture\",\"schema_ref\":\"example.kernel.item.v1\",\"witness\":\"sha256:8872c210b2476cb0a9c2ab06d303d39d785393b761c0a24c3172317c19ba4bf1\"}",
+  "digest": "sha256:1c6b78e033c8b005eb1a756706e871cd553bf2cdbeb188e75db9667d2c148dfd",
+  "input": {
+   "body": {
+    "name": "alpha",
+    "value": 1
+   },
+   "caused_by": [
+    "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+   ],
+   "kind": "record",
+   "mode": "capture",
+   "schema_ref": "example.kernel.item.v1",
+   "witness": "sha256:8872c210b2476cb0a9c2ab06d303d39d785393b761c0a24c3172317c19ba4bf1"
+  },
+  "name": "golden/reversed_parent_record",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"body\":{\"active_binding_refs\":[],\"actor_ref\":\"kernel:root\",\"authority_refs\":[],\"containment\":\"full\",\"provenance_policy_refs\":[],\"semantic_environment_refs\":[],\"substrate_ref\":\"kernel\",\"visibility_policy_refs\":[]},\"kind\":\"witness\",\"schema_ref\":\"kernel.witness.root.v1\"}",
+  "digest": "sha256:22e3bf15914b5007dea08a1079d1542470a369bcbed067687f345e7e85721130",
+  "input": {
+   "body": {
+    "active_binding_refs": [],
+    "actor_ref": "kernel:root",
+    "authority_refs": [],
+    "containment": "full",
+    "provenance_policy_refs": [],
+    "semantic_environment_refs": [],
+    "substrate_ref": "kernel",
+    "visibility_policy_refs": []
+   },
+   "kind": "witness",
+   "schema_ref": "kernel.witness.root.v1"
+  },
+  "name": "golden/root_witness.body_digest",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "canonical_text": "replaycore.kernel.canonical.v1\n{\"body\":{\"active_binding_refs\":[],\"actor_ref\":\"kernel:root\",\"authority_refs\":[],\"containment\":\"full\",\"provenance_policy_refs\":[],\"semantic_environment_refs\":[],\"substrate_ref\":\"kernel\",\"visibility_policy_refs\":[]},\"caused_by\":[],\"kind\":\"record\",\"mode\":\"capture\",\"schema_ref\":\"kernel.witness.root.v1\",\"witness\":\"\"}",
+  "digest": "sha256:0b67497cb4c0f2ed954b7988ecc321b481e7d173c4fc201adeb86591b2fd6310",
+  "input": {
+   "body": {
+    "active_binding_refs": [],
+    "actor_ref": "kernel:root",
+    "authority_refs": [],
+    "containment": "full",
+    "provenance_policy_refs": [],
+    "semantic_environment_refs": [],
+    "substrate_ref": "kernel",
+    "visibility_policy_refs": []
+   },
+   "caused_by": [],
+   "kind": "record",
+   "mode": "capture",
+   "schema_ref": "kernel.witness.root.v1",
+   "witness": ""
+  },
+  "name": "golden/root_witness.record",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "expect_error": "root witness",
+  "input": {
+   "args": {
+    "body": {},
+    "caused_by": [],
+    "mode": "capture",
+    "schema_ref": "example.step.v1",
+    "witness": ""
+   },
+   "op": "canonical_record_input"
+  },
+  "name": "validation/empty_witness_non_root_record",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "expect_error": "root witness",
+  "input": {
+   "args": {
+    "body": {
+     "active_binding_refs": [
+      "binding:task"
+     ],
+     "actor_ref": "runtime:test",
+     "authority_refs": [
+      "trusted:internal"
+     ],
+     "containment": "contained",
+     "provenance_policy_refs": [],
+     "semantic_environment_refs": [
+      "schema-set:test"
+     ],
+     "substrate_ref": "sqlite.local.v1",
+     "visibility_policy_refs": [
+      "visibility:payload"
+     ]
+    },
+    "caused_by": [],
+    "mode": "capture",
+    "schema_ref": "kernel.witness.v1",
+    "witness": ""
+   },
+   "op": "canonical_record_input"
+  },
+  "name": "validation/empty_witness_ordinary_witness_record",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "expect_error": "mode",
+  "input": {
+   "args": {
+    "body": {},
+    "caused_by": [],
+    "mode": "captured",
+    "schema_ref": "example.step.v1",
+    "witness": "sha256:8872c210b2476cb0a9c2ab06d303d39d785393b761c0a24c3172317c19ba4bf1"
+   },
+   "op": "canonical_record_input"
+  },
+  "name": "validation/invalid_mode",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "expect_error": "empty witness sentinel",
+  "input": {
+   "args": {
+    "body": {
+     "active_binding_refs": [],
+     "actor_ref": "kernel:root",
+     "authority_refs": [],
+     "containment": "full",
+     "provenance_policy_refs": [],
+     "semantic_environment_refs": [],
+     "substrate_ref": "kernel",
+     "visibility_policy_refs": []
+    },
+    "caused_by": [],
+    "mode": "capture",
+    "schema_ref": "kernel.witness.root.v1",
+    "witness": "sha256:28aa527e305e6eac5d81cebaf44d969f84ebc6faaa453fb8ebef6346fdb1f0a9"
+   },
+   "op": "canonical_record_input"
+  },
+  "name": "validation/root_witness_rejects_non_empty_witness",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "expect_error": "causal parents",
+  "input": {
+   "args": {
+    "body": {
+     "active_binding_refs": [],
+     "actor_ref": "kernel:root",
+     "authority_refs": [],
+     "containment": "full",
+     "provenance_policy_refs": [],
+     "semantic_environment_refs": [],
+     "substrate_ref": "kernel",
+     "visibility_policy_refs": []
+    },
+    "caused_by": [
+     "sha256:parent"
+    ],
+    "mode": "capture",
+    "schema_ref": "kernel.witness.root.v1",
+    "witness": ""
+   },
+   "op": "canonical_record_input"
+  },
+  "name": "validation/root_witness_with_causal_parents",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "expect_error": "root_witness_body",
+  "input": {
+   "args": {
+    "body": {
+     "active_binding_refs": [],
+     "actor_ref": "kernel:not-root",
+     "authority_refs": [],
+     "containment": "full",
+     "provenance_policy_refs": [],
+     "semantic_environment_refs": [],
+     "substrate_ref": "kernel",
+     "visibility_policy_refs": []
+    },
+    "caused_by": [],
+    "mode": "capture",
+    "schema_ref": "kernel.witness.root.v1",
+    "witness": ""
+   },
+   "op": "canonical_record_input"
+  },
+  "name": "validation/root_witness_wrong_body",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "expect_error": "mode",
+  "input": {
+   "args": {
+    "body": {
+     "active_binding_refs": [],
+     "actor_ref": "kernel:root",
+     "authority_refs": [],
+     "containment": "full",
+     "provenance_policy_refs": [],
+     "semantic_environment_refs": [],
+     "substrate_ref": "kernel",
+     "visibility_policy_refs": []
+    },
+    "caused_by": [],
+    "mode": "declaration",
+    "schema_ref": "kernel.witness.root.v1",
+    "witness": ""
+   },
+   "op": "canonical_record_input"
+  },
+  "name": "validation/root_witness_wrong_mode",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "expect_error": "containment",
+  "input": {
+   "args": {
+    "body": {
+     "active_binding_refs": [
+      "binding:task"
+     ],
+     "actor_ref": "runtime:test",
+     "authority_refs": [
+      "trusted:internal"
+     ],
+     "containment": "partial",
+     "provenance_policy_refs": [],
+     "semantic_environment_refs": [
+      "schema-set:test"
+     ],
+     "substrate_ref": "sqlite.local.v1",
+     "visibility_policy_refs": [
+      "visibility:payload"
+     ]
+    },
+    "schema_ref": "kernel.witness.v1"
+   },
+   "op": "witness_body_digest"
+  },
+  "name": "validation/witness_body_invalid_containment",
+  "profile": "replaycore.kernel.canonical.v1"
+ },
+ {
+  "expect_error": "substrate_ref",
+  "input": {
+   "args": {
+    "body": {
+     "active_binding_refs": [
+      "binding:task"
+     ],
+     "actor_ref": "runtime:test",
+     "authority_refs": [
+      "trusted:internal"
+     ],
+     "containment": "contained",
+     "provenance_policy_refs": [],
+     "semantic_environment_refs": [
+      "schema-set:test"
+     ],
+     "visibility_policy_refs": [
+      "visibility:payload"
+     ]
+    },
+    "schema_ref": "kernel.witness.v1"
+   },
+   "op": "witness_body_digest"
+  },
+  "name": "validation/witness_body_missing_substrate_ref",
+  "profile": "replaycore.kernel.canonical.v1"
+ }
+]
