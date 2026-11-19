@@ -8,6 +8,7 @@ package snapshot
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -125,15 +126,18 @@ type entry struct {
 	mode  string // git tree mode: 100644, 100755, or 120000
 	size  int64
 	mtime int64  // Unix nanoseconds
-	data  []byte // file bytes, or the symlink target string
+	data  []byte // symlink target string; nil for regular files
 	blob  string // git blob ID, filled by Snapshot
 }
 
 // walk lists the workspace's entries in lexical order. Directories
 // named .git are skipped; symlinks are recorded as links and never
 // followed; any entry that is not a regular file, directory, or
-// symlink — or a regular file that cannot be read — fails the walk
-// with an error naming the path.
+// symlink fails the walk with an error naming the path. Regular
+// files are only statted here, never read: Snapshot reads a file's
+// bytes only when the entry must actually be hashed (the Task 14
+// reuse law reuses the previous blob for unchanged entries without
+// the file being read at all).
 func walk(workspaceDir string) ([]entry, error) {
 	var entries []entry
 	err := filepath.WalkDir(workspaceDir, func(path string, d fs.DirEntry, err error) error {
@@ -171,10 +175,6 @@ func walk(workspaceDir string) ([]entry, error) {
 			if err != nil {
 				return fmt.Errorf("snapshot: stat %s: %w", path, err)
 			}
-			data, err := os.ReadFile(path)
-			if err != nil {
-				return fmt.Errorf("snapshot: read %s: %w", path, err)
-			}
 			mode := "100644"
 			if info.Mode().Perm()&0o111 != 0 {
 				mode = "100755"
@@ -182,7 +182,6 @@ func walk(workspaceDir string) ([]entry, error) {
 			entries = append(entries, entry{
 				rel: rel, kind: "file", mode: mode,
 				size: info.Size(), mtime: info.ModTime().UnixNano(),
-				data: data,
 			})
 		default:
 			return fmt.Errorf("snapshot: unsupported workspace entry %s (type %s)", path, d.Type())
@@ -245,24 +244,81 @@ func snapshotMetaBytes(meta map[string]string) ([]byte, error) {
 	return b, nil
 }
 
+// prevEntry is one entry of a previous snapshot's manifest, as
+// recorded in meta/manifest.json.
+type prevEntry struct {
+	Blob  string `json:"blob"`
+	Kind  string `json:"kind"`
+	Mtime int64  `json:"mtime"`
+	Size  int64  `json:"size"`
+}
+
+// previousManifest loads the manifest of the store's latest
+// snapshot commit from that commit's meta/manifest.json, or nil
+// when the store has no snapshot yet. The commit is the chain head
+// recovered from refs/vcscore/ops/latest (tracked as s.last), and
+// the manifest is read from the repository at Snapshot time —
+// never from memory — so a reopened store stays incremental
+// (plan Task 14, Step 2).
+func (s *Store) previousManifest() (map[string]prevEntry, error) {
+	if s.last == "" {
+		return nil, nil
+	}
+	raw, err := s.git(nil, "cat-file", "-p", s.last+":meta/manifest.json")
+	if err != nil {
+		return nil, fmt.Errorf("snapshot: read previous manifest: %w", err)
+	}
+	// The manifest is canonical-kernel bytes: the law's prefix
+	// tag on the first line, then the canonical JSON document.
+	doc := raw
+	if i := strings.Index(doc, "\n"); i >= 0 {
+		doc = doc[i+1:]
+	}
+	var manifest map[string]prevEntry
+	if err := json.Unmarshal([]byte(doc), &manifest); err != nil {
+		return nil, fmt.Errorf("snapshot: parse previous manifest: %w", err)
+	}
+	return manifest, nil
+}
+
 // Snapshot captures workspaceDir as a new dual-tree commit: the
 // workspace tree under workspace/, the manifest and snapshot
 // metadata under meta/. The commit's parent is the store's previous
 // snapshot commit; it is referenced as refs/vcscore/ops/snapshot-
 // <commit-prefix> and refs/vcscore/ops/latest. It returns the new
-// commit ID. (Task 13 hashes every entry; Task 14 makes the build
-// incremental.)
+// commit ID. The build is incremental (plan Task 14): an entry
+// whose (size, mtime) pair matches the previous snapshot's manifest
+// reuses that entry's blob SHA without the file being read or
+// re-hashed; only new or changed entries are read and hashed.
 func (s *Store) Snapshot(workspaceDir string, meta map[string]string) (string, error) {
 	entries, err := walk(workspaceDir)
 	if err != nil {
 		return "", err
 	}
+	prev, err := s.previousManifest()
+	if err != nil {
+		return "", err
+	}
 	for i := range entries {
-		blob, err := s.git(entries[i].data, "hash-object", "-w", "--stdin")
-		if err != nil {
-			return "", fmt.Errorf("snapshot: hash %s: %w", entries[i].rel, err)
+		e := &entries[i]
+		if p, ok := prev[e.rel]; ok && p.Kind == e.kind && p.Size == e.size && p.Mtime == e.mtime {
+			e.blob = p.Blob // reuse law: no read, no re-hash
+			continue
 		}
-		entries[i].blob = blob
+		data := e.data
+		if e.kind == "file" {
+			path := filepath.Join(workspaceDir, filepath.FromSlash(e.rel))
+			b, err := os.ReadFile(path)
+			if err != nil {
+				return "", fmt.Errorf("snapshot: read %s: %w", path, err)
+			}
+			data = b
+		}
+		blob, err := s.git(data, "hash-object", "-w", "--stdin")
+		if err != nil {
+			return "", fmt.Errorf("snapshot: hash %s: %w", e.rel, err)
+		}
+		e.blob = blob
 	}
 	manifest, err := manifestBytes(entries)
 	if err != nil {
