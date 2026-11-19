@@ -381,16 +381,18 @@ func (s *Store) Snapshot(workspaceDir string, meta map[string]string) (string, e
 	if err != nil {
 		return "", err
 	}
+	var lastCAS error
 	for attempt := 0; attempt < maxChainAttempts; attempt++ {
-		commit, advanced, err := s.snapshotOnce(workspaceDir, entries, snapMeta)
+		commit, advanced, casErr, err := s.snapshotOnce(workspaceDir, entries, snapMeta)
 		if err != nil {
 			return "", err
 		}
 		if advanced {
 			return commit, nil
 		}
+		lastCAS = casErr
 	}
-	return "", fmt.Errorf("snapshot: chain head %s kept moving under contention after %d attempts", latestRef, maxChainAttempts)
+	return "", fmt.Errorf("snapshot: chain head %s kept moving under contention after %d attempts: %w", latestRef, maxChainAttempts, lastCAS)
 }
 
 // snapshotOnce makes one attempt at extending the chain: it
@@ -400,15 +402,19 @@ func (s *Store) Snapshot(workspaceDir string, meta map[string]string) (string, e
 // the swap lost a race against a peer — the built commit is left
 // orphaned (its per-snapshot ref remains, harmlessly) and the
 // caller retries on the new head, so the manifest the retry
-// reuses is always the manifest of the parent actually used.
-func (s *Store) snapshotOnce(workspaceDir string, entries []entry, snapMeta []byte) (commit string, advanced bool, err error) {
+// reuses is always the manifest of the parent actually used. On
+// a lost race casErr carries the compare-and-swap's failure (and
+// err is nil): the caller keeps the last one so that exhausting
+// the retry bound reports the underlying cause, not just the
+// contention.
+func (s *Store) snapshotOnce(workspaceDir string, entries []entry, snapMeta []byte) (commit string, advanced bool, casErr error, err error) {
 	head, err := s.resolveChainHead()
 	if err != nil {
-		return "", false, err
+		return "", false, nil, err
 	}
 	prev, err := s.previousManifestOf(head)
 	if err != nil {
-		return "", false, err
+		return "", false, nil, err
 	}
 	for i := range entries {
 		e := &entries[i]
@@ -421,26 +427,26 @@ func (s *Store) snapshotOnce(workspaceDir string, entries []entry, snapMeta []by
 			path := filepath.Join(workspaceDir, filepath.FromSlash(e.rel))
 			b, err := os.ReadFile(path)
 			if err != nil {
-				return "", false, fmt.Errorf("snapshot: read %s: %w", path, err)
+				return "", false, nil, fmt.Errorf("snapshot: read %s: %w", path, err)
 			}
 			data = b
 		}
 		blob, err := s.git(data, "hash-object", "-w", "--stdin")
 		if err != nil {
-			return "", false, fmt.Errorf("snapshot: hash %s: %w", e.rel, err)
+			return "", false, nil, fmt.Errorf("snapshot: hash %s: %w", e.rel, err)
 		}
 		e.blob = blob
 	}
 	manifest, err := manifestBytes(entries)
 	if err != nil {
-		return "", false, err
+		return "", false, nil, err
 	}
 
 	// Assemble the dual tree in a temporary index so no real index
 	// is touched.
 	idxFile, err := os.CreateTemp("", "replay-core-index-*")
 	if err != nil {
-		return "", false, fmt.Errorf("snapshot: create temp index: %w", err)
+		return "", false, nil, fmt.Errorf("snapshot: create temp index: %w", err)
 	}
 	idxPath := idxFile.Name()
 	_ = idxFile.Close()
@@ -457,7 +463,7 @@ func (s *Store) snapshotOnce(workspaceDir string, entries []entry, snapMeta []by
 	}
 	for _, e := range entries {
 		if err := add(e.mode, e.blob, "workspace/"+e.rel); err != nil {
-			return "", false, err
+			return "", false, nil, err
 		}
 	}
 	for _, m := range []struct {
@@ -466,15 +472,15 @@ func (s *Store) snapshotOnce(workspaceDir string, entries []entry, snapMeta []by
 	}{{"manifest.json", manifest}, {"snapshot.json", snapMeta}} {
 		blob, err := s.git(m.data, "hash-object", "-w", "--stdin")
 		if err != nil {
-			return "", false, fmt.Errorf("snapshot: hash meta/%s: %w", m.name, err)
+			return "", false, nil, fmt.Errorf("snapshot: hash meta/%s: %w", m.name, err)
 		}
 		if err := add("100644", blob, "meta/"+m.name); err != nil {
-			return "", false, err
+			return "", false, nil, err
 		}
 	}
 	tree, err := s.gitEnv(nil, idxEnv, "write-tree")
 	if err != nil {
-		return "", false, fmt.Errorf("snapshot: write-tree: %w", err)
+		return "", false, nil, fmt.Errorf("snapshot: write-tree: %w", err)
 	}
 
 	commitArgs := []string{"commit-tree", tree}
@@ -484,10 +490,10 @@ func (s *Store) snapshotOnce(workspaceDir string, entries []entry, snapMeta []by
 	commitArgs = append(commitArgs, "-m", "snapshot")
 	newCommit, err := s.git(nil, commitArgs...)
 	if err != nil {
-		return "", false, fmt.Errorf("snapshot: commit-tree: %w", err)
+		return "", false, nil, fmt.Errorf("snapshot: commit-tree: %w", err)
 	}
 	if _, err := s.git(nil, "update-ref", opsRefPrefix+snapshotRefIn+newCommit[:commitPrefix], newCommit); err != nil {
-		return "", false, fmt.Errorf("snapshot: update-ref snapshot: %w", err)
+		return "", false, nil, fmt.Errorf("snapshot: update-ref snapshot: %w", err)
 	}
 	// Advance the chain head only if it still names the head this
 	// commit was built on (or still does not exist): the
@@ -499,8 +505,8 @@ func (s *Store) snapshotOnce(workspaceDir string, entries []entry, snapMeta []by
 		expectedOld = zeroOID
 	}
 	if _, err := s.git(nil, "update-ref", latestRef, newCommit, expectedOld); err != nil {
-		return "", false, nil
+		return "", false, err, nil
 	}
 	s.last = newCommit
-	return newCommit, true, nil
+	return newCommit, true, nil, nil
 }

@@ -344,3 +344,68 @@ func TestSnapshotRejectsSpecialFiles(t *testing.T) {
 		t.Fatalf("Snapshot error = %q, want it to name the FIFO path", err)
 	}
 }
+
+// gitInput runs a plumbing command with the given stdin and
+// returns its trimmed stdout, failing the test on any error.
+func gitInput(t *testing.T, dir, input string, args ...string) string {
+	t.Helper()
+	full := append([]string{"-C", dir}, args...)
+	cmd := exec.Command("git", full...)
+	cmd.Stdin = strings.NewReader(input)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git %s: %v", strings.Join(full, " "), err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// TestOpenRejectsCorruptManifestChainHead (ADV-6, second leg): a
+// chain head whose tree HAS meta/snapshot.json — so the presence
+// check passes — but whose meta/manifest.json does not parse as
+// a snapshot manifest must still be rejected at Open, naming the
+// ref. validateChainHead checks both legs; the foreign-head test
+// pins only the presence leg.
+func TestOpenRejectsCorruptManifestChainHead(t *testing.T) {
+	ws := t.TempDir()
+	writeFile(t, filepath.Join(ws, "hello.txt"), "hello\n")
+	dir := filepath.Join(t.TempDir(), "snap.git")
+	s, err := snapshot.Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	commit, err := s.Snapshot(ws, map[string]string{"run": "corrupt-manifest"})
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	// Rebuild the snapshot's tree with meta/manifest.json
+	// replaced by garbage, keeping meta/snapshot.json and the
+	// workspace tree intact, and point latest at the doctored
+	// commit.
+	snapshotBlob := git(t, dir, "rev-parse", commit+":meta/snapshot.json")
+	workspaceTree := git(t, dir, "rev-parse", commit+":workspace")
+	garbageBlob := gitInput(t, dir, "garbage\nnot a manifest at all\n", "hash-object", "-w", "--stdin")
+	metaTree := gitInput(t, dir,
+		"100644 blob "+garbageBlob+"\tmanifest.json\n"+
+			"100644 blob "+snapshotBlob+"\tsnapshot.json\n",
+		"mktree")
+	rootTree := gitInput(t, dir,
+		"040000 tree "+metaTree+"\tmeta\n"+
+			"040000 tree "+workspaceTree+"\tworkspace\n",
+		"mktree")
+	doctored := git(t, dir,
+		"-c", "user.name=replay-core-test", "-c", "user.email=replay-core-test@localhost",
+		"commit-tree", rootTree, "-m", "doctored")
+	git(t, dir, "update-ref", "refs/vcscore/ops/latest", doctored)
+
+	_, err = snapshot.Open(dir)
+	if err == nil {
+		t.Fatal("Open accepted a chain head whose manifest does not parse; want a loud failure")
+	}
+	if !strings.Contains(err.Error(), "refs/vcscore/ops/latest") {
+		t.Fatalf("Open error = %q, want it to name the chain-head ref", err)
+	}
+	if !strings.Contains(err.Error(), "manifest") {
+		t.Fatalf("Open error = %q, want it to name the manifest as the problem", err)
+	}
+}
