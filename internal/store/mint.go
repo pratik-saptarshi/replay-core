@@ -86,7 +86,22 @@ func AbandonBody(abandonedRootID string) canonical.Value {
 // fact, not an edit: the append deletes and rewrites nothing, and
 // the abandonment takes effect only as a projection in the slice
 // layer.
+//
+// The target is validated the way MintCut validates its
+// through-fact — fetched, and required to live on ownerPath —
+// before anything is minted: an abandon naming a nonexistent or
+// foreign-path target used to mint a success receipt for a
+// projection that silently changed nothing, leaving the records
+// the caller meant to abandon in the effective history (panel
+// W3-4).
 func (s *Store) MintAbandon(ownerPath, abandonedRootID string, causedBy []string) (Receipt, error) {
+	target, err := s.GetRecord(abandonedRootID)
+	if err != nil {
+		return Receipt{}, err
+	}
+	if target.OwnerPath != ownerPath {
+		return Receipt{}, fmt.Errorf("store: mint abandon on %q: target %s is on owner path %q, not %q", ownerPath, abandonedRootID, target.OwnerPath, ownerPath)
+	}
 	fields, ok := rootFields()
 	if !ok {
 		return Receipt{}, errors.New("store: root witness body has no body field")
