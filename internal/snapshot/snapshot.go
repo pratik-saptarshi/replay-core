@@ -251,8 +251,9 @@ type entry struct {
 	blob  string // git blob ID, filled by Snapshot
 }
 
-// walk lists the workspace's entries in lexical order. Directories
-// named .git are skipped; symlinks are recorded as links and never
+// walk lists the workspace's entries in lexical order. Entries
+// named .git are skipped whatever their filesystem type;
+// symlinks are recorded as links and never
 // followed; any entry that is not a regular file, directory, or
 // symlink fails the walk with an error naming the path. Regular
 // files are only statted here, never read: Snapshot reads a file's
@@ -265,10 +266,23 @@ func walk(workspaceDir string) ([]entry, error) {
 		if err != nil {
 			return fmt.Errorf("snapshot: walk %s: %w", path, err)
 		}
-		if d.IsDir() {
-			if d.Name() == ".git" && path != workspaceDir {
+		// An entry named .git is never workspace content,
+		// whatever its filesystem type: a directory in an
+		// ordinary checkout, a regular file in a linked worktree
+		// or a submodule checkout (where it holds a "gitdir:"
+		// pointer), a symlink in stranger layouts. Skipping only
+		// the directory let the file reach staging, where
+		// update-index refused it and the whole snapshot failed
+		// (Codex P1 on PR #2). The workspace root itself is
+		// exempt: it is the thing being snapshotted, not an
+		// entry in it.
+		if path != workspaceDir && d.Name() == ".git" {
+			if d.IsDir() {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		if d.IsDir() {
 			return nil
 		}
 		rel, err := filepath.Rel(workspaceDir, path)
