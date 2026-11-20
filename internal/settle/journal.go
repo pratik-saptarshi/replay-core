@@ -57,9 +57,14 @@ const (
 // invoked after every journal write that records progress —
 // after the planned write (done == 0), after each unit's journal
 // mark (done == units completed), and once at the commit point,
-// after the verified write (done == total units). Production
-// code never sets it; the crash test's child process sets it
-// from an environment variable and calls os.Exit.
+// after the verified write (done == total units) — and, since
+// the in-flight fix, once per unit in the window between that
+// unit's mutation landing and its completion mark being
+// persisted (done == units completed including that unit; the
+// journal on disk at that point says started, not done), so
+// the crash suite exercises the window and not only the marks.
+// Production code never sets it; the crash test's child process
+// sets it from an environment variable and calls os.Exit.
 var unitCrashHook func(done int)
 
 func callCrashHook(done int) {
@@ -70,11 +75,20 @@ func callCrashHook(done int) {
 
 // journalUnit is one materialization unit: a single path the
 // materializer writes (from the result artifact) or deletes
-// (an extra), with its completion mark.
+// (an extra), with its completion mark and its in-flight mark.
+// Started is recorded — and the journal rewritten and fsynced —
+// BEFORE the unit's first mutation lands: a crash after the
+// mutation but before the completion mark then leaves a unit
+// rollback knows it may have to undo, instead of a mutation no
+// durable record admits to. A unit a write's landing destroys
+// as a side effect (a blocking ancestor it removes, an extra
+// beneath its target it clears) is started by that write, for
+// the same reason.
 type journalUnit struct {
-	Path string
-	Kind string // unitWrite | unitDelete
-	Done bool
+	Path    string
+	Kind    string // unitWrite | unitDelete
+	Done    bool
+	Started bool
 }
 
 // journal is one parent scope's in-flight settlement, recorded
@@ -149,6 +163,7 @@ func writeJournal(root string, j *journal) error {
 			canonical.Pair{Key: "done", Value: canonical.BoolOf(u.Done)},
 			canonical.Pair{Key: "kind", Value: canonical.StringOf(u.Kind)},
 			canonical.Pair{Key: "path", Value: canonical.StringOf(u.Path)},
+			canonical.Pair{Key: "started", Value: canonical.BoolOf(u.Started)},
 		))
 	}
 	v := canonical.ObjectOf(
@@ -345,7 +360,22 @@ func decodeJournal(v canonical.Value) (*journal, error) {
 		if !ok {
 			return nil, fmt.Errorf("unit %d has no done flag", i)
 		}
-		j.Units = append(j.Units, journalUnit{Path: p, Kind: kind, Done: done})
+		// The started flag is optional on read: journals
+		// written before the in-flight discipline existed carry
+		// no such field, and their units are simply not started.
+		// When present it must be a bool — a started flag that
+		// cannot be read is not a flag recovery may guess at.
+		started := false
+		for _, pr := range uv.Pairs {
+			if pr.Key != "started" {
+				continue
+			}
+			if pr.Value.Kind != canonical.KindBool {
+				return nil, fmt.Errorf("unit %d has an invalid started flag", i)
+			}
+			started = pr.Value.Bool
+		}
+		j.Units = append(j.Units, journalUnit{Path: p, Kind: kind, Done: done, Started: started})
 	}
 	// The recorded fact body must agree with the journal: it is
 	// the authority Recover mints from, so a disagreement means
@@ -422,9 +452,12 @@ type materializeRequest struct {
 //     the staging preimage tree — all before the first side
 //     effect;
 //   - write the journal in state planned and fsync it;
-//   - apply: per unit, write (temp file + rename in the target
-//     directory, atomic per file) or delete, mark the unit done,
-//     rewrite + fsync the journal;
+//   - apply: per unit, first record the unit's in-flight intent
+//     (its started mark, plus the started marks of every unit
+//     its landing destroys as a side effect) and rewrite +
+//     fsync the journal, then write (temp file + rename in the
+//     target directory, atomic per file) or delete, mark the
+//     unit done, rewrite + fsync the journal;
 //   - verify: re-snapshot the parent; its file map must equal
 //     want, then journal state verified and fsync.
 //
@@ -520,6 +553,17 @@ func materialize(ctx *Context, req materializeRequest) error {
 		callCrashHook(done)
 		return nil
 	}
+	// recordIntent persists the journal with the started marks
+	// the caller just set, before the mutation they announce
+	// lands. It is mark without the completion count and
+	// without the crash hook: no unit has completed, and the
+	// hook's window invocation belongs after the mutation.
+	recordIntent := func() error {
+		if j.State == journalStatePlanned {
+			j.State = journalStateApplying
+		}
+		return writeJournal(ctx.Root, j)
+	}
 
 	// Writes first (Task 6/7's order): a file standing where a
 	// wanted path's ancestor directory belongs is removed as
@@ -530,6 +574,38 @@ func materialize(ctx *Context, req materializeRequest) error {
 		u := &j.Units[i]
 		if u.Kind != unitWrite {
 			continue
+		}
+		// In-flight intent, recorded before the first mutation
+		// this unit performs: the unit itself, plus every unit
+		// whose target this unit's landing destroys as a side
+		// effect — the blocking ancestors the write removes to
+		// clear its way, and the extras beneath its target that
+		// its landing clears (exactly the set the completion
+		// accounting below marks done at this unit's mark). A
+		// crash after any of those mutations but before the
+		// completion mark persists then leaves a journal that
+		// names every unit the crash may have touched, and
+		// rollback undoes started units as it undoes done ones.
+		// Without the record, rollback skipped the unit, the
+		// journal and preimages were cleared, and the mutation
+		// stood permanently with no settlement fact.
+		u.Started = true
+		for parent := pathParent(u.Path); parent != ""; parent = pathParent(parent) {
+			if _, isEntry := current[parent]; !isEntry {
+				continue
+			}
+			if di, ok := unitIndex[parent]; ok {
+				j.Units[di].Started = true
+			}
+		}
+		for k := range j.Units {
+			du := &j.Units[k]
+			if du.Kind == unitDelete && strings.HasPrefix(du.Path, u.Path+"/") {
+				du.Started = true
+			}
+		}
+		if err := recordIntent(); err != nil {
+			return err
 		}
 		for parent := pathParent(u.Path); parent != ""; parent = pathParent(parent) {
 			if _, isEntry := current[parent]; !isEntry {
@@ -564,6 +640,11 @@ func materialize(ctx *Context, req materializeRequest) error {
 				done++
 			}
 		}
+		// The window invocation (see unitCrashHook): the
+		// mutation has landed and the completion count includes
+		// this unit, but the journal on disk still records it
+		// as started, not done — the state a crash here leaves.
+		callCrashHook(done)
 		if err := mark(); err != nil {
 			return err
 		}
@@ -576,11 +657,21 @@ func materialize(ctx *Context, req materializeRequest) error {
 		if u.Kind != unitDelete || u.Done {
 			continue
 		}
+		// In-flight intent before the removal, as for writes:
+		// a crash after the removal but before the completion
+		// mark must leave the unit started, so rollback restores
+		// the file instead of skipping the unit and clearing
+		// the journal and preimage that could have restored it.
+		u.Started = true
+		if err := recordIntent(); err != nil {
+			return err
+		}
 		if err := os.Remove(filepath.Join(req.parentDir, filepath.FromSlash(u.Path))); err != nil && !targetGone(err) {
 			return fmt.Errorf("settle: remove extra %s: %w", u.Path, err)
 		}
 		u.Done = true
 		done++
+		callCrashHook(done)
 		if err := mark(); err != nil {
 			return err
 		}
@@ -813,9 +904,11 @@ func capturePreimage(parentDir, preDir, rel string) error {
 // minted from the journal's recorded fact body iff no fact
 // carries the op, and journal + staging are cleared.
 //
-// State planned/applying → roll back: every done unit is
-// undone from its preimage, and the parent directory is exactly
-// pre-apply; journal + staging are cleared.
+// State planned/applying → roll back: every done unit — and
+// every started unit, whose mutation may have landed before
+// its completion mark — is undone from its preimage, and the
+// parent directory is exactly pre-apply; journal + staging are
+// cleared.
 //
 // Every verb (Select, Apply) calls Recover for its parent scope
 // at entry; Recover is also exported so the next handle or
@@ -863,17 +956,29 @@ func Recover(ctx *Context, parentScope string) error {
 }
 
 // rollbackJournal undoes a planned/applying journal's done
-// units from their preimages. Write units are undone first, in
-// reverse order, then delete units in reverse order: the two
-// kinds interact only through path shape (a file where a
-// directory belongs, or the reverse), and undoing writes first
-// guarantees a restored delete never has to pass through a file
-// a write unit created — the parent is then exactly pre-apply.
+// and started units from their preimages. A started unit's
+// mutation may or may not have landed — the crash that left
+// the journal struck somewhere inside the unit — and undoing
+// it is safe in both states: a write with a preimage restores
+// the same bytes or link target the parent still serves if
+// the write never landed, a write without one removes an
+// occupant that is either the unit's creation or (for the
+// directory it replaces) a directory whose contents are their
+// own started units, restored by their own undo steps, and a
+// delete restores its preimage over a file that is either
+// gone or still identical to it. Units neither done nor
+// started were never touched and are never undone. Write
+// units are undone first, in reverse order, then delete units
+// in reverse order: the two kinds interact only through path
+// shape (a file where a directory belongs, or the reverse),
+// and undoing writes first guarantees a restored delete never
+// has to pass through a file a write unit created — the
+// parent is then exactly pre-apply.
 func rollbackJournal(ctx *Context, j *journal) error {
 	preDir := filepath.Join(stagingDirFor(ctx.Root, j.Op), "pre")
 	for i := len(j.Units) - 1; i >= 0; i-- {
 		u := j.Units[i]
-		if u.Kind != unitWrite || !u.Done {
+		if u.Kind != unitWrite || (!u.Done && !u.Started) {
 			continue
 		}
 		if err := undoWriteUnit(j.ParentDir, preDir, u.Path); err != nil {
@@ -882,7 +987,7 @@ func rollbackJournal(ctx *Context, j *journal) error {
 	}
 	for i := len(j.Units) - 1; i >= 0; i-- {
 		u := j.Units[i]
-		if u.Kind != unitDelete || !u.Done {
+		if u.Kind != unitDelete || (!u.Done && !u.Started) {
 			continue
 		}
 		if err := undoDeleteUnit(j.ParentDir, preDir, u.Path); err != nil {
