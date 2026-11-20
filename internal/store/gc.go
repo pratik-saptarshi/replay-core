@@ -56,8 +56,8 @@ type GarbageReport struct {
 //
 // Collection removes the collected records' rows, their causal
 // edges and path entries, witness bodies left unreferenced by any
-// surviving record, and intent rows whose every receipted record
-// was collected. Surviving records are untouched: their ordinals
+// surviving record, and intent rows no receipted record of which
+// survives. Surviving records are untouched: their ordinals
 // never change (no renumbering), and frontiers — being roots —
 // are never collected, so no frontier row moves.
 func (s *Store) CollectGarbage() (GarbageReport, error) {
@@ -235,14 +235,15 @@ func (s *Store) CollectGarbage() (GarbageReport, error) {
 		committed = true
 		return report, nil
 	}
-	collectedSet := make(map[string]bool, len(collected))
-	for _, id := range collected {
-		collectedSet[id] = true
-	}
-
-	// Intent rows whose every receipted record was collected are
-	// collected with them; an intent with any surviving receipted
-	// record stays, so its replay/conflict behavior is unchanged.
+	// Intent rows with no surviving receipted record are
+	// collected with them; an intent with any receipt in the
+	// kept set stays, so its replay/conflict behavior is
+	// unchanged. Deadness is judged against the kept set, not
+	// against this pass's deletions: a batch whose records are
+	// collected across several passes is dead once its last
+	// receipt falls, even though no single pass collected them
+	// all — judging by the pass's own collected set leaked
+	// exactly those rows forever (Codex P2 on PR #2).
 	var doomedIntents []string
 	rows, err = conn.QueryContext(ctx, "SELECT intent_id, receipts FROM append_intents")
 	if err != nil {
@@ -262,14 +263,14 @@ func (s *Store) CollectGarbage() (GarbageReport, error) {
 		if len(receipts) == 0 {
 			continue
 		}
-		allCollected := true
+		survives := false
 		for _, r := range receipts {
-			if !collectedSet[r.RecordID] {
-				allCollected = false
+			if kept[r.RecordID] {
+				survives = true
 				break
 			}
 		}
-		if allCollected {
+		if !survives {
 			doomedIntents = append(doomedIntents, intentID)
 		}
 	}
