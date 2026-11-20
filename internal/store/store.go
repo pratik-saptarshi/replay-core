@@ -99,6 +99,21 @@ CREATE TABLE IF NOT EXISTS owner_ordinals (
   owner_path TEXT PRIMARY KEY, next_ordinal INTEGER NOT NULL);
 `
 
+// dsnPathEscaper percent-encodes the three characters that are
+// URI-significant inside a file: URI's path component — '%'
+// (the escape introducer itself, encoded first so a literal
+// percent survives the parser's decoding), '#' (fragment) and
+// '?' (query). Every other byte of the caller's path, path
+// separators included, passes into the DSN unchanged. The
+// replacer scans its input once and never re-scans its own
+// output, so the '%' of an escape it just emitted is not
+// encoded again.
+var dsnPathEscaper = strings.NewReplacer(
+	"%", "%25",
+	"#", "%23",
+	"?", "%3F",
+)
+
 // Open opens (creating if needed) the store at path, applies the
 // schema, and bootstraps the root witness record if absent.
 func Open(path string) (*Store, error) {
@@ -115,7 +130,25 @@ func Open(path string) (*Store, error) {
 	// IMMEDIATE and a caller-visible locking error is a defect
 	// (AC-F2-6): a waiter must outlast a lock holder descheduled
 	// under load.
-	dsn := "file:" + path + "?_busy_timeout=30000&_journal_mode=WAL"
+	//
+	// The path is percent-escaped before it enters the URI. On
+	// Unix, '#', '?' and '%' are valid filename characters but
+	// URI syntax: '#' opens a fragment, '?' opens the query
+	// string, and a valid %XX sequence is decoded by the URI
+	// parser — so the unescaped concatenation opened a different
+	// file than the caller named (trace#one.db and trace#two.db
+	// both landed on the file "trace", silently mixing two
+	// stores; Codex P2 on PR #2, 2026-11-19). Escaping exactly
+	// those three characters — separators and relative paths
+	// pass through untouched — makes the URI name the literal
+	// path: the parser decodes the escapes back to the caller's
+	// bytes. (net/url's URL{Path: ...} was considered and
+	// rejected on a probe: it renders a relative path as the
+	// URI authority — file://trace.db — not as a path.) The
+	// driver parameters are appended after the escaped path, so
+	// the first literal '?' in the DSN is the intended query
+	// separator.
+	dsn := "file:" + dsnPathEscaper.Replace(path) + "?_busy_timeout=30000&_journal_mode=WAL"
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
