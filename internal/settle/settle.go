@@ -12,6 +12,16 @@
 // are appended to, so a run's trace path must be the scope name
 // for the facts' evidence to mean what it says — the verbs
 // neither discover nor adopt foreign paths.
+//
+// Settlement is single-caller (spec §9): for a given Root and
+// parent scope, at most one caller may run a verb or Recover
+// at a time — across processes, not only goroutines. Entry
+// recovery cannot distinguish a live operation from a crashed
+// one, so a second caller's recovery can roll back or
+// overwrite an in-flight operation's journal and staging. The
+// verbs neither detect nor prevent concurrent use; keeping to
+// one caller per Root and parent scope is the caller's
+// contract.
 package settle
 
 import (

@@ -1274,7 +1274,11 @@ func capturePreimage(parentDir, preDir, rel string) error {
 // Recover resolves parentScope's journal, if one exists: the
 // settlement a crashed (or failed) verb left behind is
 // completed or rolled back before any new work is judged
-// against the scope. No journal → nil. A journal that fails to
+// against the scope. Recovery presumes the single-caller
+// contract (spec §9): it cannot tell a live operation's
+// journal from a crashed one's, so no second caller — in this
+// process or any other — may act on the scope while one may
+// still be running. No journal → nil. A journal that fails to
 // decode or validate → a descriptive error, no writes, the
 // journal left in place as evidence. A journal the scope's
 // parent anchor does not vouch for — no anchor recorded, a
