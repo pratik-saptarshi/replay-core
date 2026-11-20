@@ -231,6 +231,118 @@ func TestCopyRebuildReleasesOverlayMount(t *testing.T) {
 	}
 }
 
+// TestOverlayMaterializeReleaseWindowHandout pins the crash
+// window between the release of the previous layer's state and
+// the wipe in a rebuild (review finding F-1): under the old
+// ordering the window left the old marker standing over a view
+// whose mount had already been released, and the idempotent
+// path handed that shell out as the layer — its Dir served
+// nothing, breaching the marker law's contents-preserved
+// promise. The window's end state is produced exactly as the
+// review probed it: a live layer whose view is unmounted
+// externally while its marker still stands.
+func TestOverlayMaterializeReleaseWindowHandout(t *testing.T) {
+	base := makeOverlayBase(t)
+	root := filepath.Join(tmpfsScratch(t), "layer")
+	guardViewMount(t, root)
+
+	layer, err := carrier.Materialize(overlaySelection, base, "tree-v1", root)
+	if err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+	// While the view is still live, the same identity
+	// re-materializes as the same layer, contents preserved:
+	// the handout this test's second half must not break.
+	writeBaseFile(t, filepath.Join(layer.Dir, "work.txt"), "work\n", 0o644)
+	again, err := carrier.Materialize(overlaySelection, base, "tree-v1", root)
+	if err != nil {
+		t.Fatalf("re-materialize live layer: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(again.Dir, "work.txt"))
+	if err != nil || string(data) != "work\n" {
+		t.Errorf("live re-materialization lost the layer's contents: data = %q, err = %v", data, err)
+	}
+
+	// The window's end state: the view's mount is released
+	// (here: unmounted externally) while the marker still
+	// stands. The next Materialize of the same identity must
+	// not hand the shell out: it rebuilds, and the handed-out
+	// layer serves the base.
+	view := filepath.Join(root, "view")
+	unmountViewExternally(t, view)
+	rebuilt, err := carrier.Materialize(overlaySelection, base, "tree-v1", root)
+	if err != nil {
+		t.Fatalf("Materialize after the release window: %v", err)
+	}
+	data, err = os.ReadFile(filepath.Join(rebuilt.Dir, "top.txt"))
+	if err != nil || string(data) != "top level\n" {
+		t.Errorf("handed-out layer does not serve the base: data = %q, err = %v", data, err)
+	}
+	assertTreeEqual(t, "rebuilt layer vs base", treeDigest(t, base), treeDigest(t, rebuilt.Dir))
+	if err := rebuilt.Remove(); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	assertNotMounted(t, view)
+}
+
+// TestOverlayMaterializePostReleaseRemnantRebuilds pins the
+// end state the fixed ordering leaves when a crash lands after
+// the marker invalidation and the state release: no marker,
+// and exactly the driver's remnant shape (upper/, work/, and
+// the now-unmounted view/). The remnant law recognizes that
+// shape: the root is wiped and rebuilt, the handed-out layer
+// serves the base, and the previous layer's upper content does
+// not survive. The state is produced in the fixed ordering's
+// own sequence from a real layer: marker invalidated first,
+// then the view's mount released, the crash before the wipe.
+func TestOverlayMaterializePostReleaseRemnantRebuilds(t *testing.T) {
+	base := makeOverlayBase(t)
+	root := filepath.Join(tmpfsScratch(t), "layer")
+	guardViewMount(t, root)
+
+	layer, err := carrier.Materialize(overlaySelection, base, "tree-v1", root)
+	if err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+	writeBaseFile(t, filepath.Join(layer.Dir, "work.txt"), "work\n", 0o644)
+
+	if err := os.Remove(filepath.Join(root, "layer.json")); err != nil {
+		t.Fatalf("invalidate the marker: %v", err)
+	}
+	view := filepath.Join(root, "view")
+	unmountViewExternally(t, view)
+
+	rebuilt, err := carrier.Materialize(overlaySelection, base, "tree-v1", root)
+	if err != nil {
+		t.Fatalf("Materialize over the post-release remnant: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(rebuilt.Dir, "top.txt"))
+	if err != nil || string(data) != "top level\n" {
+		t.Errorf("rebuilt layer does not serve the base: data = %q, err = %v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(rebuilt.Dir, "work.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("previous layer's upper content survived the remnant wipe (stat err = %v)", err)
+	}
+	if err := rebuilt.Remove(); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	assertNotMounted(t, view)
+}
+
+// unmountViewExternally unmounts a layer's view from outside
+// the carrier, simulating a state release the lifecycle did
+// not perform (the crash window's end state, or an external
+// actor): a plain unmount, falling back to a lazy detach,
+// which also removes the mount from the namespace listing.
+func unmountViewExternally(t *testing.T, view string) {
+	t.Helper()
+	if err := syscall.Unmount(view, 0); err != nil {
+		if derr := syscall.Unmount(view, syscall.MNT_DETACH); derr != nil {
+			t.Fatalf("unmount the view externally: %v (detach: %v)", err, derr)
+		}
+	}
+}
+
 // guardViewMount registers a best-effort lazy unmount of the
 // layer's view, so a test that fails before Remove cannot leak
 // its mount into the rest of the suite.

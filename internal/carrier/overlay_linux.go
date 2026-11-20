@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -96,6 +97,40 @@ func (overlayDriver) remove(l *Layer) error {
 	}
 	return nil
 }
+
+// viewLive reports whether the layer's view is still mounted,
+// read from the kernel's mount table — the same authority
+// remove answers to (unmounting a non-mountpoint is EINVAL).
+func (overlayDriver) viewLive(layerRoot string) (bool, error) {
+	view, err := filepath.Abs(filepath.Join(layerRoot, viewName))
+	if err != nil {
+		return false, fmt.Errorf("carrier: kernel-overlay: resolve view path under %q: %w", layerRoot, err)
+	}
+	data, err := os.ReadFile("/proc/self/mounts")
+	if err != nil {
+		return false, fmt.Errorf("carrier: kernel-overlay: read mount table: %w", err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && unescapeMountPoint(fields[1]) == view {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// mountPointEscapes reverses the octal escaping the kernel
+// applies to mountpoint paths in /proc/self/mounts (\040 for a
+// space, \134 for a backslash, and the other whitespace
+// escapes).
+var mountPointEscapes = strings.NewReplacer(
+	`\040`, " ",
+	`\011`, "\t",
+	`\012`, "\n",
+	`\134`, `\`,
+)
+
+func unescapeMountPoint(s string) string { return mountPointEscapes.Replace(s) }
 
 // recoverRemnant recognizes the overlay driver's crash remnant
 // in a markerless layer root (the F7 remnant law): the mount

@@ -52,7 +52,12 @@ type Layer struct {
 // The marker law: a root carrying a marker whose base_id and
 // driver match the request is returned as-is (idempotent
 // re-materialization — a second handle on the same layer,
-// contents preserved). A marker naming a different base or
+// contents preserved). For a view-managing driver the return
+// additionally requires the view to still be live (see
+// viewLiveness): an unmounted mountpoint is a directory that
+// serves nothing, and handing it out would breach the
+// contents-preserved promise, so a dead view falls through to
+// the rebuild like a missing one. A marker naming a different base or
 // driver means the base changed: the root is wiped and rebuilt,
 // never merged (AC-F5-3). A marker that fails to decode is a
 // descriptive error, never a guess and never a wipe. A non-empty
@@ -100,15 +105,30 @@ func Materialize(sel Selection, baseDir, baseID, layerRoot string) (*Layer, erro
 			if _, err := os.Stat(view); err == nil {
 				// Idempotent re-materialization: the layer is
 				// returned as-is; only staging remnants of a
-				// crashed later build are cleaned.
-				if err := removeStagingRemnants(layerRoot); err != nil {
-					return nil, err
+				// crashed later build are cleaned. A
+				// view-managing driver's handout additionally
+				// requires a live view: its view can outlive
+				// its state in name only (an unmounted
+				// mountpoint serves nothing), and handing
+				// that shell out would breach the marker
+				// law's contents-preserved promise — a dead
+				// view falls through to the rebuild, exactly
+				// as a missing one does.
+				live, lerr := viewIsLive(drv, layerRoot)
+				if lerr != nil {
+					return nil, lerr
 				}
-				return &Layer{Dir: view, BaseID: baseID, Driver: sel.Driver, root: layerRoot}, nil
+				if live {
+					if err := removeStagingRemnants(layerRoot); err != nil {
+						return nil, err
+					}
+					return &Layer{Dir: view, BaseID: baseID, Driver: sel.Driver, root: layerRoot}, nil
+				}
 			}
-			// A matching marker whose view is gone is a layer
-			// the carrier owns but cannot hand out: fall
-			// through and rebuild it.
+			// A matching marker whose view is gone — or, for
+			// a view-managing driver, no longer live — is a
+			// layer the carrier owns but cannot hand out:
+			// fall through and rebuild it.
 		}
 		// The markerless-content check: a root with content
 		// but no marker is foreign — with the one exception
@@ -213,10 +233,17 @@ func Materialize(sel Selection, baseDir, baseID, layerRoot string) (*Layer, erro
 // Because the build occupies the root itself, the previous
 // layer's state is released and its contents wiped before the
 // build — unlike the staged path, a failed rebuild does not
-// leave the previous layer standing. The marker law still
-// governs handout: a root whose view is gone is rebuilt, never
-// returned as-is, so a wiped root can never be handed out as a
-// stale layer.
+// leave the previous layer standing. Handout stays governed by
+// the marker law, and the release ordering (releaseLayerState)
+// is what keeps it sound: the previous layer's marker is
+// invalidated before its state is released, so a crash
+// anywhere in the rebuild leaves either the intact previous
+// layer — marker present, view live, safe to hand out as-is —
+// or the previous driver's markerless crash remnant, which the
+// remnant law recognizes and rebuilds. A root is never left
+// holding a marker that names a layer whose state was already
+// released: the shell such a marker would hand out serves
+// nothing.
 func buildViewLayer(drv viewDriver, sel Selection, baseDir, baseID, layerRoot string, preExisted bool, oldMarker *layerMarker) (*Layer, error) {
 	if oldMarker != nil {
 		if err := releaseLayerState(*oldMarker, layerRoot); err != nil {
@@ -244,8 +271,13 @@ func buildViewLayer(drv viewDriver, sel Selection, baseDir, baseID, layerRoot st
 	if err := writeMarker(layerRoot, layerMarker{BaseID: baseID, Driver: sel.Driver}); err != nil {
 		// The build succeeded but cannot be recorded: release
 		// the driver's state so no mount outlives the error,
-		// and leave no root behind on a first build.
-		drv.remove(&Layer{Driver: sel.Driver, root: layerRoot})
+		// and leave no root behind on a first build. A failed
+		// release is joined into the returned error, never
+		// dropped: a live mount left behind silently would
+		// outlive the failure that was actually reported.
+		if rerr := drv.remove(&Layer{Driver: sel.Driver, root: layerRoot}); rerr != nil {
+			err = errors.Join(err, fmt.Errorf("carrier: release %s layer at %q after the marker write failed: %w", sel.Driver, layerRoot, rerr))
+		}
 		if !preExisted {
 			os.RemoveAll(layerRoot)
 		}
@@ -261,6 +293,18 @@ func buildViewLayer(drv viewDriver, sel Selection, baseDir, baseID, layerRoot st
 // drivers' state is plain files (copy) or nonexistent (the
 // not-yet-implemented stubs never completed a build, so no
 // marker can name one from a real layer).
+//
+// For such a layer the root's marker is invalidated BEFORE the
+// state is released: a crash between the release and the wipe
+// then leaves the driver's markerless crash remnant, which the
+// remnant law (remnantRecoverer) recognizes and rebuilds —
+// never a standing marker over a released view, which the
+// idempotent path would hand out as a layer that serves
+// nothing. Drivers without releasable state keep their marker
+// until the wipe: their views are plain content that genuinely
+// serves whenever it exists, so their marker never names a
+// dead layer and their crash states stay recoverable under the
+// marker law as they were.
 func releaseLayerState(marker layerMarker, root string) error {
 	drv, ok := driverByID(marker.Driver)
 	if !ok {
@@ -269,10 +313,26 @@ func releaseLayerState(marker layerMarker, root string) error {
 	if _, ok := drv.(viewDriver); !ok {
 		return nil
 	}
+	if err := os.Remove(filepath.Join(root, markerName)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("carrier: invalidate layer marker in %q before releasing the %s layer: %w", root, marker.Driver, err)
+	}
 	if err := drv.remove(&Layer{Driver: marker.Driver, root: root}); err != nil {
 		return fmt.Errorf("carrier: release previous %s layer at %q: %w", marker.Driver, root, err)
 	}
 	return nil
+}
+
+// viewIsLive reports whether the view of the layer at root is
+// still live, for a driver that manages its view. Only a
+// driver implementing viewLiveness can know; every other
+// driver's view is plain content whose presence the caller has
+// already checked, and it is reported live.
+func viewIsLive(drv driver, root string) (bool, error) {
+	lc, ok := drv.(viewLiveness)
+	if !ok {
+		return true, nil
+	}
+	return lc.viewLive(root)
 }
 
 // Remove tears the layer down and deletes layerRoot entirely.

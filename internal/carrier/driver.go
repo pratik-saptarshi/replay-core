@@ -44,6 +44,18 @@ type remnantRecoverer interface {
 	recoverRemnant(layerRoot string) (bool, error)
 }
 
+// viewLiveness is a view-managing driver that can report
+// whether the view of an existing layer at a root is still
+// live — for the overlay driver, whether the view is still
+// mounted. The shared lifecycle consults it before handing an
+// existing layer out as-is: a view whose backing state is gone
+// (an unmounted mountpoint) is an empty directory that serves
+// nothing, and handing it out would breach the marker law's
+// promise that a returned layer serves its contents.
+type viewLiveness interface {
+	viewLive(root string) (bool, error)
+}
+
 // driverByID returns the registered driver with the given ID.
 func driverByID(id DriverID) (driver, bool) {
 	for _, d := range drivers {
