@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/pratik-saptarshi/replay-core/internal/canonical"
 	"github.com/pratik-saptarshi/replay-core/internal/snapshot"
@@ -530,6 +531,21 @@ func materialize(ctx *Context, req materializeRequest) error {
 		}
 		u.Done = true
 		done++
+		// The symmetric accounting (Task 8 fix round): a write
+		// that lands where a directory stood clears that
+		// directory's whole subtree to take its place, so every
+		// extra beneath the target is destroyed by this write —
+		// its delete unit is done, and the journal says so at
+		// the same mark. Without the mark, rollback would leave
+		// those files unrestored: their destruction would be
+		// recorded nowhere.
+		for k := range j.Units {
+			du := &j.Units[k]
+			if du.Kind == unitDelete && !du.Done && strings.HasPrefix(du.Path, u.Path+"/") {
+				du.Done = true
+				done++
+			}
+		}
 		if err := mark(); err != nil {
 			return err
 		}
@@ -542,7 +558,7 @@ func materialize(ctx *Context, req materializeRequest) error {
 		if u.Kind != unitDelete || u.Done {
 			continue
 		}
-		if err := os.Remove(filepath.Join(req.parentDir, filepath.FromSlash(u.Path))); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := os.Remove(filepath.Join(req.parentDir, filepath.FromSlash(u.Path))); err != nil && !targetGone(err) {
 			return fmt.Errorf("settle: remove extra %s: %w", u.Path, err)
 		}
 		u.Done = true
@@ -557,6 +573,12 @@ func materialize(ctx *Context, req materializeRequest) error {
 	// implied directories are never at risk). Directory shape is
 	// outside the file-map contract — the snapshot verify below
 	// is the arbiter — and mirrors the bare materializer's law.
+	//
+	// The inventory is pre-materialization: a path that was a
+	// directory then may since have been replaced by a write
+	// unit (a shape-changing delta). Only prune what is still a
+	// directory — an unconditional remove would unlink the file
+	// the write just landed (Task 8 fix round).
 	implied := map[string]bool{}
 	for rel := range req.want {
 		for parent := pathParent(rel); parent != ""; parent = pathParent(parent) {
@@ -570,7 +592,11 @@ func materialize(ctx *Context, req materializeRequest) error {
 		if implied[d] {
 			continue
 		}
-		_ = os.Remove(filepath.Join(req.parentDir, filepath.FromSlash(d)))
+		dst := filepath.Join(req.parentDir, filepath.FromSlash(d))
+		if info, err := os.Lstat(dst); err != nil || !info.IsDir() {
+			continue
+		}
+		_ = os.Remove(dst)
 	}
 
 	// Verify: re-snapshot the parent; its file map must equal
@@ -830,16 +856,47 @@ func rollbackJournal(ctx *Context, j *journal) error {
 	return clearJournalState(ctx.Root, j.ParentScope, j.Op)
 }
 
+// targetGone reports whether a remove error means the target
+// is absent: either it does not exist, or an ancestor component
+// is no longer a directory (ENOTDIR) — a shape-changing write
+// at the ancestor already destroyed it, so the path names
+// nothing. Either way the absence a delete unit asks for holds.
+func targetGone(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
+}
+
 // undoWriteUnit reverses one applied write unit: if the target
 // had a preimage, the preimage is restored; if it had none, the
 // unit created the occupant and it is removed.
+//
+// Two shape-changing cases (Task 8 fix round) have no file
+// preimage of their own, and both end at removeOccupant:
+//
+//   - the preimage stat fails ENOTDIR: an ancestor component of
+//     the preimage path is a file — another unit's preimage
+//     (the file→directory swap: the delete unit's preimage sits
+//     at pre/old.txt, shadowing everything beneath it). Capture
+//     is lexical, so nothing was ever recorded beneath a file;
+//     there is no preimage at this path.
+//   - the preimage path is a directory: it exists only to hold
+//     the preimages of the units beneath the target (the
+//     directory→file swap: pre/old.txt/ holds inner.txt's
+//     preimage). A directory's contents are their own units,
+//     restored by their own undo steps; the directory itself is
+//     outside the file-map contract, and reading it as a file
+//     would wedge recovery on a lawful shape.
 func undoWriteUnit(parentDir, preDir, rel string) error {
 	dst := filepath.Join(parentDir, filepath.FromSlash(rel))
 	pre := filepath.Join(preDir, filepath.FromSlash(rel))
-	if _, err := os.Lstat(pre); errors.Is(err, fs.ErrNotExist) {
-		return removeOccupant(dst)
-	} else if err != nil {
+	preInfo, err := os.Lstat(pre)
+	if err != nil {
+		if targetGone(err) {
+			return removeOccupant(dst)
+		}
 		return fmt.Errorf("settle: stat preimage %s: %w", pre, err)
+	}
+	if preInfo.IsDir() {
+		return removeOccupant(dst)
 	}
 	return restorePreimage(dst, pre)
 }
