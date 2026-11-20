@@ -94,6 +94,12 @@ func Apply(ctx *Context, parentScope, parentDir, runScope, opID string) (store.R
 	if opID == "" {
 		return store.Receipt{}, errors.New("settle: apply: op ID is empty")
 	}
+	if err := checkScopeName("parent", parentScope); err != nil {
+		return store.Receipt{}, err
+	}
+	if err := checkScopeName("run", runScope); err != nil {
+		return store.Receipt{}, err
+	}
 	// Journal recovery at verb entry (Task 8): a crashed
 	// predecessor on this parent scope is completed or rolled
 	// back before this verb is judged.

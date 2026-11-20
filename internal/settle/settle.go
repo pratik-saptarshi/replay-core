@@ -21,6 +21,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/pratik-saptarshi/replay-core/internal/canonical"
@@ -60,6 +61,36 @@ var ErrNoForkProvenance = errors.New("settle: no fork provenance for scope")
 // archiveRefPrefix is the snapshot layout's archive class: a
 // discarded scope's ref moves to refs/vcscore/archive/<scope>.
 const archiveRefPrefix = "refs/vcscore/archive/"
+
+// scopeNamePattern is the scope-name law, mirroring the
+// snapshot store's: lowercase alphanumerics and hyphens,
+// starting with an alphanumeric — a single ref path
+// component, so a scope name can never carry a traversal
+// component into a filesystem path built from it.
+var scopeNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+
+// validScopeName reports whether scope obeys the scope-name
+// law.
+func validScopeName(scope string) bool {
+	return scopeNamePattern.MatchString(scope)
+}
+
+// checkScopeName refuses a scope name the law rejects. Every
+// verb calls it for each scope name it is handed BEFORE
+// constructing any filesystem path from the name — the base
+// extraction directory and the temporary layer root Fork
+// unconditionally removes, the sidecar path Select, Apply and
+// Discard read, the journal path Recover reads — because a
+// traversal name otherwise steers those paths outside the
+// settle Root and reaches their extractions and removals
+// before the snapshot store's own validation of the name
+// (inside Snaps.Fork and Snaps.ScopeHead) ever runs.
+func checkScopeName(kind, scope string) error {
+	if !validScopeName(scope) {
+		return fmt.Errorf("settle: invalid %s scope name %q (must match %s)", kind, scope, scopeNamePattern)
+	}
+	return nil
+}
 
 // forkSidecar is a fork's provenance (plan Decision 3): the
 // parent scope, the fork commit (the parent head at fork time),
@@ -216,6 +247,17 @@ func ensureNotConsumed(ctx *Context, runScope string) error {
 // scope's head) is the caller's composition of snapshot.Snapshot
 // + snapshot.AdvanceScope; Fork owns only the fork.
 func Fork(ctx *Context, parentScope, runScope string) (*carrier.Layer, error) {
+	// The scope-name law is enforced before any filesystem
+	// path is constructed from either name (see checkScopeName):
+	// the extraction and the unconditional removal below are
+	// exactly the effects a traversal run scope must never
+	// reach.
+	if err := checkScopeName("parent", parentScope); err != nil {
+		return nil, err
+	}
+	if err := checkScopeName("run", runScope); err != nil {
+		return nil, err
+	}
 	parentHead, err := ctx.Snaps.ScopeHead(parentScope)
 	if err != nil {
 		return nil, fmt.Errorf("settle: fork %q from %q: %w", runScope, parentScope, err)
@@ -291,6 +333,12 @@ func Fork(ctx *Context, parentScope, runScope string) (*carrier.Layer, error) {
 func Select(ctx *Context, parentScope, parentDir, runScope, opID string) (store.Receipt, error) {
 	if opID == "" {
 		return store.Receipt{}, errors.New("settle: select: op ID is empty")
+	}
+	if err := checkScopeName("parent", parentScope); err != nil {
+		return store.Receipt{}, err
+	}
+	if err := checkScopeName("run", runScope); err != nil {
+		return store.Receipt{}, err
 	}
 	// Journal recovery at verb entry (Task 8): a crashed
 	// predecessor on this parent scope is completed or rolled
@@ -393,6 +441,9 @@ func Select(ctx *Context, parentScope, parentDir, runScope, opID string) (store.
 func Discard(ctx *Context, runScope, opID string) (store.Receipt, error) {
 	if opID == "" {
 		return store.Receipt{}, errors.New("settle: discard: op ID is empty")
+	}
+	if err := checkScopeName("run", runScope); err != nil {
+		return store.Receipt{}, err
 	}
 	if err := ensureNotConsumed(ctx, runScope); err != nil {
 		return store.Receipt{}, err

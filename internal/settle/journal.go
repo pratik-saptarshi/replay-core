@@ -914,6 +914,12 @@ func capturePreimage(parentDir, preDir, rel string) error {
 // at entry; Recover is also exported so the next handle or
 // process can resolve a crashed predecessor directly.
 func Recover(ctx *Context, parentScope string) error {
+	// The journal path is constructed from the parent scope
+	// name, so the scope-name law is enforced before it is
+	// built (see checkScopeName in settle.go).
+	if err := checkScopeName("parent", parentScope); err != nil {
+		return err
+	}
 	j, err := readJournal(ctx.Root, parentScope)
 	if err != nil {
 		return err
