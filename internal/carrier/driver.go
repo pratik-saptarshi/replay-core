@@ -94,7 +94,7 @@ func (d stubDriver) remove(*Layer) error {
 var drivers = []driver{
 	kernelOverlayDriver(),
 	fuseDriver{},
-	stubDriver{driverID: DriverReflink, probeFn: probeReflink},
+	reflinkDriver(),
 	copyDriver{},
 }
 
