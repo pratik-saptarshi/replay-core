@@ -411,13 +411,56 @@ func decodeJournal(v canonical.Value) (*journal, error) {
 	return &j, nil
 }
 
+// otherStagingOwner reports whether a journal on a DIFFERENT
+// parent scope names op: staging is keyed only by operation
+// ID (stagingDirFor), so such a journal owns the staging
+// directory this op would use — its preimages and result tree
+// live there, and removing or reusing the directory destroys
+// the only record that journal's recovery can restore from.
+// Operation IDs are caller-supplied and are not enforced as
+// globally unique; settlement identity is (parent scope, op),
+// so reuse across parent scopes must be refused, never shared.
+// unreadable is true when another scope's journal exists but
+// cannot be read back: its op cannot be known, so it is
+// treated as a potential owner — the fail-closed direction.
+func otherStagingOwner(root, parentScope, op string) (owner string, unreadable bool) {
+	entries, err := os.ReadDir(filepath.Join(root, "journals"))
+	if err != nil {
+		return "", false
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		other := strings.TrimSuffix(name, ".json")
+		if other == parentScope {
+			continue
+		}
+		j, err := readJournal(root, other)
+		if err != nil {
+			return "", true
+		}
+		if j != nil && j.Op == op {
+			return other, false
+		}
+	}
+	return "", false
+}
+
 // clearJournalState removes parentScope's journal and the op's
 // staging directory (preimages and the result-artifact tree):
 // the settlement is complete or undone, and its operational
-// state goes with it.
+// state goes with it. The staging directory is removed only
+// when no other parent scope's journal still owns it under
+// the same op ID: one scope's cleanup must never destroy
+// another scope's durable preimages.
 func clearJournalState(root, parentScope, op string) error {
 	if err := os.Remove(journalPath(root, parentScope)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("settle: remove journal for %q: %w", parentScope, err)
+	}
+	if owner, unreadable := otherStagingOwner(root, parentScope, op); owner != "" || unreadable {
+		return nil
 	}
 	if err := os.RemoveAll(stagingDirFor(root, op)); err != nil {
 		return fmt.Errorf("settle: remove staging for op %q: %w", op, err)
@@ -488,6 +531,23 @@ func materialize(ctx *Context, req materializeRequest) error {
 		return fmt.Errorf("settle: %s %q: resolve parent directory %q: %w", req.verb, req.runScope, req.parentDir, err)
 	}
 	req.parentDir = absDir
+	// Staging is keyed only by op ID, so a pending journal on
+	// another parent scope with the same op ID owns the staging
+	// directory below: removing it here (or clearing it when
+	// this verb completes) would destroy that settlement's
+	// durable preimages while its journal survives, and its
+	// recovery would then treat modified files as creations.
+	// Refuse the reuse before any side effect — the other
+	// settlement must be recovered or completed first. An
+	// unreadable journal on another scope is treated the same
+	// way: its op cannot be known, so reuse cannot be proven
+	// safe.
+	if owner, unreadable := otherStagingOwner(ctx.Root, req.parentScope, req.opID); owner != "" || unreadable {
+		if unreadable {
+			return fmt.Errorf("settle: %s %q: a journal on another parent scope cannot be read, so op ID %q cannot be proven free — refusing to reuse its staging directory", req.verb, req.runScope, req.opID)
+		}
+		return fmt.Errorf("settle: %s %q: op ID %q is already owned by a pending settlement on parent scope %q — refusing to reuse its staging directory", req.verb, req.runScope, req.opID, owner)
+	}
 	stagingRoot := filepath.Join(ctx.Root, "staging")
 	if err := os.MkdirAll(stagingRoot, 0o755); err != nil {
 		return fmt.Errorf("settle: create staging dir: %w", err)
