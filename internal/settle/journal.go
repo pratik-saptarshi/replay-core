@@ -437,6 +437,24 @@ func materialize(ctx *Context, req materializeRequest) error {
 	if !validOpID(req.opID) {
 		return fmt.Errorf("settle: %s %q: op ID %q is not a single path component", req.verb, req.runScope, req.opID)
 	}
+	// The journal records ParentDir, and Recover — whose fixed
+	// signature receives no directory — acts on the recorded
+	// value from whatever process and working directory comes
+	// next. A directory spelled relatively ("." or "workspace")
+	// would be recorded verbatim and then refused by
+	// decodeJournal's absolute-path validation: the journal a
+	// crashed verb most needs read back would be the one
+	// recovery cannot read, and every later verb on that parent
+	// would fail at its entry Recover. Normalize here — the one
+	// path both materializing verbs take, before the journal is
+	// written or the parent is touched; decodeJournal's
+	// requirement stays as the backstop for journals written by
+	// anything else.
+	absDir, err := filepath.Abs(req.parentDir)
+	if err != nil {
+		return fmt.Errorf("settle: %s %q: resolve parent directory %q: %w", req.verb, req.runScope, req.parentDir, err)
+	}
+	req.parentDir = absDir
 	stagingRoot := filepath.Join(ctx.Root, "staging")
 	if err := os.MkdirAll(stagingRoot, 0o755); err != nil {
 		return fmt.Errorf("settle: create staging dir: %w", err)
