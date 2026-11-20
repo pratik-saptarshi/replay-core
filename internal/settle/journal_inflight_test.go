@@ -49,7 +49,8 @@ func rawUnit(path, kind string, done, started bool) canonical.Value {
 // produces), bypassing the journal struct so the fixture does
 // not depend on fields the unfixed code does not have. It
 // also records the parent anchor writeJournal leaves beside
-// every journal it writes, so the fixture's on-disk state is
+// every journal it writes — directory and digest vouch for
+// the exact bytes planted — so the fixture's on-disk state is
 // the full state a crash in the window leaves.
 func writeRawJournal(t *testing.T, f *journalFixture, op string, units []canonical.Value) {
 	t.Helper()
@@ -76,7 +77,11 @@ func writeRawJournal(t *testing.T, f *journalFixture, op string, units []canonic
 	if err := os.WriteFile(jpath, b, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeParentAnchor(f.root, "parent", f.parentDir); err != nil {
+	if err := writeParentAnchor(f.root, parentAnchor{
+		ParentScope:   "parent",
+		ParentDir:     f.parentDir,
+		JournalDigest: journalBytesDigest(b),
+	}); err != nil {
 		t.Fatalf("write parent anchor: %v", err)
 	}
 }

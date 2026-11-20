@@ -2,6 +2,8 @@ package settle
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -116,7 +118,14 @@ type journalUnit struct {
 // the directory it names — a journal file that arrives without
 // the system's writer (planted, transplanted from another
 // root, restored from a stray backup) carries no anchor and
-// is refused, never acted on.
+// is refused, never acted on. The anchor vouches for the
+// journal itself as well as its directory: it records a
+// one-way digest of the journal's canonical bytes, refreshed
+// on every writeJournal, so an anchor left behind with no
+// journal beside it (an interrupted cleanup, a failed journal
+// write) vouches for nothing a planter can construct — the
+// digests name journals the writer produced, and a planted
+// journal matches none of them.
 type journal struct {
 	Op           string
 	Verb         string // verbSelect | verbApply
@@ -128,6 +137,12 @@ type journal struct {
 	ParentDir    string // the real tree the units apply to
 	Fact         canonical.Value
 	Units        []journalUnit
+
+	// digest is the digest of the exact bytes readJournal
+	// loaded this journal from — its provenance mark, checked
+	// against the parent anchor's vouch in Recover. Only
+	// readJournal sets it; a journal built in memory has none.
+	digest string
 }
 
 func journalPath(root, parentScope string) string {
@@ -147,30 +162,73 @@ func journalAnchorPath(root, parentScope string) string {
 	return filepath.Join(root, "journals", parentScope+".anchor")
 }
 
-// parentAnchor is the independent record that vouches for a
-// journal's parent directory: the (scope, directory) pair the
-// system's writer recorded under the settle root when the
-// settlement was materialized. It is the anchor the stored-
-// state rule requires — a durable record's field that steers
-// filesystem effects (the journal's parent_dir, which selects
-// the tree every validated unit path applies to) is checked
-// against a record the journal itself is not, so a journal
-// whose parent_dir no anchor vouches for is refused rather
-// than acted on.
-type parentAnchor struct {
-	ParentScope string
-	ParentDir   string
+// journalBytesDigest returns the digest of a journal's
+// canonical bytes, in the codebase's digest form
+// ("sha256:<lowercase hex>") — the value the parent anchor
+// records as its vouch for the journal. The digest is
+// one-way: the anchor names the journals the writer produced
+// without letting anyone construct one from the anchor.
+func journalBytesDigest(b []byte) string {
+	sum := sha256.Sum256(b)
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
-// writeParentAnchor records (parentScope, parentDir) as the
-// scope's parent anchor: canonical JSON to a temp file in the
-// journals directory, fsynced, renamed into place, and the
-// directory fsynced — the writeJournal discipline, so the
-// anchor is durable before the journal it vouches for lands.
-func writeParentAnchor(root, parentScope, parentDir string) error {
+// validJournalDigest reports whether s is a well-formed
+// journal digest — the only form journalBytesDigest emits.
+func validJournalDigest(s string) bool {
+	h, ok := strings.CutPrefix(s, "sha256:")
+	if !ok || len(h) != 64 {
+		return false
+	}
+	for _, c := range h {
+		if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// parentAnchor is the independent record that vouches for a
+// journal: the (scope, directory) pair the system's writer
+// recorded under the settle root when the settlement was
+// materialized, and the digests of the journal bytes that
+// record covers. It is the anchor the stored-state rule
+// requires — a durable record's field that steers filesystem
+// effects (the journal's parent_dir, which selects the tree
+// every validated unit path applies to) is checked against a
+// record the journal itself is not, so a journal whose
+// parent_dir no anchor vouches for is refused rather than
+// acted on.
+//
+// The digest pair is a two-slot vouch. JournalDigest names
+// the journal writeJournal was landing when it last
+// refreshed the anchor; PrevJournalDigest names the journal
+// those bytes replaced ("" when there were none). writeJournal
+// refreshes the anchor BEFORE the journal's rename, so a
+// crash between the two leaves the previous journal on disk —
+// vouched by the second slot — while a completed rename
+// leaves the new journal, vouched by the first. At every
+// crash point the journal actually on disk is one of the
+// two, and a journal the writer never produced is neither.
+type parentAnchor struct {
+	ParentScope       string
+	ParentDir         string
+	JournalDigest     string
+	PrevJournalDigest string
+}
+
+// writeParentAnchor records a as parentScope's parent
+// anchor: canonical JSON to a temp file in the journals
+// directory, fsynced, renamed into place, and the directory
+// fsynced — the writeJournal discipline, so the anchor is
+// durable before the journal it vouches for lands.
+func writeParentAnchor(root string, a parentAnchor) error {
+	parentScope := a.ParentScope
 	v := canonical.ObjectOf(
-		canonical.Pair{Key: "parent_dir", Value: canonical.StringOf(parentDir)},
-		canonical.Pair{Key: "parent_scope", Value: canonical.StringOf(parentScope)},
+		canonical.Pair{Key: "journal_digest", Value: canonical.StringOf(a.JournalDigest)},
+		canonical.Pair{Key: "parent_dir", Value: canonical.StringOf(a.ParentDir)},
+		canonical.Pair{Key: "parent_scope", Value: canonical.StringOf(a.ParentScope)},
+		canonical.Pair{Key: "prev_journal_digest", Value: canonical.StringOf(a.PrevJournalDigest)},
 	)
 	b, err := canonical.MarshalKernel(v)
 	if err != nil {
@@ -231,35 +289,66 @@ func readParentAnchor(root, parentScope string) (parentAnchor, bool, error) {
 		}
 		*dst = s
 	}
+	// The digest vouch is read leniently in form and strictly
+	// in effect: an anchor recorded before the vouch existed
+	// carries no digest fields and vouches for no journal (the
+	// gate in Recover refuses any journal beside it, exactly
+	// as it refuses a journal beside no anchor at all), and a
+	// digest field that is present must be a well-formed
+	// digest or the anchor does not decode.
+	for key, dst := range map[string]*string{
+		"journal_digest":      &a.JournalDigest,
+		"prev_journal_digest": &a.PrevJournalDigest,
+	} {
+		s, ok := stringField(v, key)
+		if !ok {
+			continue
+		}
+		if s != "" && !validJournalDigest(s) {
+			return parentAnchor{}, false, fmt.Errorf("settle: parent anchor for %q: field %q is not a journal digest", parentScope, key)
+		}
+		*dst = s
+	}
 	return a, true, nil
 }
 
-// ensureParentAnchor makes the anchor state match the journal
-// writeJournal is about to land: an anchor already vouching
-// for the journal's directory stands; a missing anchor is
-// recorded. An anchor naming a DIFFERENT directory while its
-// journal is still live is a refusal — re-anchoring under a
-// live journal would let a later writer redirect the earlier
-// settlement's recovery — but with no journal live the anchor
-// is debris of a settlement whose cleanup died between
-// removing the journal and removing the anchor, and the new
-// settlement's writer replaces it.
-func ensureParentAnchor(root string, j *journal) error {
+// ensureParentAnchor makes the anchor state match the
+// journal writeJournal is about to land: the anchor records
+// the journal's directory and the two-slot digest vouch for
+// the transition — journalDigest, the journal being landed,
+// and prevDigest, the journal it replaces. An anchor already
+// recording exactly this vouch stands. An anchor naming a
+// DIFFERENT directory while its journal is still live is a
+// refusal — re-anchoring under a live journal would let a
+// later writer redirect the earlier settlement's recovery —
+// but with no journal live the anchor is debris (of an
+// interrupted cleanup, or of a journal write that failed
+// after the anchor landed) and the new settlement's writer
+// replaces it.
+func ensureParentAnchor(root string, j *journal, journalDigest, prevDigest string) error {
 	a, found, err := readParentAnchor(root, j.ParentScope)
 	if err != nil {
 		return err
 	}
 	if found {
-		if a.ParentScope == j.ParentScope && a.ParentDir == j.ParentDir {
+		if a.ParentScope == j.ParentScope && a.ParentDir == j.ParentDir &&
+			a.JournalDigest == journalDigest && a.PrevJournalDigest == prevDigest {
 			return nil
 		}
-		if _, serr := os.Stat(journalPath(root, j.ParentScope)); serr == nil {
-			return fmt.Errorf("settle: journal for %q is anchored to parent directory %q — refusing to record it under %q while that journal is live", j.ParentScope, a.ParentDir, j.ParentDir)
-		} else if !errors.Is(serr, fs.ErrNotExist) {
-			return fmt.Errorf("settle: stat journal for %q: %w", j.ParentScope, serr)
+		if a.ParentDir != j.ParentDir {
+			if _, serr := os.Stat(journalPath(root, j.ParentScope)); serr == nil {
+				return fmt.Errorf("settle: journal for %q is anchored to parent directory %q — refusing to record it under %q while that journal is live", j.ParentScope, a.ParentDir, j.ParentDir)
+			} else if !errors.Is(serr, fs.ErrNotExist) {
+				return fmt.Errorf("settle: stat journal for %q: %w", j.ParentScope, serr)
+			}
 		}
 	}
-	return writeParentAnchor(root, j.ParentScope, j.ParentDir)
+	return writeParentAnchor(root, parentAnchor{
+		ParentScope:       j.ParentScope,
+		ParentDir:         j.ParentDir,
+		JournalDigest:     journalDigest,
+		PrevJournalDigest: prevDigest,
+	})
 }
 
 // validOpID reports whether op is safe to name a staging
@@ -340,8 +429,21 @@ func writeJournal(root string, j *journal) error {
 	}
 	// The parent anchor lands before the journal it vouches
 	// for: at no moment does a journal exist on disk whose
-	// parent directory no anchor records.
-	if err := ensureParentAnchor(root, j); err != nil {
+	// parent directory no anchor records. The anchor's digest
+	// vouch names this journal and the journal it replaces —
+	// read back now, before the rename — so a crash between
+	// the anchor's landing and the journal's leaves the
+	// on-disk journal vouched by the second slot, and a
+	// journal write that fails after the anchor landed leaves
+	// the same recoverable state.
+	journalDigest := journalBytesDigest(b)
+	prevDigest := ""
+	if prev, rerr := os.ReadFile(journalPath(root, j.ParentScope)); rerr == nil {
+		prevDigest = journalBytesDigest(prev)
+	} else if !errors.Is(rerr, fs.ErrNotExist) {
+		return fmt.Errorf("settle: read journal being replaced for %q: %w", j.ParentScope, rerr)
+	}
+	if err := ensureParentAnchor(root, j, journalDigest, prevDigest); err != nil {
 		return err
 	}
 	tmp, err := os.CreateTemp(dir, ".journal-*")
@@ -391,6 +493,7 @@ func readJournal(root, parentScope string) (*journal, error) {
 	if j.ParentScope != parentScope {
 		return nil, fmt.Errorf("settle: journal at %q names parent scope %q", journalPath(root, parentScope), j.ParentScope)
 	}
+	j.digest = journalBytesDigest(b)
 	return j, nil
 }
 
@@ -671,8 +774,11 @@ func clearJournalState(root, parentScope, op string) error {
 	// The parent anchor goes with the journal it vouched for:
 	// the settlement is complete or undone, and no record of
 	// its directory outlives it. (A crash between the two
-	// removals leaves anchor debris the next settlement's
-	// writer replaces — see ensureParentAnchor.)
+	// removals leaves an orphan anchor: it vouches only for
+	// the digests of the journal just removed and the one
+	// that journal replaced, so no planted journal can act
+	// beside it, and the next settlement's writer replaces
+	// it — see ensureParentAnchor.)
 	if err := os.Remove(journalAnchorPath(root, parentScope)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("settle: remove parent anchor for %q: %w", parentScope, err)
 	}
@@ -1170,11 +1276,12 @@ func capturePreimage(parentDir, preDir, rel string) error {
 // completed or rolled back before any new work is judged
 // against the scope. No journal → nil. A journal that fails to
 // decode or validate → a descriptive error, no writes, the
-// journal left in place as evidence. A journal whose parent
-// directory the scope's parent anchor does not vouch for —
-// no anchor recorded, or a different directory anchored — is
-// refused the same way, before any state is judged: the
-// journal never vouches for its own scope.
+// journal left in place as evidence. A journal the scope's
+// parent anchor does not vouch for — no anchor recorded, a
+// different directory anchored, or a digest matching neither
+// of the anchor's vouched journals — is refused the same way,
+// before any state is judged: the journal never vouches for
+// its own scope.
 //
 // State verified → the commit point is completed idempotently:
 // the parent scope advances old_head → result_commit if it has
@@ -1216,7 +1323,16 @@ func Recover(ctx *Context, parentScope string) error {
 	// writer left under the settle root, before any state is
 	// judged. A journal with no anchor, or one naming a
 	// different directory than the anchor records, is refused
-	// with the journal left in place.
+	// with the journal left in place. The anchor must also
+	// vouch for the journal itself: its digest must match one
+	// of the anchor's two slots — the journal the writer last
+	// landed, or the one that journal replaced (the journal
+	// on disk when a crash interrupted the anchor's refresh
+	// ahead of the journal's own rename). An anchor left
+	// behind with no journal beside it therefore vouches for
+	// nothing a planter can construct: the slots hold one-way
+	// digests of journals the writer produced, and a planted
+	// journal is neither.
 	a, found, err := readParentAnchor(ctx.Root, parentScope)
 	if err != nil {
 		return err
@@ -1226,6 +1342,9 @@ func Recover(ctx *Context, parentScope string) error {
 	}
 	if a.ParentScope != parentScope || a.ParentDir != j.ParentDir {
 		return fmt.Errorf("settle: recover %q: journal's parent directory %q disagrees with the recorded parent anchor %q — refusing to act on it", parentScope, j.ParentDir, a.ParentDir)
+	}
+	if j.digest != a.JournalDigest && j.digest != a.PrevJournalDigest {
+		return fmt.Errorf("settle: recover %q: the parent anchor does not vouch for this journal — its digest matches neither the journal the anchor last recorded nor the journal that one replaced — refusing to act on it", parentScope)
 	}
 	switch j.State {
 	case journalStateVerified:
