@@ -93,7 +93,7 @@ func (d stubDriver) remove(*Layer) error {
 // always reads this list.
 var drivers = []driver{
 	kernelOverlayDriver(),
-	stubDriver{driverID: DriverFuseOverlay, probeFn: probeFuse},
+	fuseDriver{},
 	stubDriver{driverID: DriverReflink, probeFn: probeReflink},
 	copyDriver{},
 }
