@@ -591,6 +591,17 @@ func (s *Store) Snapshot(workspaceDir string, meta map[string]string) (string, e
 	if err != nil {
 		return "", err
 	}
+	// The generated metadata must round-trip through its own
+	// reader before anything is built on it: MarshalKernel
+	// preserves raw bytes, but DecodeKernel — the reader's law,
+	// enforced by parseSnapshotMeta at Open — rejects invalid
+	// UTF-8, so a caller meta key or value carrying such bytes
+	// would publish a chain head no reopen could ever adopt
+	// (Codex P2 on PR #2). Refuse here, before any object or
+	// ref is written.
+	if err := parseSnapshotMeta(snapMeta); err != nil {
+		return "", fmt.Errorf("snapshot: generated meta/snapshot.json does not parse as snapshot metadata: %w", err)
+	}
 	var lastCAS error
 	for attempt := 0; attempt < maxChainAttempts; attempt++ {
 		commit, advanced, casErr, err := s.snapshotOnce(workspaceDir, entries, snapMeta)
@@ -704,6 +715,23 @@ func (s *Store) snapshotOnce(workspaceDir string, entries []entry, snapMeta []by
 	manifest, err := manifestBytes(entries)
 	if err != nil {
 		return "", false, nil, err
+	}
+	// The generated manifest must round-trip through its own
+	// reader before the commit is created and any ref is
+	// published: MarshalKernel preserves raw bytes in the entry
+	// keys, but DecodeKernel — the reader's law, enforced by
+	// parseManifest on every parent read — rejects invalid
+	// UTF-8, and a workspace filename carrying such bytes is
+	// legal on Unix. Publishing such a manifest would wedge
+	// the chain permanently: Open and every later Snapshot
+	// fail on the head even after the file is removed (Codex
+	// P2 on PR #2). The manifest stays a faithful record —
+	// the name is refused, never sanitized. This is the
+	// earliest point the manifest bytes exist: they name the
+	// blobs hashed above, and those orphaned blobs are as
+	// harmless as a lost race's orphaned commit.
+	if _, err := parseManifest(manifest); err != nil {
+		return "", false, nil, fmt.Errorf("snapshot: generated meta/manifest.json does not parse as a snapshot manifest: %w", err)
 	}
 
 	// Assemble the dual tree in a temporary index so no real index
