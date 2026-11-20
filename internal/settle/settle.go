@@ -32,14 +32,14 @@ import (
 
 // Context bundles the two stores and the one root all settle
 // operational state lives under (plan Decision 8(e)): fork
-// sidecars, base extractions, layers, staging, and journals
-// live under Root; nothing in F5/F6 writes anywhere else
-// except the parent directory at a verb's commit point and
-// the two stores through their own APIs.
+// sidecars, base extractions, layers, staging, fork staging,
+// and journals live under Root; nothing in F5/F6 writes
+// anywhere else except the parent directory at a verb's
+// commit point and the two stores through their own APIs.
 type Context struct {
 	Trace *store.Store
 	Snaps *snapshot.Store
-	Root  string // forks/, bases/, layers/, staging/, journals/
+	Root  string // forks/, bases/, layers/, staging/, fork-staging/, journals/
 }
 
 // ErrParentAdvanced is returned by Select when the parent scope's
@@ -238,7 +238,7 @@ func ensureNotConsumed(ctx *Context, runScope string) error {
 // parent head, extracts that commit's workspace tree to
 // Root/bases/<runScope>, selects a carrier on Root/layers and
 // materializes a layer into a temporary root under
-// Root/staging — and only then creates the scope ref, writes the
+// Root/fork-staging — and only then creates the scope ref, writes the
 // sidecar, and renames the layer root into place. A layer is
 // never handed out without provenance; a crash between the ref
 // and the sidecar leaves an inert ref the verbs refuse with
@@ -268,8 +268,8 @@ func Fork(ctx *Context, parentScope, runScope string) (*carrier.Layer, error) {
 	}
 	basesDir := filepath.Join(ctx.Root, "bases")
 	layersDir := filepath.Join(ctx.Root, "layers")
-	stagingDir := filepath.Join(ctx.Root, "staging")
-	for _, dir := range []string{basesDir, layersDir, stagingDir} {
+	forkStagingDir := filepath.Join(ctx.Root, "fork-staging")
+	for _, dir := range []string{basesDir, layersDir, forkStagingDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, fmt.Errorf("settle: fork %q: create %s: %w", runScope, dir, err)
 		}
@@ -283,10 +283,16 @@ func Fork(ctx *Context, parentScope, runScope string) (*carrier.Layer, error) {
 		_ = os.RemoveAll(baseDir)
 		return nil, fmt.Errorf("settle: fork %q: %w", runScope, err)
 	}
-	// The temporary layer root is staging state — never handed
-	// out — so a remnant of a crashed Fork is removed outright
-	// rather than adopted.
-	tmpRoot := filepath.Join(stagingDir, "fork-"+runScope)
+	// The temporary layer root lives in Fork's own namespace
+	// under the Root — never handed out — so a remnant of a
+	// crashed Fork is removed outright rather than adopted.
+	// The namespace is structural, not a naming convention:
+	// settlement staging is keyed by caller-supplied operation
+	// ID under Root/staging, and no operation ID can name a
+	// path outside that directory, so no settlement's staging
+	// can ever stand where this removal lands (and this
+	// removal can never land on a settlement's staging).
+	tmpRoot := filepath.Join(forkStagingDir, runScope)
 	_ = os.RemoveAll(tmpRoot)
 	layer, err := carrier.Materialize(sel, baseDir, baseTree, tmpRoot)
 	if err != nil {
