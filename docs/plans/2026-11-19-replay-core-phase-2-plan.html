@@ -36,11 +36,11 @@
 
 <p><b>Decision 2 — No new module dependencies; carrier mechanics via the standard library.</b> The kernel-overlay mount and the FICLONE ioctl are both reachable from the standard library's <code>syscall</code> package on Linux (<code>syscall.Mount</code>, <code>syscall.Syscall(syscall.SYS_IOCTL, …)</code>), in Linux-tagged files with a small non-Linux fallback that reports each driver unavailable with its reason. The module therefore keeps exactly one requirement (<code>github.com/mattn/go-sqlite3</code>, Phase 1 Decision 1). The one dependency this decision refuses is a FUSE library — see Decision 5.</p>
 
-<p><b>Decision 3 — One scope identity across both stores; fork provenance is settle-side operational state.</b> A settlement scope is named once: the scope name is both the snapshot scope ref (<code>refs/vcscore/scopes/&lt;name&gt;</code>, matching the Phase 1 scope-name law <code>^[a-z0-9][a-z0-9-]*$</code>) and the trace owner path its settlement facts are appended to. AC-F6-7's “the scope's tail” is then well-defined: the frontier of the owner path named by the scope. Fork provenance — parent scope, fork commit, base (workspace) tree — is recorded by <code>settle.Fork</code> in a sidecar file under the settle root (<code>forks/&lt;runScope&gt;.json</code>, canonical JSON, fsynced before the layer is handed out). It is operational state of the same kind as the journal (Decision 8(e)), <i>not</i> a trace fact: AC-F6-7 enumerates the settlement facts as the three verbs' records, and the plan does not add a fourth fact class on its own authority. Advancing a run line between fork and settlement (snapshotting the layer, moving the run scope's head) is the caller's composition of <code>snapshot.Snapshot</code> + <code>snapshot.AdvanceScope</code>; settle owns only the fork and the verbs.</p>
+<p><b>Decision 3 — One scope identity across both stores; fork provenance is settle-side operational state.</b> A settlement scope is named once: the scope name is both the snapshot scope ref (<code>refs/vcscore/scopes/&lt;name&gt;</code>, matching the Phase 1 scope-name law <code>^[a-z0-9][a-z0-9-]*$</code>) and the trace owner path its settlement facts are appended to. AC-F6-7's “the scope's tail” is then well-defined: the frontier of the owner path named by the scope. Fork provenance — parent scope, fork commit, base (workspace) tree — is recorded by <code>settle.Fork</code> in a sidecar file under the settle root (<code>forks/&lt;runScope&gt;.json</code>, canonical JSON, fsynced before the layer is handed out). It is operational state of the same kind as the journal (Decision 8(e)), <i>not</i> a trace fact: AC-F6-7 enumerates the settlement facts as the three verbs' records, and the plan does not add a fourth fact class on its own authority. Advancing a run line between fork and settlement (snapshotting the layer, moving the run scope's head) is the caller's composition of <code>snapshot.Snapshot</code> + <code>snapshot.AdvanceScope</code>; settle owns only the fork and the verbs. One consumer obligation rides on this binding, stated in so many words: settlement facts cite the frontier of the owner path the scope names, so for AC-F6-7's evidence to mean what it says, <b>a run's trace path must be the scope name</b> — a consumer whose run appended its execution facts on a differently-shaped path gets settlement facts citing a tail that is not its run's, and the verbs neither discover nor adopt foreign paths.</p>
 
 <p><b>Decision 4 — Settlement facts are reserved, store-minted records (the Phase 1 minting pattern).</b> Three new schema refs — <code>replaycore.settle-select.v1</code>, <code>replaycore.settle-apply.v1</code>, <code>replaycore.settle-discard.v1</code> — join the reserved set: <code>AppendFact</code>/<code>AppendBatch</code> reject them with <code>ErrReservedSchemaRef</code>, and their bodies are constructed and minted only by new constructors in <code>internal/store</code> (<code>settle.go</code>, beside <code>mint.go</code>), each minting with <code>caused_by</code> = the scope path's frontier at mint time and the root witness fields as witness (Decision 4(a) of the Phase 1 plan: the house convention for system-authored facts). This is the wave-2 (ADV-3) lesson applied prospectively: a fact class that other code will <i>trust</i> — consume-once enforcement and crash completion both read settlement facts as authority — is never appendable through the unguarded path. Each body carries the caller-supplied operation ID (<code>op</code>); consume-once and journal recovery key on (schema ref, run scope, op), never on wall-clock or ordering guesses. Body shapes, all flat: select <code>{op, parent_scope, run_scope, parent_head, run_head}</code>; apply <code>{op, parent_scope, run_scope, fork_commit, result_commit, settled_paths}</code>; discard <code>{op, run_scope, head, archive_ref}</code>.</p>
 
-<p><b>Decision 5 — FUSE-overlay driver depth: protocol-registered and probe-honest; the mount itself is not built in Phase 2.</b> The baseline is unambiguous: <code>/dev/fuse</code> is absent in this sandbox, so a FUSE driver cannot be exercised here at all — no test in this environment could distinguish a correct FUSE implementation from a plausible-looking one, and Phase 2's discipline is that unexercisable code does not ship as if proven. The driver therefore occupies its slot in the selection order with a real probe (it stats and opens <code>/dev/fuse</code> and records the outcome) and a <code>materialize</code> that refuses with the probe's recorded reason. AC-F5-9 is recorded <b>host-deferred, not discharged</b> (Decision 7); a future host with <code>/dev/fuse</code> present owes the mount implementation against the same isolation contract as AC-F5-5, and the probe will start reporting availability there only when the mount exists to back it — the probe and the mount land together or not at all. The alternative — a full FUSE implementation against a new third-party library, compile-verified only — was rejected: it adds the phase's only new dependency for code no test here can run.</p>
+<p><b>Decision 5 — FUSE-overlay driver depth: protocol-registered and probe-honest; the mount itself is not built in Phase 2.</b> The baseline is unambiguous: <code>/dev/fuse</code> is absent in this sandbox, so a FUSE driver cannot be exercised here at all — no test in this environment could distinguish a correct FUSE implementation from a plausible-looking one, and Phase 2's discipline is that unexercisable code does not ship as if proven. The driver therefore occupies its slot in the selection order with a probe that examines <code>/dev/fuse</code> and records what it finds but reports the driver <b>unavailable on every host until the mount exists to back it</b> — its reason distinguishes “<code>/dev/fuse</code> absent” from “<code>/dev/fuse</code> present, mount not implemented” — and a <code>materialize</code> that refuses with the probe's recorded reason. AC-F5-9 is recorded <b>host-deferred, not discharged</b> (Decision 7); a future host with <code>/dev/fuse</code> present owes the mount implementation against the same isolation contract as AC-F5-5, and the probe will start reporting availability there only when the mount exists to back it — the probe and the mount land together or not at all. The alternative — a full FUSE implementation against a new third-party library, compile-verified only — was rejected: it adds the phase's only new dependency for code no test here can run.</p>
 
 <p><b>Decision 6 — Issue #3 (intent path-scoping, and the parked identity question) does not interact with F5/F6; this plan neither uses nor settles it.</b> Stated explicitly, as the issue's disposition (“deferred to Phase 2 design”) requires a Phase 2 answer: settlement appends are single, constructor-minted facts (Decision 4) — the verbs call the <code>MintSettle*</code> constructors, never <code>AppendBatch</code>, so the <code>append_intents</code> table, its key, and the AC-F2-2 contract are untouched, unread, and undepended-on by every task in this plan. Idempotency for settlement comes from the journal + op-ID scan (Task 8), not from the intent mechanism. The identity question is likewise untouched: settlement facts are ordinary content-addressed records under the existing law, and no task changes what a record's identity is computed from. Issue #3 therefore remains open for the owner's design call in parallel; if the owner settles it before or during Phase 2 execution, no task in this plan changes. (What F6 <i>does</i> rely on from Phase 1 is the wave-3 law as built: intent IDs are globally single-use and cross-path reuse is rejected — relied on only in the negative sense that nothing here needs the alternative.)</p>
 
@@ -78,16 +78,16 @@
 <tr><th>Plan task</th><th>Roadmap task</th><th>Acceptance criteria</th><th>Depends on</th></tr>
 <tr><td>1</td><td>T-F5-1</td><td>AC-F5-1 (selection order, explicit degradation), AC-F5-2 (probe truth in this sandbox, safety-bearing)</td><td>—</td></tr>
 <tr><td>2</td><td>T-F5-2</td><td>AC-F5-3 (stale-layer wipe), AC-F5-4 (layer lifecycle), AC-F5-5 (copy isolation)</td><td>1</td></tr>
-<tr><td>3</td><td>T-F5-3</td><td>AC-F5-7 (kernel overlay, scratch grade), AC-F5-8 (kernel overlay, real workspaces — <b>host-deferred, not discharged</b>)</td><td>1</td></tr>
+<tr><td>3</td><td>T-F5-3</td><td>AC-F5-7 (kernel overlay, scratch grade), AC-F5-8 (kernel overlay, real workspaces — <b>host-deferred, not discharged</b>)</td><td>1, 2</td></tr>
 <tr><td>4</td><td>T-F5-4</td><td>AC-F5-9 (FUSE overlay — <b>host-deferred, not discharged</b>)</td><td>1</td></tr>
-<tr><td>5</td><td>T-F5-5</td><td>AC-F5-10 (reflink — no-silent-fallback clause discharged here; extent-sharing clause <b>host-deferred, not discharged</b>)</td><td>1</td></tr>
+<tr><td>5</td><td>T-F5-5</td><td>AC-F5-10 (reflink — no-silent-fallback clause discharged here; extent-sharing clause <b>host-deferred, not discharged</b>)</td><td>1, 2</td></tr>
 <tr><td>6</td><td>T-F6-1</td><td>AC-F6-1 (FF-only select, safety-bearing, gate evidence), AC-F6-5 (archive-on-discard), AC-F6-6 (consume-once)</td><td>2</td></tr>
 <tr><td>7</td><td>T-F6-2</td><td>AC-F6-2 (disjoint apply, safety-bearing, gate evidence), AC-F6-3 (overlap refusal, safety-bearing, gate evidence)</td><td>6</td></tr>
 <tr><td>8</td><td>T-F6-3</td><td>AC-F6-4 (journaled materialization, safety-bearing, gate evidence)</td><td>6, 7</td></tr>
 <tr><td>9</td><td>T-F6-4</td><td>AC-F6-7 (settlement graph evidence; only path to a real tree)</td><td>7, 8</td></tr>
-<tr><td>10</td><td>T-GATE-P2</td><td>AC-F5-6 (fork a real repo workspace, gate evidence); assembled evidence for AC-F6-1, AC-F6-2, AC-F6-3, AC-F6-4</td><td>3, 5, 6, 7, 8, 9</td></tr>
+<tr><td>10</td><td>T-GATE-P2</td><td>AC-F5-6 (fork a real repo workspace, gate evidence); assembled evidence for AC-F6-1, AC-F6-2, AC-F6-3, AC-F6-4</td><td>all (1–9)</td></tr>
 </table>
-<p>Sequencing note: the matrix lists T-F6-3's dependency as T-F6-1 alone; this plan sequences Task 8 after Task 7 as well, because the journal's subject is apply's materializer — there is nothing to journal until apply exists. No criterion's ownership changes. (Phase 1's plan reordered roadmap tasks the same way where the mechanics required it.)</p>
+<p>Sequencing note: the matrix lists T-F6-3's dependency as T-F6-1 alone; this plan sequences Task 8 after Task 7 as well, because the journal's subject is apply's materializer — there is nothing to journal until apply exists. No criterion's ownership changes. (Phase 1's plan reordered roadmap tasks the same way where the mechanics required it.) Two further departures from the matrix's dependency column, both matching the task bodies: Tasks 3 and 5 list Task 2 alongside Task 1, because their Interfaces consume the layer machinery and not just the protocol core; and Task 10 depends on all nine tasks, because the gate assembles the whole phase, where the matrix lists only T-F5-2, T-F6-2, T-F6-3 for T-GATE-P2.</p>
 
 <h2>Tasks</h2>
 
@@ -124,7 +124,7 @@ type Selection struct {
 // itself is unusable (missing, not a directory, unwritable) —
 // never as a substitute for a recorded probe failure.
 func Select(rootDir string) (Selection, error)</pre>
-<p>The driver registry is an ordered package-level list (<code>var drivers []driver</code>) of an unexported interface with three methods — <code>probe(rootDir) ProbeResult</code>, <code>materialize(...)</code>, <code>remove(...)</code> (materialize/remove signatures arrive with the <code>Layer</code> type in Task 2; in this task every driver's materialize/remove returns a descriptive “driver not yet implemented” error). Package-internal tests may substitute the registry; the public <code>Select</code> always uses the real one. Probes are real from this task onward, because AC-F5-1/AC-F5-2 judge the <i>record</i>: the kernel-overlay probe creates a scratch overlay under the root (lower/upper/work/merged plus one lower file), mounts it, confirms the lower file is visible through the merged view, and unmounts; the reflink probe creates two scratch files and attempts one FICLONE; the FUSE probe opens <code>/dev/fuse</code>; each failure's <code>Reason</code> names the mechanism and the error class (e.g. the mount failure, the EPERM). Scratch is removed on every path. Selection is computed fresh on every call — no caching (Global Constraints). <i>Interim honesty:</i> until Tasks 2/3/5 land, <code>Select</code> can name a driver whose materialize does not exist yet; Task 1's tests therefore assert selection and records, never materialization, and the stub errors say exactly that.</p>
+<p>The driver registry is an ordered package-level list (<code>var drivers []driver</code>) of an unexported interface with three methods — <code>probe(rootDir) ProbeResult</code>, <code>materialize(...)</code>, <code>remove(...)</code> (materialize/remove signatures arrive with the <code>Layer</code> type in Task 2; in this task every driver's materialize/remove returns a descriptive “driver not yet implemented” error). Package-internal tests may substitute the registry; the public <code>Select</code> always uses the real one. Probes are real from this task onward, because AC-F5-1/AC-F5-2 judge the <i>record</i>: the kernel-overlay probe creates a scratch overlay under the root (lower/upper/work/merged plus one lower file), mounts it, confirms the lower file is visible through the merged view, and unmounts; the reflink probe creates two scratch files and attempts one FICLONE; the FUSE probe examines <code>/dev/fuse</code> and records what it finds, but reports the driver unavailable on every host in Phase 2 (Decision 5's law: availability is reported only when the mount exists to back it) — its <code>Reason</code> distinguishes “<code>/dev/fuse</code> absent” from “mount not implemented”; each failure's <code>Reason</code> names the mechanism and the error class (e.g. the mount failure, the EPERM). Scratch is removed on every path. Selection is computed fresh on every call — no caching (Global Constraints). <i>Interim honesty:</i> until Tasks 2/3/5 land, <code>Select</code> can name a driver whose materialize does not exist yet; Task 1's tests therefore assert selection and records, never materialization, and the stub errors say exactly that.</p>
 <ul>
 <li>[ ] <b>Step 1 — Failing test (AC-F5-1, input shape — every driver hostile):</b>
 <pre>func TestSelectFallsThroughWithRecordedReasons(t *testing.T) {
@@ -184,7 +184,7 @@ func Materialize(sel Selection, baseDir, baseID, layerRoot string) (*Layer, erro
 func (l *Layer) Remove() error
 
 var ErrForeignLayerDir = errors.New("carrier: layer root exists and is not a carrier layer")</pre>
-<p>Materialize law: a layer root carrying a marker whose <code>base_id</code> and driver match the request is returned as-is (idempotent re-materialization — a second handle on the same layer, contents preserved). A marker naming a different base or driver means the base changed: the root is <b>wiped and rebuilt</b>, never merged (AC-F5-3). A non-empty layer root with <i>no</i> marker is refused with <code>ErrForeignLayerDir</code> — the wipe deletes only what the carrier created (Review Focus). A marker that fails to decode is a descriptive error, never a guess and never a wipe. Builds go to a staging sibling (<code>view.building-*</code>) renamed into place, with the marker written last; a staging remnant from a crashed build is removed by the next <code>Materialize</code> of the same root. The copy driver walks the base: directories recreated with their modes, regular files byte-copied with modes preserved, symlinks recreated as symlinks and <b>never followed</b>, and any other kind (FIFO, socket, device) refused with an error naming the path — a base the snapshot store could never have produced is hostile input, not a layer. Kernel-overlay and reflink materialize remain this plan's stated stubs until Tasks 3 and 5; <code>Materialize</code> with such a selection returns the stub's descriptive error.</p>
+<p>Materialize law: a layer root carrying a marker whose <code>base_id</code> and driver match the request is returned as-is (idempotent re-materialization — a second handle on the same layer, contents preserved). A marker naming a different base or driver means the base changed: the root is <b>wiped and rebuilt</b>, never merged (AC-F5-3). A non-empty layer root with <i>no</i> marker is refused with <code>ErrForeignLayerDir</code> — the wipe deletes only what the carrier created (Review Focus). The single exception is a driver's own crash remnant, recognized by that driver's exact remnant layout and recovered by that driver (Task 3's overlay remnant law); any markerless shape a driver cannot recognize as its own stays refused, unwiped. A marker that fails to decode is a descriptive error, never a guess and never a wipe. Builds go to a staging sibling (<code>view.building-*</code>) renamed into place, with the marker written last; a staging remnant from a crashed build is removed by the next <code>Materialize</code> of the same root. The copy driver walks the base: directories recreated with their modes, regular files byte-copied with modes preserved, symlinks recreated as symlinks and <b>never followed</b>, and any other kind (FIFO, socket, device) refused with an error naming the path — a base the snapshot store could never have produced is hostile input, not a layer. Kernel-overlay and reflink materialize remain this plan's stated stubs until Tasks 3 and 5; <code>Materialize</code> with such a selection returns the stub's descriptive error.</p>
 <ul>
 <li>[ ] <b>Step 1 — Failing test (AC-F5-5):</b>
 <pre>func TestCopyLayerMaterializesBaseByteIdentical(t *testing.T) {
@@ -239,6 +239,7 @@ Run: <code>go test ./internal/carrier/ -run 'TestCopyLayerStale|TestLayerLifecyc
 <h3>Task 3 (T-F5-3): Kernel-overlay driver</h3>
 <p><b>Files:</b> Create <code>internal/carrier/overlay_linux.go</code> (mount materialize/remove), <code>internal/carrier/overlay_other.go</code> (non-Linux: materialize returns the platform refusal); Test <code>internal/carrier/overlay_test.go</code> (package <code>carrier_test</code>).</p>
 <p><b>Interfaces:</b> Consumes — Tasks 1–2 (the driver registry, the layer layout). Produces — the kernel-overlay driver's real materialize/remove, replacing Task 1's stub. Layout under the layer root: <code>view/</code> is the merged mountpoint, <code>upper/</code> and <code>work/</code> are its siblings (never inside the view). Materialize mounts <code>overlay</code> with <code>lowerdir=baseDir, upperdir, workdir</code>; a mount failure is returned as the operation's error — a driver chosen by selection that fails at use is <b>never</b> silently replaced by another driver (Global Constraints). Remove unmounts the view, then the layer root is deleted by the shared lifecycle. The driver is filesystem-agnostic — it takes any lowerdir — so AC-F5-8 (real workspaces) needs no code change on a host whose workspace filesystem accepts overlay mounts; this task records AC-F5-8 <b>not discharged</b> in this sandbox (Decision 7).</p>
+<p><b>Crash-remnant law.</b> The mount happens inside materialize, before the shared lifecycle writes the marker (Task 2 writes the marker last), so a crash in that window leaves a markerless layer root in the overlay driver's own remnant shape: <code>upper/</code> and <code>work/</code> present, <code>view/</code> present and possibly still mounted, and no marker. The overlay driver's <code>Materialize</code> recognizes exactly that shape — the driver's own layout, all three directories and nothing unexpected beside them — as its own remnant: it unmounts <code>view/</code> if a mount is still live, wipes the root, and rebuilds. Recognition is by the exact remnant layout, never by emptiness or name similarity; any other markerless non-empty root remains <code>ErrForeignLayerDir</code> under Task 2's law, unwiped.</p>
 <ul>
 <li>[ ] <b>Step 1 — Failing test (AC-F5-7, live probe at scratch grade):</b>
 <pre>func TestOverlayLayerOnTmpfs(t *testing.T) {
@@ -264,12 +265,23 @@ Run: <code>go test ./internal/carrier/ -run TestOverlayLayerOnTmpfs -count=1</co
     // and Select on the same root still lands on copy (Task 1)
 }</pre>
 Run: <code>go test ./internal/carrier/ -run TestOverlayMaterializeOnBtrfs -count=1</code> — Expected: FAIL until the error path leaves no partial layer.</li>
-<li>[ ] <b>Step 4 — Commit:</b> <code>feat(carrier): kernel-overlay driver with scratch-grade probe</code>.</li>
+<li>[ ] <b>Step 4 — Failing test (crash-remnant recovery; timing shape):</b>
+<pre>func TestOverlayMaterializeRecoversCrashRemnant(t *testing.T) {
+    // hand-build the remnant shape under a tmpfs root:
+    // upper/, work/, view/ present, no marker (the crash
+    // window between mount and marker write)
+    // Materialize → succeeds: the remnant is recognized as
+    // the driver's own, wiped, and the layer rebuilt usable
+    // a markerless root in an UNRECOGNIZED shape (upper/
+    // plus a stray file) → ErrForeignLayerDir, untouched
+}</pre>
+Run: <code>go test ./internal/carrier/ -run TestOverlayMaterializeRecovers -count=1</code> — Expected: FAIL (no remnant recognition).</li>
+<li>[ ] <b>Step 5 — Commit:</b> <code>feat(carrier): kernel-overlay driver with scratch-grade probe</code>.</li>
 </ul>
 
 <h3>Task 4 (T-F5-4): FUSE-overlay driver registration</h3>
 <p><b>Files:</b> Create <code>internal/carrier/fuse.go</code> (the driver's final registered form); Test <code>internal/carrier/fuse_test.go</code> (package <code>carrier_test</code>).</p>
-<p><b>Interfaces:</b> Consumes — Task 1 (its probe already lives in the registry). Produces — the FUSE-overlay driver in its Phase 2 form (Decision 5): the probe from Task 1 stands (it opens <code>/dev/fuse</code> and records the outcome), and <code>materialize</code>/<code>remove</code> refuse with an error carrying the probe's recorded reason, so a forced selection fails honestly instead of pretending. AC-F5-9 is owned here as its build home and recorded <b>host-deferred, not discharged</b>: <code>/dev/fuse</code> is absent in this sandbox, so the driver cannot be exercised here at all. The host follow-up this task's code comments must state: on a host with <code>/dev/fuse</code>, the mount implementation lands against the same isolation contract as AC-F5-5, and the probe reports availability only once the mount exists to back it.</p>
+<p><b>Interfaces:</b> Consumes — Task 1 (its probe already lives in the registry). Produces — the FUSE-overlay driver in its Phase 2 form (Decision 5): the probe from Task 1 stands (it examines <code>/dev/fuse</code>, records what it finds, and reports unavailable on every host until the mount lands — “<code>/dev/fuse</code> absent” here, “mount not implemented” on a host that has the device), and <code>materialize</code>/<code>remove</code> refuse with an error carrying the probe's recorded reason, so a forced selection fails honestly instead of pretending. AC-F5-9 is owned here as its build home and recorded <b>host-deferred, not discharged</b>: <code>/dev/fuse</code> is absent in this sandbox, so the driver cannot be exercised here at all. The host follow-up this task's code comments must state: on a host with <code>/dev/fuse</code>, the mount implementation lands against the same isolation contract as AC-F5-5, and the probe reports availability only once the mount exists to back it.</p>
 <ul>
 <li>[ ] <b>Step 1 — Failing tests:</b>
 <pre>func TestFuseMaterializeRefusesWithProbeReason(t *testing.T) {
@@ -336,7 +348,10 @@ func (s *Store) ArchiveScope(scope string) error
     // descriptive error), then delete refs/vcscore/scopes/&lt;scope&gt;
 
 func (s *Store) WorkspaceTreeID(commitID string) (string, error) // the workspace/ subtree's tree ID
-type WorkspaceEntry struct { Blob string; Symlink bool }
+type WorkspaceEntry struct { Blob string; Mode string; Symlink bool }
+    // Mode is the git tree mode (100644, 100755, 120000):
+    // a mode-only change is a real change in every delta,
+    // union, and verify computation below — never invisible
 func (s *Store) WorkspaceFiles(commitID string) (map[string]WorkspaceEntry, error)
     // every path under workspace/, relative to it
 func (s *Store) ExtractWorkspace(commitID, dir string) error
@@ -357,7 +372,7 @@ var ErrNoForkProvenance = errors.New("settle: no fork provenance for scope")
 func Fork(ctx *Context, parentScope, runScope string) (*carrier.Layer, error)
 func Select(ctx *Context, parentScope, parentDir, runScope, opID string) (store.Receipt, error)
 func Discard(ctx *Context, runScope, opID string) (store.Receipt, error)</pre>
-<p><code>Fork</code>: read the parent head; extract its workspace tree to <code>Root/bases/&lt;runScope&gt;</code>; select a carrier on <code>Root/layers</code> and materialize into a temporary layer root; only then create the scope ref (<code>Snaps.Fork</code>), write the sidecar (<code>Root/forks/&lt;runScope&gt;.json</code>: <code>{parent_scope, run_scope, fork_commit, base_tree}</code>, canonical JSON, fsynced), and rename the layer root into place — a layer is never handed out without provenance, and a crash between ref and sidecar leaves an inert ref the verbs refuse with <code>ErrNoForkProvenance</code> rather than a usable fork. <code>Select</code>: degenerate inputs first (empty <code>opID</code>, unknown scopes, missing sidecar — descriptive errors, nothing written); consume-once scan; probe-snapshot the parent directory (Decision 8(c)); the fast-forward check — the probe's workspace tree must equal the sidecar's <code>base_tree</code>, else <code>ErrParentAdvanced</code> and <b>no rebase or merge is attempted</b>; materialize the parent directory from the run head's tree (the shared <code>syncTree</code> helper: make the directory match a <code>WorkspaceFiles</code> map exactly — write new/changed, delete extras); verify by re-snapshotting and comparing file maps; <code>AdvanceScope(parent, headAtStart, runHead)</code>; <b>fact last</b> — <code>MintSettleSelect</code> on the run scope's path (Review Focus: ordering). <code>Discard</code>: consume-once scan; <code>ArchiveScope</code>; remove the layer (an already-missing layer is not an error); delete the sidecar; fact last via <code>MintSettleDiscard</code>. Consume-once is a scan of the run scope's <code>PathRecords</code> for any record whose schema ref is one of the three settlement refs — a scope settled by <i>any</i> verb is consumed for <i>every</i> verb (AC-F6-6). <i>Interim honesty (Decision 8(d)):</i> <code>syncTree</code> in this task is unjournaled; a crash mid-materialization can leave the parent directory between trees until Task 8 rebuilds <code>syncTree</code> on the journal without changing the verbs' contracts. Task 8 also inserts journal recovery at each verb's entry, at the point marked in this task's code.</p>
+<p><code>Fork</code>: read the parent head; extract its workspace tree to <code>Root/bases/&lt;runScope&gt;</code>; select a carrier on <code>Root/layers</code> and materialize into a temporary layer root; only then create the scope ref (<code>Snaps.Fork</code>), write the sidecar (<code>Root/forks/&lt;runScope&gt;.json</code>: <code>{parent_scope, run_scope, fork_commit, base_tree}</code>, canonical JSON, fsynced), and rename the layer root into place — a layer is never handed out without provenance, and a crash between ref and sidecar leaves an inert ref the verbs refuse with <code>ErrNoForkProvenance</code> rather than a usable fork. <code>Select</code>: degenerate inputs first (empty <code>opID</code>, unknown scopes, missing sidecar — descriptive errors, nothing written); consume-once scan; the fast-forward check — <code>ScopeHead(parentScope)</code> must equal the sidecar's <code>fork_commit</code>, else <code>ErrParentAdvanced</code> and <b>no rebase or merge is attempted</b> (advancement is a property of the parent head, not of its tree: a parent that advanced by a meta-only commit has an identical workspace tree and is still refused — a probe-tree comparison is not the test); materialize the parent directory from the run head's tree (the shared <code>syncTree</code> helper: make the directory match a <code>WorkspaceFiles</code> map exactly — write new/changed, where a mode-only difference counts as changed and is applied as a chmod, delete extras); verify by re-snapshotting and comparing file maps; <code>AdvanceScope(parent, fork_commit, runHead)</code>; <b>fact last</b> — <code>MintSettleSelect</code> on the run scope's path (Review Focus: ordering). <code>Discard</code>: consume-once scan; <code>ArchiveScope</code>; remove the layer (an already-missing layer is not an error); delete the sidecar; fact last via <code>MintSettleDiscard</code>. Consume-once is a scan of the run scope's <code>PathRecords</code> for any record whose schema ref is one of the three settlement refs — a scope settled by <i>any</i> verb is consumed for <i>every</i> verb (AC-F6-6). <i>Interim honesty (Decision 8(d)):</i> <code>syncTree</code> in this task is unjournaled; a crash mid-materialization can leave the parent directory between trees until Task 8 rebuilds <code>syncTree</code> on the journal without changing the verbs' contracts. The interim also carries a post-CAS/pre-fact window: a crash after <code>AdvanceScope</code> moves the parent head but before the fact is minted leaves the head moved with no fact recorded, and a naive retry of the verb reads that moved head as an advanced parent (<code>ErrParentAdvanced</code>) even though the move was the crashed verb's own. Task 8 closes both windows — it inserts journal recovery at each verb's entry, at the point marked in this task's code, so a crashed predecessor is completed or rolled back before any new verb is judged.</p>
 <ul>
 <li>[ ] <b>Step 1 — Failing tests (snapshot surface):</b>
 <pre>func TestScopeHeadAdvanceArchive(t *testing.T) {
@@ -373,10 +388,11 @@ func Discard(ctx *Context, runScope, opID string) (store.Receipt, error)</pre>
 func TestWorkspaceFilesAndExtract(t *testing.T) {
     // snapshot a workspace (files, a subdir, a symlink, an
     // executable); WorkspaceFiles == the ls-tree ground truth
-    // (paths, blob IDs, symlink flags); WorkspaceTreeID ==
+    // (paths, blob IDs, modes, symlink flags); WorkspaceTreeID ==
     // the commit's workspace subtree ID
     // ExtractWorkspace into a fresh dir → byte-equal tree,
-    // symlink preserved as a symlink
+    // symlink preserved as a symlink, the executable's mode
+    // preserved (100755 — not flattened to 100644)
     // an empty-workspace commit → empty map; extract → empty dir
 }</pre>
 Run: <code>go test ./internal/snapshot/ -run 'TestScopeHead|TestWorkspaceFiles' -count=1</code> — Expected: FAIL (no such methods).</li>
@@ -402,10 +418,19 @@ Run: <code>go test ./internal/store/ -run TestSettle -count=1</code> — Expecte
 // snapshot; settle.Fork a run scope; the run harness advances
 // the run line by snapshotting the layer and AdvanceScope-ing
 // the run scope (the caller's composition, per Interfaces).
+// The settle Context.Root sits on a btrfs scratch dir under
+// the working directory — never a tmpfs temp dir — so Fork's
+// carrier selection on Root/layers lands on the copy carrier
+// (AC-F5-2's recorded truth for btrfs) and every verb fixture
+// in Tasks 6–8 exercises the same carrier deterministically;
+// on tmpfs, selection would hand Fork a kernel-overlay layer
+// and the carrier under test would vary with the host.
 
 func TestSelectFastForwardsUnadvancedParent(t *testing.T) {
-    // run layer: add a file, modify one; advance the run line
-    // Select → parentDir serves exactly the run head's tree;
+    // run layer: add a file, add an executable (mode 100755),
+    // modify one; advance the run line
+    // Select → parentDir serves exactly the run head's tree,
+    // the executable's mode intact (not flattened to 0644);
     // ScopeHead(parent) == run head; exactly one settle-select
     // fact on the run path, caused_by == the pre-verb frontier
 }
@@ -416,6 +441,10 @@ func TestSelectRefusesAdvancedParent(t *testing.T) {
     // Select → ErrParentAdvanced; parent scope head unmoved;
     // parentDir bytes unchanged; no fact minted; no merge or
     // rebase artifact anywhere (AC-F6-1's failure witness)
+    // second leg: the parent advances by a meta-only snapshot
+    // (identical workspace tree, new commit) → still
+    // ErrParentAdvanced: advancement is a property of the
+    // head, not the tree
 }
 
 func TestDiscardArchivesNeverDeletes(t *testing.T) {
@@ -456,7 +485,7 @@ Run: <code>go test ./internal/settle/ -run TestSelectConcurrentRace -count=1</co
 <pre>var ErrOverlap = errors.New("settle: run and parent changes overlap")
 
 func Apply(ctx *Context, parentScope, parentDir, runScope, opID string) (store.Receipt, error)</pre>
-<p>Apply's shape is <b>artifacts before side effects</b> (the journal task's sequence, started here): (1) degenerate and consume-once checks, sidecar load; (2) probe-snapshot the parent (Decision 8(c)) and compute the three file maps — fork tree <i>F</i> (sidecar <code>base_tree</code>'s commit), run head <i>R</i>, parent current <i>P</i> — and the two deltas against <i>F</i> (added / deleted / blob-changed path sets); (3) the disjointness census over run-delta × parent-delta (below) — any overlap refuses with <code>ErrOverlap</code> naming the offending pair, and nothing has been written but probe snapshots; (4) build the expected union map <i>U</i> from the three maps, then build the union <i>tree</i> in a staging directory (extract <i>F</i>, overlay the parent delta from an extraction of <i>P</i>, overlay the run delta from an extraction of <i>R</i>, apply deletions) and snapshot the staging directory — the result commit exists as a durable artifact <b>before</b> the parent directory is touched, and its file map must equal <i>U</i> exactly or the verb fails as an internal error with the parent untouched; (5) <code>syncTree</code> the parent directory from the staging tree, verify by re-snapshotting (file map == <i>U</i>); (6) <code>AdvanceScope(parent, headAtStart, resultCommit)</code>; (7) fact last — <code>MintSettleApply</code> with <code>settled_paths</code> = the run delta's paths, sorted. An empty run delta is a descriptive refusal (nothing to settle — the degenerate-input discipline; select is the verb for the no-parent-change case). The disjointness predicate: two relative paths overlap iff, after cleaning, they are equal or one is a directory-prefix of the other — <i>or</i> their canonical forms in the parent's current tree do. Canonical form: clean the path, then resolve symlinks over its longest existing ancestor inside the parent directory and re-append the remainder; two paths whose canonical forms are equal or prefix-related are aliases and overlap. (The run's paths are judged against the parent's tree because that is where they would land.) No content merge is ever synthesized: apply moves whole files whose blobs come from <i>R</i> or <i>P</i>, nothing else.</p>
+<p>Apply's shape is <b>artifacts before side effects</b> (the journal task's sequence, started here): (1) degenerate and consume-once checks, sidecar load; (2) probe-snapshot the parent (Decision 8(c)) and compute the three file maps — fork tree <i>F</i> (sidecar <code>base_tree</code>'s commit), run head <i>R</i>, parent current <i>P</i> — and the two deltas against <i>F</i> (added / deleted / changed path sets — <i>changed</i> means blob-changed <b>or mode-changed</b>: a mode-only change, the same blob under a new mode, is a delta change and lands in the union with its new mode); (3) the disjointness census over run-delta × parent-delta (below) — any overlap refuses with <code>ErrOverlap</code> naming the offending pair, and nothing has been written but probe snapshots; (4) build the expected union map <i>U</i> from the three maps, then build the union <i>tree</i> in a staging directory (extract <i>F</i>, overlay the parent delta from an extraction of <i>P</i>, overlay the run delta from an extraction of <i>R</i>, apply deletions) and snapshot the staging directory — the result commit exists as a durable artifact <b>before</b> the parent directory is touched, and its file map must equal <i>U</i> exactly or the verb fails as an internal error with the parent untouched; (5) <code>syncTree</code> the parent directory from the staging tree, verify by re-snapshotting (file map == <i>U</i>); (6) <code>AdvanceScope(parent, headAtStart, resultCommit)</code>; (7) fact last — <code>MintSettleApply</code> with <code>settled_paths</code> = the run delta's paths, sorted. An empty run delta is a descriptive refusal (nothing to settle — the degenerate-input discipline; select is the verb for the no-parent-change case). The disjointness predicate: two relative paths overlap iff, after cleaning, they are equal or one is a directory-prefix of the other — <i>or</i> their canonical forms in the parent's current tree do. Canonical form: clean the path, then resolve symlinks over its longest existing ancestor inside the parent directory and re-append the remainder; two paths whose canonical forms are equal or prefix-related are aliases and overlap. (The run's paths are judged against the parent's tree because that is where they would land.) No content merge is ever synthesized: apply moves whole files whose blobs come from <i>R</i> or <i>P</i>, nothing else.</p>
 <ul>
 <li>[ ] <b>Step 1 — Failing test (the predicate census; AC-F6-2/AC-F6-3's shapes, pure):</b>
 <pre>func TestDisjointCensus(t *testing.T) {
@@ -480,6 +509,26 @@ Run: <code>go test ./internal/settle/ -run TestDisjointCensus -count=1</code> �
     //   tree); ScopeHead(parent) == the result commit;
     //   WorkspaceFiles(result) == U; the apply fact's
     //   settled_paths == the run delta, sorted
+}
+
+func TestApplySettlesModeOnlyChange(t *testing.T) {
+    // fixture as in Task 6; after Fork:
+    //   run chmods run.sh (mode-only: same blob, 100644 →
+    //   100755); parent edits a disjoint file
+    // Apply → the settled tree carries the new mode:
+    //   WorkspaceFiles(result)["run.sh"].Mode == "100755",
+    //   and run.sh is in the run delta and in settled_paths
+}
+
+func TestApplySettlesAliasShapedDisjoint(t *testing.T) {
+    // fixture as in Task 6; the fork tree contains link → sub
+    // (a symlink); after Fork:
+    //   run modifies link/f.txt (canonical: sub/f.txt)
+    //   parent modifies sub/g.txt (canonical: sub/g.txt) —
+    //   an alias-shaped near-miss, genuinely disjoint
+    // Apply → SUCCEEDS (no false refusal): the parent tree
+    //   serves sub/f.txt with the run's bytes and sub/g.txt
+    //   with the parent's, byte-exact
 }</pre>
 Run: <code>go test ./internal/settle/ -run TestApplySettles -count=1</code> — Expected: FAIL (no Apply).</li>
 <li>[ ] <b>Step 4 — Implement <code>apply.go</code>.</b> Run — Expected: PASS.</li>
@@ -499,14 +548,25 @@ Run: <code>go test ./internal/settle/ -run TestApplySettles -count=1</code> — 
 }</pre>
 Run: <code>go test ./internal/settle/ -run TestApplyRefuses -count=1</code> — Expected: FAIL on the alias leg (a string-only predicate passes it) until canonicalization lands.</li>
 <li>[ ] <b>Step 6 — Implement canonicalization</b> (longest-existing-ancestor symlink resolution against the parent directory). Run the full settle suite — Expected: PASS, including Task 6's tests unedited.</li>
-<li>[ ] <b>Step 7 — Commit:</b> <code>feat(settle): path-disjoint apply, fail-closed</code>.</li>
+<li>[ ] <b>Step 7 — Failing test (consume-once, cross-verb with Apply; AC-F6-6):</b>
+<pre>func TestConsumeOnceAcrossVerbsWithApply(t *testing.T) {
+    // after a successful Select: Apply on the same run scope
+    //   → ErrScopeConsumed
+    // after a successful Apply: Select on the same run scope
+    //   → ErrScopeConsumed; a second Apply → ErrScopeConsumed
+    // (the consume-once scan is Task 6's shared code; these
+    // cases pin it for the verb Task 6 could only name in a
+    // test comment)
+}</pre>
+Run: <code>go test ./internal/settle/ -run TestConsumeOnceAcrossVerbsWithApply -count=1</code> — Expected: FAIL if Apply's entry path skips the scan.</li>
+<li>[ ] <b>Step 8 — Commit:</b> <code>feat(settle): path-disjoint apply, fail-closed</code>.</li>
 </ul>
 
 <h3>Task 8 (T-F6-3): Journaled materialization and crash recovery</h3>
 <p><b>Files:</b> Create <code>internal/settle/journal.go</code> (journal format, journaled materializer, <code>Recover</code>); Modify <code>internal/settle/settle.go</code> and <code>internal/settle/apply.go</code> (verbs route materialization through the journal; recovery at verb entry); Test <code>internal/settle/journal_test.go</code>, <code>internal/settle/crash_test.go</code> (package <code>settle</code> — the crash child needs the unexported hook, Phase 1 Task 6's re-exec precedent).</p>
 <p><b>Interfaces:</b> Consumes — Tasks 6–7. Produces —</p>
 <pre>func Recover(ctx *Context, parentScope string) error</pre>
-<p>Journal law. One journal per parent scope: <code>Root/journals/&lt;parentScope&gt;.json</code>, canonical JSON, fsynced at every state change. Contents: <code>{op, verb, parent_scope, run_scope, state, old_head, result_commit, units}</code> where <code>state</code> is <code>planned</code> → <code>applying</code> → <code>verified</code>, and each unit is <code>{path, kind: write|delete, done}</code>. The materializer (replacing Task 6/7's bare <code>syncTree</code> at both verbs' commit points): <b>preflight</b> — the staging tree already holds the durable result artifact (Task 7's shape; for select, an extraction of the run head); copy the <i>preimage</i> of every unit target that exists (into <code>Root/staging/&lt;op&gt;/pre/</code>); write the journal in state <code>planned</code> and fsync — all before the first side effect. <b>Apply</b> — per unit: write via temp file + rename in the target directory (atomic per file) or delete; mark the unit done; rewrite + fsync the journal. <b>Verify</b> — re-snapshot the parent; its file map must equal the result artifact's, then journal state <code>verified</code> (+ <code>result_commit</code>) and fsync. The verb then completes the commit point (CAS + fact, Task 6/7's order) and clears journal + staging. <code>Recover</code>: no journal → nil. Journal fails to decode or validate → descriptive error, <b>no writes</b>, journal left in place (Review Focus). State <code>verified</code> → complete the commit point idempotently: if the parent scope head is still <code>old_head</code>, <code>AdvanceScope(old_head → result_commit)</code>; if it is already <code>result_commit</code>, proceed; anything else is a descriptive refusal (the line moved under a crashed verb — recovery does not guess). Then mint the verb's fact iff no fact carries this <code>op</code>; clear journal + staging. State <code>planned</code>/<code>applying</code> → roll back: for each done unit in reverse, restore its preimage (or remove a file the unit created); the parent is then exactly pre-apply; clear journal + staging. Every verb (<code>Select</code>, <code>Apply</code>) calls <code>Recover</code> for its parent scope at entry — a crashed predecessor is resolved before new work, by whichever handle or process comes next. The crash hook for tests: an unexported <code>var unitCrashHook func(done int)</code> in the settle package, invoked after each unit's journal mark; the crash test's child process sets it from an environment variable and calls <code>os.Exit</code> — the Phase 1 store fault-injection pattern, including its reporting discipline: the child entry test, <code>TestSettleCrashChild</code>, reports SKIP in the parent process and is named as the settle package's sole skip exception in <code>check-phase2.sh</code> (Task 10).</p>
+<p>Journal law. One journal per parent scope: <code>Root/journals/&lt;parentScope&gt;.json</code>, canonical JSON, fsynced at every state change. Contents: <code>{op, verb, parent_scope, run_scope, state, old_head, result_commit, fact, units}</code> where <code>state</code> is <code>planned</code> → <code>applying</code> → <code>verified</code>, and each unit is <code>{path, kind: write|delete, done}</code>. <code>fact</code> is the verb's complete settlement fact body (Decision 4's shapes), computed by the verb and recorded at <code>planned</code> time, before the first side effect — for apply it carries <code>fork_commit</code> (from the sidecar) and <code>settled_paths</code> (the run delta, final once the census has run), so <code>Recover</code> mints the fact from the journal alone and never has to reconstruct it. For select, <code>result_commit</code> <i>is</i> the run scope's head — the commit <code>AdvanceScope</code> moves the parent scope to — and the stored select body carries <code>parent_head = old_head</code> and <code>run_head = result_commit</code>. The materializer (replacing Task 6/7's bare <code>syncTree</code> at both verbs' commit points): <b>preflight</b> — the staging tree already holds the durable result artifact (Task 7's shape; for select, an extraction of the run head); copy the <i>preimage</i> of every unit target that exists (into <code>Root/staging/&lt;op&gt;/pre/</code>); write the journal in state <code>planned</code> and fsync — all before the first side effect. <b>Apply</b> — per unit: write via temp file + rename in the target directory (atomic per file) or delete; mark the unit done; rewrite + fsync the journal. <b>Verify</b> — re-snapshot the parent; its file map must equal the result artifact's, then journal state <code>verified</code> (+ <code>result_commit</code>) and fsync. The verb then completes the commit point (CAS + fact, Task 6/7's order) and clears journal + staging. <code>Recover</code>: no journal → nil. Journal fails to decode or validate → descriptive error, <b>no writes</b>, journal left in place (Review Focus). State <code>verified</code> → complete the commit point idempotently: if the parent scope head is still <code>old_head</code>, <code>AdvanceScope(old_head → result_commit)</code>; if it is already <code>result_commit</code>, proceed; anything else is a descriptive refusal (the line moved under a crashed verb — recovery does not guess). Then mint the verb's fact from the journal's recorded <code>fact</code> body iff no fact carries this <code>op</code>; clear journal + staging. State <code>planned</code>/<code>applying</code> → roll back: for each done unit in reverse, restore its preimage (or remove a file the unit created); the parent is then exactly pre-apply; clear journal + staging. Every verb (<code>Select</code>, <code>Apply</code>) calls <code>Recover</code> for its parent scope at entry — a crashed predecessor is resolved before new work, by whichever handle or process comes next. The crash hook for tests: an unexported <code>var unitCrashHook func(done int)</code> in the settle package, invoked after each unit's journal mark; the crash test's child process sets it from an environment variable and calls <code>os.Exit</code> — the Phase 1 store fault-injection pattern, including its reporting discipline: the child entry test, <code>TestSettleCrashChild</code>, reports SKIP in the parent process and is named as the settle package's sole skip exception in <code>check-phase2.sh</code> (Task 10).</p>
 <ul>
 <li>[ ] <b>Step 1 — Failing test (journal round-trip and the corrupt-journal refusal; input shape):</b>
 <pre>func TestRecoverRejectsCorruptJournal(t *testing.T) {
@@ -518,7 +578,7 @@ Run: <code>go test ./internal/settle/ -run TestApplyRefuses -count=1</code> — 
     // and: no journal at all → Recover returns nil
 }</pre>
 Run: <code>go test ./internal/settle/ -run TestRecover -count=1</code> — Expected: FAIL (no journal).</li>
-<li>[ ] <b>Step 2 — Implement the journal and <code>Recover</code>'s rollback/completion halves</b> against hand-built journal fixtures (a <code>planned</code> journal with two done units rolls the parent back byte-exactly; a <code>verified</code> journal completes: ref advanced, fact minted once, journal cleared).</li>
+<li>[ ] <b>Step 2 — Implement the journal and <code>Recover</code>'s rollback/completion halves</b> against hand-built journal fixtures built to the format above, recorded <code>fact</code> body included (a <code>planned</code> journal with two done units rolls the parent back byte-exactly; a <code>verified</code> journal completes: ref advanced, fact minted once from the recorded body, journal cleared).</li>
 <li>[ ] <b>Step 3 — Route both verbs through the journaled materializer.</b> Run the full settle suite — Expected: PASS, Tasks 6–7 tests unedited (the journal is below their contracts).</li>
 <li>[ ] <b>Step 4 — Failing test (AC-F6-4, the fault-injection gate proof in miniature; timing + handle shapes):</b>
 <pre>func TestApplyCrashRecovery(t *testing.T) {
@@ -534,7 +594,7 @@ Run: <code>go test ./internal/settle/ -run TestRecover -count=1</code> — Expec
     //   and the scope advanced; if pre: no fact, scope
     //   unmoved, and a fresh Apply of the same work succeeds
 }</pre>
-Run: <code>go test ./internal/settle/ -run TestApplyCrashRecovery -count=1</code> — Expected: FAIL until recovery is exact at every boundary.</li>
+Run: <code>go test ./internal/settle/ -run TestApplyCrashRecovery -count=1</code> — Expected: FAIL until recovery is exact at every boundary. The kill points are enumerated deterministically — {0, 1, 2, all} spans every unit boundary of this fixture — which is strictly stronger than AC-F6-4's “randomized points” wording: every boundary a random draw could land on is exercised on every run.</li>
 <li>[ ] <b>Step 5 — Failing test (crash after verify, before the commit point):</b>
 <pre>func TestRecoverCompletesVerifiedJournal(t *testing.T) {
     // the child dies after the journal reaches verified but
@@ -581,15 +641,25 @@ Run: <code>go test ./internal/settle/ -run TestWritePathAudit -count=1</code> �
 <p><b>Files:</b> Create <code>internal/conformance/phase2_gate_test.go</code> (package <code>conformance_test</code>), <code>scripts/check-phase2.sh</code>.</p>
 <p><b>Interfaces:</b> Consumes — everything above. Produces — the assembled gate evidence for AC-F5-6 (owned here) with AC-F6-1, AC-F6-2, AC-F6-3, AC-F6-4 re-discharged in assembled form, and the one-command gate script.</p>
 <ul>
-<li>[ ] <b>Step 1 — Failing test (the gate demonstration):</b> <code>TestPhase2Gate</code> runs one settlement story end-to-end, in a temp dir except where the gate clause names the real repo:
-<pre>// 1. stores opened in a temp dir; a fixture git repo as the
-//    parent workspace (files in a/, x/, old.txt); snapshot it;
-//    parent scope adopted at that commit
+<li>[ ] <b>Step 1 — Failing test (the gate demonstration):</b> <code>TestPhase2Gate</code> runs one settlement story end-to-end, in a temp dir (the stores) and a btrfs scratch dir under the working directory (the settle root — leg 1 states why), except where the gate clause names the real repo:
+<pre>// 1. trace/snapshot stores opened in a temp dir; the settle
+//    Context.Root on a btrfs scratch dir under the working
+//    directory — never the temp dir: Fork selects its carrier
+//    on Root/layers, and on a tmpfs root selection returns
+//    kernel-overlay, silently discharging leg 2 through the
+//    wrong carrier (AC-F5-6 names the copy carrier). A
+//    fixture git repo as the parent workspace (files in a/,
+//    x/, old.txt); snapshot it; parent scope adopted at that
+//    commit
 // 2. AC-F5-6 leg — fork THIS repository (the checkout the test
 //    runs in, located from the test file's path) via the copy
-//    carrier: write a probe file in the layer; assert the base
-//    repo's `git status --porcelain` is unchanged and the probe
-//    file does not exist in the base working tree
+//    carrier: assert the forked layer reports the copy driver
+//    (the selection record is the evidence the AC ran as
+//    specified); write a probe file in the layer; assert the
+//    base repo's `git status --porcelain` is unchanged, the
+//    probe file does not exist in the base working tree, and
+//    the base repo's refs are untouched (a for-each-ref
+//    digest taken before the fork equals the one after)
 // 3. run-1 forked from the fixture parent; the run adds x/y.txt,
 //    modifies a/b.txt, deletes old.txt (snapshot + advance)
 // 4. the parent advances disjointly: modifies a/b-c.txt and
