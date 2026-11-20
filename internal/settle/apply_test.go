@@ -634,3 +634,206 @@ func TestApplyRefusesOverlapShapes(t *testing.T) {
 		})
 	}
 }
+
+// assertSettledUnion pins a successful Apply's end state: the
+// parent directory serves exactly the hand-built expected tree
+// byte-for-byte (walk hash), the parent scope head's file map
+// equals the union of the three maps, and exactly one apply
+// fact — the returned receipt — names wantPaths as its
+// settled_paths.
+func assertSettledUnion(t *testing.T, f *fixture, receipt store.Receipt, forkHead, parentHead, runHead, expectedDir string, wantPaths []string) {
+	t.Helper()
+	if got, want := walkHash(t, f.parentDir), walkHash(t, expectedDir); got != want {
+		t.Fatalf("parentDir walk hash = %s, want expected union %s", got, want)
+	}
+	result, err := f.snaps.ScopeHead("parent")
+	if err != nil {
+		t.Fatalf("ScopeHead(parent): %v", err)
+	}
+	forkMap, err := f.snaps.WorkspaceFiles(forkHead)
+	if err != nil {
+		t.Fatalf("WorkspaceFiles(fork): %v", err)
+	}
+	runMap, err := f.snaps.WorkspaceFiles(runHead)
+	if err != nil {
+		t.Fatalf("WorkspaceFiles(run): %v", err)
+	}
+	parentMap, err := f.snaps.WorkspaceFiles(parentHead)
+	if err != nil {
+		t.Fatalf("WorkspaceFiles(parent): %v", err)
+	}
+	resultMap, err := f.snaps.WorkspaceFiles(result)
+	if err != nil {
+		t.Fatalf("WorkspaceFiles(result): %v", err)
+	}
+	if want := unionOf(forkMap, parentMap, runMap); !reflect.DeepEqual(resultMap, want) {
+		t.Fatalf("WorkspaceFiles(result) = %v, want union %v", resultMap, want)
+	}
+	facts := applyFacts(t, f, "run-a")
+	if len(facts) != 1 || facts[0].ID != receipt.RecordID {
+		t.Fatalf("apply facts on run-a = %v, want exactly the apply receipt %s", facts, receipt.RecordID)
+	}
+	if got := factStringList(t, factBody(t, facts[0]), "settled_paths"); !reflect.DeepEqual(got, wantPaths) {
+		t.Fatalf("settled_paths = %v, want run delta sorted %v", got, wantPaths)
+	}
+}
+
+// TestApplySettlesDirToFileSwap (whole-branch final review,
+// blocking item (b); AC-F6-2): a directory→file shape swap —
+// a directory in the fork tree replaced by a file — on either
+// side is a genuinely disjoint delta when the other side never
+// touched that subtree, and it must settle to the byte-exact
+// union. Inside the union builder, the sorted overlay pass
+// lands the file at old.txt first, clearing the directory; the
+// delete of the orphaned descendant old.txt/inner.txt then
+// names a path under a file. That target is already gone —
+// the journal's targetGone tolerance (Task 8) mirrored in the
+// overlay — not an abort.
+func TestApplySettlesDirToFileSwap(t *testing.T) {
+	build := func(dir string) {
+		writeTestFile(t, filepath.Join(dir, "old.txt", "inner.txt"), "inner original\n", 0o644)
+		writeTestFile(t, filepath.Join(dir, "p.txt"), "p original\n", 0o644)
+		writeTestFile(t, filepath.Join(dir, "r.txt"), "r original\n", 0o644)
+	}
+	swap := func(t *testing.T, dir, content string) {
+		t.Helper()
+		if err := os.RemoveAll(filepath.Join(dir, "old.txt")); err != nil {
+			t.Fatalf("remove old.txt directory: %v", err)
+		}
+		writeTestFile(t, filepath.Join(dir, "old.txt"), content, 0o644)
+	}
+
+	t.Run("run side", func(t *testing.T) {
+		f := newFixture(t)
+		forkHead := extendParentTree(t, f, build)
+		layer, err := settle.Fork(f.ctx, "parent", "run-a")
+		if err != nil {
+			t.Fatalf("Fork: %v", err)
+		}
+		swap(t, layer.Dir, "swapped by run\n")
+		runHead := f.advanceRun(t, layer, "run-a", forkHead)
+
+		// The parent changes a disjoint path.
+		writeTestFile(t, filepath.Join(f.parentDir, "p.txt"), "p parent\n", 0o644)
+		parentHead := advanceParent(t, f)
+
+		receipt, err := settle.Apply(f.ctx, "parent", f.parentDir, "run-a", "op-1")
+		if err != nil {
+			t.Fatalf("Apply of disjoint run-side dir-to-file swap: %v", err)
+		}
+		expectedDir := filepath.Join(filepath.Dir(f.root), "expected-run-swap")
+		writeTestFile(t, filepath.Join(expectedDir, "keep.txt"), "keep\n", 0o644)
+		writeTestFile(t, filepath.Join(expectedDir, "mod.txt"), "original\n", 0o644)
+		writeTestFile(t, filepath.Join(expectedDir, "old.txt"), "swapped by run\n", 0o644)
+		writeTestFile(t, filepath.Join(expectedDir, "p.txt"), "p parent\n", 0o644)
+		writeTestFile(t, filepath.Join(expectedDir, "r.txt"), "r original\n", 0o644)
+		assertSettledUnion(t, f, receipt, forkHead, parentHead, runHead, expectedDir,
+			[]string{"old.txt", "old.txt/inner.txt"})
+	})
+
+	t.Run("parent side", func(t *testing.T) {
+		f := newFixture(t)
+		forkHead := extendParentTree(t, f, build)
+		layer, err := settle.Fork(f.ctx, "parent", "run-a")
+		if err != nil {
+			t.Fatalf("Fork: %v", err)
+		}
+		writeTestFile(t, filepath.Join(layer.Dir, "r.txt"), "r run\n", 0o644)
+		runHead := f.advanceRun(t, layer, "run-a", forkHead)
+
+		// The parent performs the swap on its side.
+		swap(t, f.parentDir, "swapped by parent\n")
+		parentHead := advanceParent(t, f)
+
+		receipt, err := settle.Apply(f.ctx, "parent", f.parentDir, "run-a", "op-1")
+		if err != nil {
+			t.Fatalf("Apply of disjoint parent-side dir-to-file swap: %v", err)
+		}
+		expectedDir := filepath.Join(filepath.Dir(f.root), "expected-parent-swap")
+		writeTestFile(t, filepath.Join(expectedDir, "keep.txt"), "keep\n", 0o644)
+		writeTestFile(t, filepath.Join(expectedDir, "mod.txt"), "original\n", 0o644)
+		writeTestFile(t, filepath.Join(expectedDir, "old.txt"), "swapped by parent\n", 0o644)
+		writeTestFile(t, filepath.Join(expectedDir, "p.txt"), "p original\n", 0o644)
+		writeTestFile(t, filepath.Join(expectedDir, "r.txt"), "r run\n", 0o644)
+		assertSettledUnion(t, f, receipt, forkHead, parentHead, runHead, expectedDir,
+			[]string{"r.txt"})
+	})
+}
+
+// TestApplySettlesFileToDirSwap (whole-branch final review,
+// blocking item (b); AC-F6-2): the symmetric shape swap — a
+// file in the fork tree replaced by a directory with contents
+// — on either side. The sorted overlay pass deletes the file
+// at old.txt before writing the entries beneath it, so this
+// direction settles through the same pass; these fixtures pin
+// that it does, to the byte-exact union.
+func TestApplySettlesFileToDirSwap(t *testing.T) {
+	build := func(dir string) {
+		writeTestFile(t, filepath.Join(dir, "old.txt"), "file original\n", 0o644)
+		writeTestFile(t, filepath.Join(dir, "p.txt"), "p original\n", 0o644)
+		writeTestFile(t, filepath.Join(dir, "r.txt"), "r original\n", 0o644)
+	}
+	swap := func(t *testing.T, dir, content string) {
+		t.Helper()
+		if err := os.Remove(filepath.Join(dir, "old.txt")); err != nil {
+			t.Fatalf("remove old.txt file: %v", err)
+		}
+		writeTestFile(t, filepath.Join(dir, "old.txt", "inner.txt"), content, 0o644)
+	}
+
+	t.Run("run side", func(t *testing.T) {
+		f := newFixture(t)
+		forkHead := extendParentTree(t, f, build)
+		layer, err := settle.Fork(f.ctx, "parent", "run-a")
+		if err != nil {
+			t.Fatalf("Fork: %v", err)
+		}
+		swap(t, layer.Dir, "inner by run\n")
+		runHead := f.advanceRun(t, layer, "run-a", forkHead)
+
+		// The parent changes a disjoint path.
+		writeTestFile(t, filepath.Join(f.parentDir, "p.txt"), "p parent\n", 0o644)
+		parentHead := advanceParent(t, f)
+
+		receipt, err := settle.Apply(f.ctx, "parent", f.parentDir, "run-a", "op-1")
+		if err != nil {
+			t.Fatalf("Apply of disjoint run-side file-to-dir swap: %v", err)
+		}
+		expectedDir := filepath.Join(filepath.Dir(f.root), "expected-run-swap")
+		writeTestFile(t, filepath.Join(expectedDir, "keep.txt"), "keep\n", 0o644)
+		writeTestFile(t, filepath.Join(expectedDir, "mod.txt"), "original\n", 0o644)
+		writeTestFile(t, filepath.Join(expectedDir, "old.txt", "inner.txt"), "inner by run\n", 0o644)
+		writeTestFile(t, filepath.Join(expectedDir, "p.txt"), "p parent\n", 0o644)
+		writeTestFile(t, filepath.Join(expectedDir, "r.txt"), "r original\n", 0o644)
+		assertSettledUnion(t, f, receipt, forkHead, parentHead, runHead, expectedDir,
+			[]string{"old.txt", "old.txt/inner.txt"})
+	})
+
+	t.Run("parent side", func(t *testing.T) {
+		f := newFixture(t)
+		forkHead := extendParentTree(t, f, build)
+		layer, err := settle.Fork(f.ctx, "parent", "run-a")
+		if err != nil {
+			t.Fatalf("Fork: %v", err)
+		}
+		writeTestFile(t, filepath.Join(layer.Dir, "r.txt"), "r run\n", 0o644)
+		runHead := f.advanceRun(t, layer, "run-a", forkHead)
+
+		// The parent performs the swap on its side.
+		swap(t, f.parentDir, "inner by parent\n")
+		parentHead := advanceParent(t, f)
+
+		receipt, err := settle.Apply(f.ctx, "parent", f.parentDir, "run-a", "op-1")
+		if err != nil {
+			t.Fatalf("Apply of disjoint parent-side file-to-dir swap: %v", err)
+		}
+		expectedDir := filepath.Join(filepath.Dir(f.root), "expected-parent-swap")
+		writeTestFile(t, filepath.Join(expectedDir, "keep.txt"), "keep\n", 0o644)
+		writeTestFile(t, filepath.Join(expectedDir, "mod.txt"), "original\n", 0o644)
+		writeTestFile(t, filepath.Join(expectedDir, "old.txt", "inner.txt"), "inner by parent\n", 0o644)
+		writeTestFile(t, filepath.Join(expectedDir, "p.txt"), "p original\n", 0o644)
+		writeTestFile(t, filepath.Join(expectedDir, "r.txt"), "r run\n", 0o644)
+		assertSettledUnion(t, f, receipt, forkHead, parentHead, runHead, expectedDir,
+			[]string{"r.txt"})
+	})
+}

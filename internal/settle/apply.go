@@ -3,7 +3,6 @@ package settle
 import (
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -265,7 +264,14 @@ func buildUnionTree(ctx *Context, forkCommit, parentCommit, runCommit string, pa
 // no content is merged. Sorted order places a prefix path
 // before its descendants, so a deletion that changes a path's
 // shape lands before the entries beneath it are written, and a
-// deletion whose path is already gone is not an error.
+// deletion whose path is already gone is not an error. Already
+// gone includes the shape-swap case (targetGone, the journal's
+// tolerance mirrored): a directory→file swap in the same pass
+// lands the file at the prefix path first, clearing the
+// directory, so the delete of a descendant beneath it fails
+// ENOTDIR — the descendant was destroyed by that write, and
+// the absence the delete asks for holds. Any other delete
+// failure still aborts.
 func overlayDelta(ctx *Context, stage, commit string, d treeDelta) error {
 	if len(d.paths) == 0 {
 		return nil
@@ -282,7 +288,7 @@ func overlayDelta(ctx *Context, stage, commit string, d treeDelta) error {
 	for _, rel := range d.paths {
 		dst := filepath.Join(stage, filepath.FromSlash(rel))
 		if d.deleted[rel] {
-			if err := os.Remove(dst); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			if err := os.Remove(dst); err != nil && !targetGone(err) {
 				return fmt.Errorf("settle: apply deletion of %s in union staging: %w", rel, err)
 			}
 			continue
