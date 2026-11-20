@@ -18,6 +18,32 @@ type driver interface {
 	remove(l *Layer) error
 }
 
+// viewDriver is a driver that manages the view directory
+// itself: a mountpoint cannot be built in a staging sibling and
+// renamed into place, so the shared lifecycle creates the view
+// at its final path in the layer root and the driver populates
+// it there, keeping its own state as the view's siblings. The
+// lifecycle still owns the marker law and the layer root's
+// deletion.
+type viewDriver interface {
+	driver
+	materializeView(baseDir, layerRoot, viewDir string) error
+}
+
+// remnantRecoverer is a driver that can recognize and recover
+// its own crash remnant in a markerless layer root: the exact
+// layout a crash between the driver's state creation and the
+// marker write leaves behind. recoverRemnant reports whether
+// the root held exactly that layout; a recognized remnant has
+// its driver state released and its contents wiped, and true is
+// returned so the caller proceeds to build. Any other shape
+// returns false and stays subject to the foreign-directory law
+// — recognition is by exact layout, never by emptiness or name
+// similarity.
+type remnantRecoverer interface {
+	recoverRemnant(layerRoot string) (bool, error)
+}
+
 // driverByID returns the registered driver with the given ID.
 func driverByID(id DriverID) (driver, bool) {
 	for _, d := range drivers {
@@ -54,7 +80,7 @@ func (d stubDriver) remove(*Layer) error {
 // Package-internal tests may substitute it; the public Select
 // always reads this list.
 var drivers = []driver{
-	stubDriver{driverID: DriverKernelOverlay, probeFn: probeKernelOverlay},
+	kernelOverlayDriver(),
 	stubDriver{driverID: DriverFuseOverlay, probeFn: probeFuse},
 	stubDriver{driverID: DriverReflink, probeFn: probeReflink},
 	copyDriver{},

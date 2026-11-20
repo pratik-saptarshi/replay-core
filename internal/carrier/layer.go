@@ -81,6 +81,7 @@ func Materialize(sel Selection, baseDir, baseID, layerRoot string) (*Layer, erro
 	}
 
 	preExisted := false
+	var oldMarker *layerMarker
 	if info, err := os.Stat(layerRoot); err == nil {
 		if !info.IsDir() {
 			return nil, fmt.Errorf("carrier: layer root %q is not a directory: %w", layerRoot, ErrForeignLayerDir)
@@ -89,6 +90,10 @@ func Materialize(sel Selection, baseDir, baseID, layerRoot string) (*Layer, erro
 		marker, found, markerErr := readMarker(layerRoot)
 		if markerErr != nil {
 			return nil, markerErr
+		}
+		if found {
+			m := marker
+			oldMarker = &m
 		}
 		if found && marker.BaseID == baseID && marker.Driver == sel.Driver {
 			view := filepath.Join(layerRoot, viewName)
@@ -105,11 +110,27 @@ func Materialize(sel Selection, baseDir, baseID, layerRoot string) (*Layer, erro
 			// the carrier owns but cannot hand out: fall
 			// through and rebuild it.
 		}
-		// Step 4 of the plan pins the markerless-content check
-		// here: a root with content but no marker is foreign.
+		// The markerless-content check: a root with content
+		// but no marker is foreign — with the one exception
+		// the marker law names. The selected driver is asked
+		// first whether the root is exactly its own crash
+		// remnant (Task 3's overlay remnant law); a recognized
+		// remnant is recovered by the driver and the build
+		// proceeds. Anything the driver does not recognize
+		// stays subject to the foreign law, unwiped.
 		if !found {
-			if err := refuseForeignContent(layerRoot); err != nil {
-				return nil, err
+			recovered := false
+			if rr, ok := drv.(remnantRecoverer); ok {
+				var rerr error
+				recovered, rerr = rr.recoverRemnant(layerRoot)
+				if rerr != nil {
+					return nil, rerr
+				}
+			}
+			if !recovered {
+				if err := refuseForeignContent(layerRoot); err != nil {
+					return nil, err
+				}
 			}
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -122,6 +143,12 @@ func Materialize(sel Selection, baseDir, baseID, layerRoot string) (*Layer, erro
 	}
 	if err := removeStagingRemnants(layerRoot); err != nil {
 		return nil, err
+	}
+	// A driver that manages the view itself — a mountpoint
+	// cannot be built in a staging sibling and renamed into
+	// place — builds in the root directly.
+	if vd, ok := drv.(viewDriver); ok {
+		return buildViewLayer(vd, sel, baseDir, baseID, layerRoot, preExisted, oldMarker)
 	}
 	staging, err := os.MkdirTemp(layerRoot, stagingPrefix)
 	if err != nil {
@@ -144,7 +171,16 @@ func Materialize(sel Selection, baseDir, baseID, layerRoot string) (*Layer, erro
 
 	// The build succeeded: the root's previous contents (an old
 	// view, an old marker, driver state) are wiped — never
-	// merged — and the staging view is renamed into place.
+	// merged — and the staging view is renamed into place. The
+	// previous layer's driver state is released first: a
+	// view-managing driver's view may be a live mount, and
+	// deleting through a mount corrupts the layer's backing
+	// store instead of removing the layer.
+	if oldMarker != nil {
+		if err := releaseLayerState(*oldMarker, layerRoot); err != nil {
+			return nil, err
+		}
+	}
 	entries, err := os.ReadDir(layerRoot)
 	if err != nil {
 		return nil, fmt.Errorf("carrier: list layer root %q: %w", layerRoot, err)
@@ -168,6 +204,75 @@ func Materialize(sel Selection, baseDir, baseID, layerRoot string) (*Layer, erro
 		return nil, err
 	}
 	return &Layer{Dir: view, BaseID: baseID, Driver: sel.Driver, root: layerRoot}, nil
+}
+
+// buildViewLayer builds a layer for a viewDriver: the view is
+// created at its final path in the layer root and the driver
+// populates it there, keeping its state as the view's siblings;
+// the marker is written last, exactly as in the staged path.
+// Because the build occupies the root itself, the previous
+// layer's state is released and its contents wiped before the
+// build — unlike the staged path, a failed rebuild does not
+// leave the previous layer standing. The marker law still
+// governs handout: a root whose view is gone is rebuilt, never
+// returned as-is, so a wiped root can never be handed out as a
+// stale layer.
+func buildViewLayer(drv viewDriver, sel Selection, baseDir, baseID, layerRoot string, preExisted bool, oldMarker *layerMarker) (*Layer, error) {
+	if oldMarker != nil {
+		if err := releaseLayerState(*oldMarker, layerRoot); err != nil {
+			return nil, err
+		}
+	}
+	entries, err := os.ReadDir(layerRoot)
+	if err != nil {
+		return nil, fmt.Errorf("carrier: list layer root %q: %w", layerRoot, err)
+	}
+	for _, e := range entries {
+		if err := os.RemoveAll(filepath.Join(layerRoot, e.Name())); err != nil {
+			return nil, fmt.Errorf("carrier: wipe previous layer content %q: %w", e.Name(), err)
+		}
+	}
+	view := filepath.Join(layerRoot, viewName)
+	if err := drv.materializeView(baseDir, layerRoot, view); err != nil {
+		if !preExisted {
+			// A failed first build leaves no layer root
+			// behind (the staged path's law).
+			os.RemoveAll(layerRoot)
+		}
+		return nil, err
+	}
+	if err := writeMarker(layerRoot, layerMarker{BaseID: baseID, Driver: sel.Driver}); err != nil {
+		// The build succeeded but cannot be recorded: release
+		// the driver's state so no mount outlives the error,
+		// and leave no root behind on a first build.
+		drv.remove(&Layer{Driver: sel.Driver, root: layerRoot})
+		if !preExisted {
+			os.RemoveAll(layerRoot)
+		}
+		return nil, err
+	}
+	return &Layer{Dir: view, BaseID: baseID, Driver: sel.Driver, root: layerRoot}, nil
+}
+
+// releaseLayerState releases the driver state of the previous
+// layer at a root before its contents are wiped. Only a
+// view-managing driver (viewDriver) holds state a wipe cannot
+// safely delete through — a live mount at the view; other
+// drivers' state is plain files (copy) or nonexistent (the
+// not-yet-implemented stubs never completed a build, so no
+// marker can name one from a real layer).
+func releaseLayerState(marker layerMarker, root string) error {
+	drv, ok := driverByID(marker.Driver)
+	if !ok {
+		return nil
+	}
+	if _, ok := drv.(viewDriver); !ok {
+		return nil
+	}
+	if err := drv.remove(&Layer{Driver: marker.Driver, root: root}); err != nil {
+		return fmt.Errorf("carrier: release previous %s layer at %q: %w", marker.Driver, root, err)
+	}
+	return nil
 }
 
 // Remove tears the layer down and deletes layerRoot entirely.
