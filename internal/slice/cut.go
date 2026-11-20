@@ -246,8 +246,21 @@ func closure(s *store.Store, cut Cut) (map[string]store.StoredRecord, map[string
 // closed set every cause is itself selected. Cut resolution
 // (cut.go) and the effective-history projection (project.go) share
 // this one walk.
+//
+// The seed load is bounded in the store (PathRecordsThrough):
+// loading the whole path and filtering afterward enumerated and
+// fetched records the walk would discard, and a GC pass
+// collecting one of them mid-read failed the resolution of a
+// fully retained cut (Codex P2 on PR #2). Bounding the seed
+// cannot strand a same-path cause outside the set: append
+// validation requires every caused_by entry to name an existing
+// record or an earlier draft in the same batch, and per-owner
+// ordinals are assigned gap-free in append order, so a cause's
+// ordinal is strictly smaller than its citer's — every same-path
+// cause of a seeded record is itself within the bound. Cross-path
+// causes are fetched via GetRecord, as before.
 func closureWalk(s *store.Store, ownerPath string, throughOrdinal int64) (map[string]store.StoredRecord, map[string][]string, error) {
-	pathRecs, err := s.PathRecords(ownerPath)
+	pathRecs, err := s.PathRecordsThrough(ownerPath, throughOrdinal)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -255,11 +268,9 @@ func closureWalk(s *store.Store, ownerPath string, throughOrdinal int64) (map[st
 	causes := make(map[string][]string)
 	var stack []string
 	for _, rec := range pathRecs {
-		if rec.OwnerOrdinal <= throughOrdinal {
-			if _, ok := selected[rec.ID]; !ok {
-				selected[rec.ID] = rec
-				stack = append(stack, rec.ID)
-			}
+		if _, ok := selected[rec.ID]; !ok {
+			selected[rec.ID] = rec
+			stack = append(stack, rec.ID)
 		}
 	}
 	for len(stack) > 0 {

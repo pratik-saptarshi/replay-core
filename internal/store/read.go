@@ -146,9 +146,49 @@ func (s *Store) GetRecord(recordID string) (StoredRecord, error) {
 // copy while validation followed the records table, and a cut
 // could resolve without its own through record (panel W3-3).
 func (s *Store) PathRecords(ownerPath string) ([]StoredRecord, error) {
-	rows, err := s.db.Query(
+	ids, err := s.enumeratePathIDs(ownerPath,
 		"SELECT record_id FROM records WHERE owner_path = ? ORDER BY owner_ordinal ASC",
 		ownerPath)
+	if err != nil {
+		return nil, err
+	}
+	return s.fetchRecords(ids)
+}
+
+// PathRecordsThrough returns ownerPath's records with ordinal at
+// most throughOrdinal, in ordinal order — the bounded prefix read
+// behind cut resolution (slice.ResolveCut, epochs). The bound
+// lives in the query, so out-of-prefix records are never
+// enumerated or fetched.
+//
+// The bound is a correctness property, not an optimization: the
+// whole-path read enumerates every ID on the path and then
+// fetches each through GetRecord, so a garbage collection that
+// collects an out-of-prefix record between the enumeration and
+// its fetch fails the fetch — and with it the resolution of a
+// fully retained published cut, whose addressed set the
+// collection provably did not touch (Codex P2 on PR #2,
+// 2026-11-19). Bounding the enumeration to the addressed prefix
+// removes out-of-prefix records from the read entirely, so
+// their collection cannot affect it. Each record goes through
+// GetRecord, so reads are validated the same way.
+func (s *Store) PathRecordsThrough(ownerPath string, throughOrdinal int64) ([]StoredRecord, error) {
+	ids, err := s.enumeratePathIDs(ownerPath,
+		"SELECT record_id FROM records WHERE owner_path = ? AND owner_ordinal <= ? ORDER BY owner_ordinal ASC",
+		ownerPath, throughOrdinal)
+	if err != nil {
+		return nil, err
+	}
+	return s.fetchRecords(ids)
+}
+
+// enumeratePathIDs runs a record_id-selecting query over
+// ownerPath's records and returns the IDs in row order. The
+// result set is fully consumed and closed before returning:
+// callers fetch the records through GetRecord afterwards, and
+// no half-open enumeration may sit across those reads.
+func (s *Store) enumeratePathIDs(ownerPath, query string, args ...any) ([]string, error) {
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("store: list path %q: %w", ownerPath, err)
 	}
@@ -166,6 +206,11 @@ func (s *Store) PathRecords(ownerPath string) ([]StoredRecord, error) {
 		return nil, fmt.Errorf("store: list path %q: %w", ownerPath, err)
 	}
 	rows.Close()
+	return ids, nil
+}
+
+// fetchRecords loads each ID through GetRecord, in order.
+func (s *Store) fetchRecords(ids []string) ([]StoredRecord, error) {
 	out := make([]StoredRecord, 0, len(ids))
 	for _, id := range ids {
 		rec, err := s.GetRecord(id)
