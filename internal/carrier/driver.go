@@ -5,31 +5,48 @@ import (
 	"os"
 )
 
-// driver is one carrier mechanism. The materialize/remove
-// signatures arrive with the Layer type in Task 2 (T-F5-2); in
-// this task every driver's materialize/remove returns a
-// descriptive "driver not yet implemented" error.
+// driver is one carrier mechanism. The shared lifecycle
+// (layer.go) owns the marker law, staging, and layer-root
+// deletion; a driver owns only its mechanism: materialize
+// populates an existing empty view directory from a base
+// directory, and remove releases any driver state (mounts) a
+// layer holds before the lifecycle deletes its root.
 type driver interface {
+	id() DriverID
 	probe(rootDir string) ProbeResult
-	materialize() error
-	remove() error
+	materialize(baseDir, viewDir string) error
+	remove(l *Layer) error
+}
+
+// driverByID returns the registered driver with the given ID.
+func driverByID(id DriverID) (driver, bool) {
+	for _, d := range drivers {
+		if d.id() == id {
+			return d, true
+		}
+	}
+	return nil, false
 }
 
 // stubDriver is a registered driver whose probe is real but whose
-// materialize/remove are not yet implemented.
+// materialize/remove are not yet implemented; it reports a
+// descriptive "driver not yet implemented" error rather than
+// pretending to serve.
 type stubDriver struct {
-	id      DriverID
-	probeFn func(rootDir string) ProbeResult
+	driverID DriverID
+	probeFn  func(rootDir string) ProbeResult
 }
+
+func (d stubDriver) id() DriverID { return d.driverID }
 
 func (d stubDriver) probe(rootDir string) ProbeResult { return d.probeFn(rootDir) }
 
-func (d stubDriver) materialize() error {
-	return fmt.Errorf("carrier: %s driver not yet implemented", d.id)
+func (d stubDriver) materialize(string, string) error {
+	return fmt.Errorf("carrier: %s driver not yet implemented", d.driverID)
 }
 
-func (d stubDriver) remove() error {
-	return fmt.Errorf("carrier: %s driver not yet implemented", d.id)
+func (d stubDriver) remove(*Layer) error {
+	return fmt.Errorf("carrier: %s driver not yet implemented", d.driverID)
 }
 
 // drivers is the carrier registry, in the fixed selection order
@@ -37,10 +54,10 @@ func (d stubDriver) remove() error {
 // Package-internal tests may substitute it; the public Select
 // always reads this list.
 var drivers = []driver{
-	stubDriver{id: DriverKernelOverlay, probeFn: probeKernelOverlay},
-	stubDriver{id: DriverFuseOverlay, probeFn: probeFuse},
-	stubDriver{id: DriverReflink, probeFn: probeReflink},
-	stubDriver{id: DriverCopy, probeFn: probeCopy},
+	stubDriver{driverID: DriverKernelOverlay, probeFn: probeKernelOverlay},
+	stubDriver{driverID: DriverFuseOverlay, probeFn: probeFuse},
+	stubDriver{driverID: DriverReflink, probeFn: probeReflink},
+	copyDriver{},
 }
 
 // probeCopy is the copy driver's probe: the floor mechanism needs

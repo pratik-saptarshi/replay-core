@@ -13,9 +13,12 @@ type fakeDriver struct {
 	result ProbeResult
 }
 
+func (f fakeDriver) id() DriverID             { return f.result.Driver }
 func (f fakeDriver) probe(string) ProbeResult { return f.result }
-func (f fakeDriver) materialize() error       { return errors.New("carrier: fake driver") }
-func (f fakeDriver) remove() error            { return errors.New("carrier: fake driver") }
+func (f fakeDriver) materialize(string, string) error {
+	return errors.New("carrier: fake driver")
+}
+func (f fakeDriver) remove(*Layer) error { return errors.New("carrier: fake driver") }
 
 // TestSelectFallsThroughWithRecordedReasons is AC-F5-1 against a
 // stubbed registry (input shape: every mechanism driver hostile):
