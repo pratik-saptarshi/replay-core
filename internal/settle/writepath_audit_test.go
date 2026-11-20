@@ -82,7 +82,7 @@ var writeAllowlist = map[string]string{
 	// the verbs' own operational state under the settle Root.
 	"settle.writeSidecar": "the fork provenance writer: canonical JSON to a temp file in Root/forks, fsynced and renamed over the sidecar path",
 	"settle.Fork":         "the fork verb's operational writes under the settle Root: it stages the fork base extraction and renames it into place, removing its own staging on failure; it never writes the parent directory",
-	"settle.Discard":      "the discard verb removes the run's fork sidecar — its own operational state under the settle Root — once the scope is archived",
+	"settle.Discard":      "the discard verb removes the run's fork sidecar — its own operational state under the settle Root — after the mint, so a crash before it leaves the provenance a retry completes from",
 	// internal/carrier — the layer lifecycle.
 	"carrier.Materialize":           "the layer lifecycle: builds the staging tree under the layer root it owns, renames the view into place, and wipes stale layers whose identity marker it issued",
 	"carrier.buildViewLayer":        "the view-driver layer builder: assembles upper/work/view under the layer root for mount-backed drivers",

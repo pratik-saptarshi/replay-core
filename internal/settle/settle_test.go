@@ -550,3 +550,98 @@ func TestSettleVerbsRejectDegenerateInputs(t *testing.T) {
 		t.Fatalf("parent head = %s, %v after degenerate calls; want %s unmoved", head, err, f.parent0)
 	}
 }
+
+// TestDiscardCompletesAfterCrashPastArchive (PR #7 review,
+// Codex P2): a Discard that dies after ArchiveScope lands but
+// before the fact is minted leaves the active scope ref gone
+// and no fact anywhere — and on the unfixed code a retry dies
+// with it: ScopeHead refuses the missing ref (or, one step
+// later, the sidecar is already gone), so the discard can
+// never complete and consume-once has no authoritative fact to
+// read. The archive ref holds the head the fact must cite, so
+// a retry must complete the discard from the surviving state:
+// finish the cleanup, mint the fact citing the archived head,
+// and report the scope consumed thereafter.
+func TestDiscardCompletesAfterCrashPastArchive(t *testing.T) {
+	assertCompleted := func(t *testing.T, f *fixture, receipt store.Receipt) {
+		t.Helper()
+		refs, err := f.snaps.ListScopes()
+		if err != nil {
+			t.Fatalf("ListScopes: %v", err)
+		}
+		foundArchive := false
+		for _, r := range refs {
+			if r.Kind == snapshot.RefScope && r.Name == "run-a" {
+				t.Fatalf("scope run-a still present after completed Discard: %+v", r)
+			}
+			if r.Kind == snapshot.RefArchive && r.Name == "run-a" {
+				if r.CommitID != f.parent0 {
+					t.Fatalf("archive/run-a at %s, want fork commit %s", r.CommitID, f.parent0)
+				}
+				foundArchive = true
+			}
+		}
+		if !foundArchive {
+			t.Fatalf("ListScopes = %v, want archive/run-a at %s", refs, f.parent0)
+		}
+		if _, err := os.Stat(filepath.Join(f.root, "layers", "run-a")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("layer root after completed Discard: err = %v, want gone", err)
+		}
+		if _, err := os.Stat(filepath.Join(f.root, "forks", "run-a.json")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("sidecar after completed Discard: err = %v, want gone", err)
+		}
+		facts := f.settleFacts(t, "run-a")
+		if len(facts) != 1 || facts[0].ID != receipt.RecordID {
+			t.Fatalf("settle facts on run-a = %v, want exactly the discard receipt %s", facts, receipt.RecordID)
+		}
+		body := factBody(t, facts[0])
+		for key, want := range map[string]string{
+			"op": "op-1", "run_scope": "run-a", "head": f.parent0,
+			"archive_ref": "refs/vcscore/archive/run-a",
+		} {
+			if got, _ := stringField(body, key); got != want {
+				t.Fatalf("discard fact body[%q] = %q, want %q (the archived head, cited as recorded)", key, got, want)
+			}
+		}
+		// The completion is authoritative: a further retry
+		// reads the fact and reports the scope consumed.
+		if _, err := settle.Discard(f.ctx, "run-a", "op-2"); !errors.Is(err, settle.ErrScopeConsumed) {
+			t.Fatalf("Discard after completed Discard: err = %v, want ErrScopeConsumed", err)
+		}
+	}
+
+	t.Run("crash right after the archive", func(t *testing.T) {
+		f := newFixture(t)
+		if _, err := settle.Fork(f.ctx, "parent", "run-a"); err != nil {
+			t.Fatalf("Fork: %v", err)
+		}
+		// The crashed Discard's surviving state: the archive
+		// landed, the layer and sidecar remain, no fact.
+		if err := f.snaps.ArchiveScope("run-a"); err != nil {
+			t.Fatalf("ArchiveScope (the crashed verb's last landed step): %v", err)
+		}
+		receipt, err := settle.Discard(f.ctx, "run-a", "op-1")
+		if err != nil {
+			t.Fatalf("Discard completing a discard crashed past the archive: %v", err)
+		}
+		assertCompleted(t, f, receipt)
+	})
+
+	t.Run("crash after layer removal", func(t *testing.T) {
+		f := newFixture(t)
+		if _, err := settle.Fork(f.ctx, "parent", "run-a"); err != nil {
+			t.Fatalf("Fork: %v", err)
+		}
+		if err := f.snaps.ArchiveScope("run-a"); err != nil {
+			t.Fatalf("ArchiveScope (the crashed verb's last landed step): %v", err)
+		}
+		if err := os.RemoveAll(filepath.Join(f.root, "layers", "run-a")); err != nil {
+			t.Fatalf("remove layer (the crashed verb's cleanup): %v", err)
+		}
+		receipt, err := settle.Discard(f.ctx, "run-a", "op-1")
+		if err != nil {
+			t.Fatalf("Discard completing a discard crashed after layer removal: %v", err)
+		}
+		assertCompleted(t, f, receipt)
+	})
+}

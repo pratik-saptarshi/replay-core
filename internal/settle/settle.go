@@ -370,10 +370,26 @@ func Select(ctx *Context, parentScope, parentDir, runScope, opID string) (store.
 
 // Discard retires a run scope without deleting its history
 // (AC-F6-5): the scope ref is archived at its head, the layer
-// and the fork sidecar are removed, and the discard fact is
-// minted last, on the run scope's trace path. An already-missing
-// layer is not an error — the archive is the settlement, the
-// layer is operational state.
+// is removed, the discard fact is minted last among the
+// settlement effects (Decision 4), and the fork sidecar — the
+// verb's own operational state — is removed after the mint,
+// the same shape as Select and Apply clearing their journal
+// state after theirs. An already-missing layer is not an
+// error — the archive is the settlement, the layer is
+// operational state.
+//
+// The order makes every prefix of the verb completable on
+// retry, with no discard journal: a Discard that dies after
+// the archive lands leaves the sidecar in place and the
+// archive ref holding the head the fact must cite, so a
+// retried Discard resolves its head from the archive, finishes
+// the cleanup, and mints the fact; a Discard that dies after
+// the mint leaves a fact the consume-once scan reads, and the
+// retry reports the scope consumed. The one window this does
+// not close is a crash inside ArchiveScope itself, between
+// its create and its delete: both refs then name the same
+// head, nothing is lost, and the retry fails with the
+// archive's own already-exists refusal, descriptively.
 func Discard(ctx *Context, runScope, opID string) (store.Receipt, error) {
 	if opID == "" {
 		return store.Receipt{}, errors.New("settle: discard: op ID is empty")
@@ -386,21 +402,58 @@ func Discard(ctx *Context, runScope, opID string) (store.Receipt, error) {
 		return store.Receipt{}, err
 	}
 	head, err := ctx.Snaps.ScopeHead(runScope)
-	if err != nil {
-		return store.Receipt{}, fmt.Errorf("settle: discard %q: %w", runScope, err)
-	}
-	if err := ctx.Snaps.ArchiveScope(runScope); err != nil {
+	switch {
+	case err == nil:
+		if err := ctx.Snaps.ArchiveScope(runScope); err != nil {
+			return store.Receipt{}, fmt.Errorf("settle: discard %q: %w", runScope, err)
+		}
+	case errors.Is(err, snapshot.ErrScopeNotFound):
+		// The scope ref is gone. If the archive ref exists, a
+		// previous Discard died after archiving but before the
+		// mint: complete it, citing the archived head. If no
+		// archive exists either, the scope is simply absent
+		// and the refusal below is the one Discard has always
+		// given for it.
+		archived, found, aerr := archivedHead(ctx, runScope)
+		if aerr != nil {
+			return store.Receipt{}, fmt.Errorf("settle: discard %q: %w", runScope, aerr)
+		}
+		if !found {
+			return store.Receipt{}, fmt.Errorf("settle: discard %q: %w", runScope, err)
+		}
+		head = archived
+	default:
 		return store.Receipt{}, fmt.Errorf("settle: discard %q: %w", runScope, err)
 	}
 	if err := removeLayer(ctx, sc); err != nil {
 		return store.Receipt{}, fmt.Errorf("settle: discard %q: %w", runScope, err)
 	}
+	// Fact last (Review Focus): the scope is archived and the
+	// layer is gone; only now is the act recorded.
+	receipt, err := ctx.Trace.MintSettleDiscard(runScope, opID, runScope, head, archiveRefPrefix+runScope)
+	if err != nil {
+		return store.Receipt{}, err
+	}
 	if err := os.Remove(sidecarPath(ctx.Root, runScope)); err != nil {
 		return store.Receipt{}, fmt.Errorf("settle: discard %q: remove sidecar: %w", runScope, err)
 	}
-	// Fact last (Review Focus): the scope is archived and the
-	// operational state is gone; only now is the act recorded.
-	return ctx.Trace.MintSettleDiscard(runScope, opID, runScope, head, archiveRefPrefix+runScope)
+	return receipt, nil
+}
+
+// archivedHead returns the commit runScope's archive ref
+// names — the head a crashed Discard archived at — or found
+// false when the scope was never archived.
+func archivedHead(ctx *Context, runScope string) (head string, found bool, err error) {
+	refs, err := ctx.Snaps.ListScopes()
+	if err != nil {
+		return "", false, err
+	}
+	for _, r := range refs {
+		if r.Kind == snapshot.RefArchive && r.Name == runScope {
+			return r.CommitID, true, nil
+		}
+	}
+	return "", false, nil
 }
 
 // removeLayer tears down a run scope's carrier layer through
