@@ -77,8 +77,9 @@ func deltaAgainst(base, target map[string]snapshot.WorkspaceEntry) treeDelta {
 //     directory is touched, and its file map must equal U
 //     exactly or the verb fails as an internal error with the
 //     parent untouched;
-//  5. syncTree the parent directory from the staging tree and
-//     verify by re-snapshotting (file map == U);
+//  5. materialize the parent directory from the union tree
+//     under the journal (Task 8) and verify by re-snapshotting
+//     inside the materializer (file map == U);
 //  6. AdvanceScope(parent, headAtStart, resultCommit) — the
 //     compare-and-swap is the commit point;
 //  7. fact last: MintSettleApply, with settled_paths = the run
@@ -86,17 +87,20 @@ func deltaAgainst(base, target map[string]snapshot.WorkspaceEntry) treeDelta {
 //
 // An empty run delta is a descriptive refusal: there is nothing
 // to settle (Select is the verb for the no-parent-change case).
-// Like Select, Apply commits through the unjournaled syncTree
-// in this task — Task 8 rebuilds the materializer on the
-// journal (see the interim note on syncTree).
+// Like Select, Apply commits through the journaled
+// materializer: the journal records the complete apply fact
+// body at planned time, and Recover at the next verb's entry
+// completes or rolls back a crashed apply.
 func Apply(ctx *Context, parentScope, parentDir, runScope, opID string) (store.Receipt, error) {
 	if opID == "" {
 		return store.Receipt{}, errors.New("settle: apply: op ID is empty")
 	}
-	// TASK 8 MARKER: journal recovery for parentScope is
-	// inserted here, at verb entry, before the verb is judged —
-	// a crashed predecessor is completed or rolled back first
-	// (see the interim note on syncTree).
+	// Journal recovery at verb entry (Task 8): a crashed
+	// predecessor on this parent scope is completed or rolled
+	// back before this verb is judged.
+	if err := Recover(ctx, parentScope); err != nil {
+		return store.Receipt{}, err
+	}
 	if err := ensureNotConsumed(ctx, runScope); err != nil {
 		return store.Receipt{}, err
 	}
@@ -175,29 +179,41 @@ func Apply(ctx *Context, parentScope, parentDir, runScope, opID string) (store.R
 		return store.Receipt{}, fmt.Errorf("settle: apply %q: %w", runScope, err)
 	}
 
-	// Materialize the parent directory from the union tree and
-	// verify by re-snapshotting.
-	if err := syncTree(ctx, resultCommit, parentDir, union); err != nil {
+	// Materialize the parent directory from the union tree
+	// under the journal (Task 8), verified by re-snapshotting
+	// inside the materializer, with the complete apply fact
+	// body recorded at planned time, before the first write.
+	fact := store.SettleApplyBody(opID, parentScope, runScope, sc.ForkCommit, resultCommit, runDelta.paths)
+	if err := materialize(ctx, materializeRequest{
+		verb:         verbApply,
+		opID:         opID,
+		parentScope:  parentScope,
+		runScope:     runScope,
+		parentDir:    parentDir,
+		oldHead:      parentHeadStart,
+		resultCommit: resultCommit,
+		want:         union,
+		fact:         fact,
+	}); err != nil {
 		return store.Receipt{}, fmt.Errorf("settle: apply %q: %w", runScope, err)
-	}
-	verifyCommit, err := ctx.Snaps.Snapshot(parentDir, map[string]string{"settle": "apply-verify"})
-	if err != nil {
-		return store.Receipt{}, fmt.Errorf("settle: apply %q: verify snapshot of parent directory: %w", runScope, err)
-	}
-	got, err := ctx.Snaps.WorkspaceFiles(verifyCommit)
-	if err != nil {
-		return store.Receipt{}, fmt.Errorf("settle: apply %q: %w", runScope, err)
-	}
-	if !reflect.DeepEqual(got, union) {
-		return store.Receipt{}, fmt.Errorf("settle: apply %q: parent directory does not match the union tree after materialization", runScope)
 	}
 
 	if err := ctx.Snaps.AdvanceScope(parentScope, parentHeadStart, resultCommit); err != nil {
 		return store.Receipt{}, fmt.Errorf("settle: apply %q: %w", runScope, err)
 	}
 	// Fact last (Review Focus): the ref has moved and the tree
-	// is verified; only now is the act recorded.
-	return ctx.Trace.MintSettleApply(runScope, opID, parentScope, runScope, sc.ForkCommit, resultCommit, runDelta.paths)
+	// is verified; only now is the act recorded. If the CAS or
+	// the mint fails, the verified journal stays in place and
+	// Recover completes the commit point at the next verb's
+	// entry — the post-CAS/pre-fact window is closed.
+	receipt, err := ctx.Trace.MintSettleApply(runScope, opID, parentScope, runScope, sc.ForkCommit, resultCommit, runDelta.paths)
+	if err != nil {
+		return store.Receipt{}, err
+	}
+	if err := clearJournalState(ctx.Root, parentScope, opID); err != nil {
+		return store.Receipt{}, fmt.Errorf("settle: apply %q: %w", runScope, err)
+	}
+	return receipt, nil
 }
 
 // buildUnionTree assembles the union tree in a staging

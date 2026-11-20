@@ -21,8 +21,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"reflect"
-	"sort"
 	"strings"
 
 	"github.com/pratik-saptarshi/replay-core/internal/canonical"
@@ -34,8 +32,8 @@ import (
 // Context bundles the two stores and the one root all settle
 // operational state lives under (plan Decision 8(e)): fork
 // sidecars, base extractions, layers, staging, and journals
-// (Task 8) live under Root; nothing in F5/F6 writes anywhere
-// else except the parent directory at a verb's commit point and
+// live under Root; nothing in F5/F6 writes anywhere else
+// except the parent directory at a verb's commit point and
 // the two stores through their own APIs.
 type Context struct {
 	Trace *store.Store
@@ -294,10 +292,12 @@ func Select(ctx *Context, parentScope, parentDir, runScope, opID string) (store.
 	if opID == "" {
 		return store.Receipt{}, errors.New("settle: select: op ID is empty")
 	}
-	// TASK 8 MARKER: journal recovery for parentScope is
-	// inserted here, at verb entry, before the verb is judged —
-	// a crashed predecessor is completed or rolled back first
-	// (see the interim note on syncTree).
+	// Journal recovery at verb entry (Task 8): a crashed
+	// predecessor on this parent scope is completed or rolled
+	// back before this verb is judged.
+	if err := Recover(ctx, parentScope); err != nil {
+		return store.Receipt{}, err
+	}
 	if err := ensureNotConsumed(ctx, runScope); err != nil {
 		return store.Receipt{}, err
 	}
@@ -331,29 +331,41 @@ func Select(ctx *Context, parentScope, parentDir, runScope, opID string) (store.
 	if err != nil {
 		return store.Receipt{}, fmt.Errorf("settle: select %q: %w", runScope, err)
 	}
-	if err := syncTree(ctx, runHead, parentDir, want); err != nil {
+	// Materialize under the journal (Task 8): the parent
+	// directory is made to match the run head's tree exactly and
+	// verified by re-snapshot inside the materializer, with the
+	// complete select fact body recorded at planned time,
+	// before the first write.
+	fact := store.SettleSelectBody(opID, parentScope, runScope, sc.ForkCommit, runHead)
+	if err := materialize(ctx, materializeRequest{
+		verb:         verbSelect,
+		opID:         opID,
+		parentScope:  parentScope,
+		runScope:     runScope,
+		parentDir:    parentDir,
+		oldHead:      sc.ForkCommit,
+		resultCommit: runHead,
+		want:         want,
+		fact:         fact,
+	}); err != nil {
 		return store.Receipt{}, fmt.Errorf("settle: select %q: %w", runScope, err)
-	}
-	// Verify: re-snapshot the materialized directory and compare
-	// file maps — the directory must serve exactly the run
-	// head's tree before the ref moves.
-	verifyCommit, err := ctx.Snaps.Snapshot(parentDir, map[string]string{"settle": "select-verify"})
-	if err != nil {
-		return store.Receipt{}, fmt.Errorf("settle: select %q: verify snapshot of parent directory: %w", runScope, err)
-	}
-	got, err := ctx.Snaps.WorkspaceFiles(verifyCommit)
-	if err != nil {
-		return store.Receipt{}, fmt.Errorf("settle: select %q: %w", runScope, err)
-	}
-	if !reflect.DeepEqual(got, want) {
-		return store.Receipt{}, fmt.Errorf("settle: select %q: parent directory does not match run head %s after materialization", runScope, runHead)
 	}
 	if err := ctx.Snaps.AdvanceScope(parentScope, sc.ForkCommit, runHead); err != nil {
 		return store.Receipt{}, fmt.Errorf("settle: select %q: %w", runScope, err)
 	}
 	// Fact last (Review Focus): the ref has moved and the tree
-	// is verified; only now is the act recorded.
-	return ctx.Trace.MintSettleSelect(runScope, opID, parentScope, runScope, sc.ForkCommit, runHead)
+	// is verified; only now is the act recorded. If the CAS or
+	// the mint fails, the verified journal stays in place and
+	// Recover completes the commit point at the next verb's
+	// entry — the post-CAS/pre-fact window is closed.
+	receipt, err := ctx.Trace.MintSettleSelect(runScope, opID, parentScope, runScope, sc.ForkCommit, runHead)
+	if err != nil {
+		return store.Receipt{}, err
+	}
+	if err := clearJournalState(ctx.Root, parentScope, opID); err != nil {
+		return store.Receipt{}, fmt.Errorf("settle: select %q: %w", runScope, err)
+	}
+	return receipt, nil
 }
 
 // Discard retires a run scope without deleting its history
@@ -413,150 +425,6 @@ func removeLayer(ctx *Context, sc forkSidecar) error {
 		return err
 	}
 	return layer.Remove()
-}
-
-// INTERIM (plan Decision 8(d), Task 6): syncTree is the shared
-// tree materializer the settlement verbs commit through, and in
-// this task it is UNJOURNALED. Two crash windows are therefore
-// open, stated here rather than discovered later: (1) a crash
-// mid-materialization can leave the parent directory between
-// trees — some units written, some not, with no record of which;
-// (2) a crash after AdvanceScope moves the parent head but
-// before the settlement fact is minted (the post-CAS/pre-fact
-// window) leaves the head moved with no fact recorded, and a
-// naive retry of the verb reads that moved head as an advanced
-// parent (ErrParentAdvanced) even though the move was the
-// crashed verb's own. Task 8 closes both windows: it rebuilds
-// this materializer on the journal without changing either
-// verb's contract, and inserts journal recovery at each verb's
-// entry — at the point marked in Select — so a crashed
-// predecessor is completed or rolled back before any new verb
-// is judged.
-
-// syncTree makes dir match want — the workspace file map of
-// commitID — exactly: new and changed files are written (a
-// mode-only difference counts as changed and is applied as a
-// chmod), symlinks are recreated as symlinks, and entries not in
-// want are deleted. File writes are temp-file-plus-rename within
-// the target directory (atomic per file), so a concurrent reader
-// never observes a torn file. Entries named .git are never
-// touched, mirroring the snapshot walk's law: a parent directory
-// that is a git working tree keeps its repository.
-func syncTree(ctx *Context, commitID, dir string, want map[string]snapshot.WorkspaceEntry) error {
-	stagingDir := filepath.Join(ctx.Root, "staging")
-	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
-		return fmt.Errorf("settle: create staging dir: %w", err)
-	}
-	stage, err := os.MkdirTemp(stagingDir, "synctree-")
-	if err != nil {
-		return fmt.Errorf("settle: create staging dir: %w", err)
-	}
-	defer func() { _ = os.RemoveAll(stage) }()
-	if err := ctx.Snaps.ExtractWorkspace(commitID, stage); err != nil {
-		return err
-	}
-
-	current, dirs, err := walkDirFiles(dir)
-	if err != nil {
-		return err
-	}
-
-	rels := make([]string, 0, len(want))
-	for rel := range want {
-		rels = append(rels, rel)
-	}
-	sort.Strings(rels)
-	for _, rel := range rels {
-		entry := want[rel]
-		src := filepath.Join(stage, filepath.FromSlash(rel))
-		dst := filepath.Join(dir, filepath.FromSlash(rel))
-		// A file or symlink standing where a wanted path's
-		// ancestor directory belongs is removed first: in any
-		// real tree a wanted path's ancestors are directories,
-		// so the blocker is an extra whose removal the delete
-		// pass would have done anyway — the write just cannot
-		// wait for it.
-		for parent := pathParent(rel); parent != ""; parent = pathParent(parent) {
-			if _, isFile := current[parent]; isFile {
-				if err := os.Remove(filepath.Join(dir, filepath.FromSlash(parent))); err != nil {
-					return fmt.Errorf("settle: remove blocking %s: %w", parent, err)
-				}
-				delete(current, parent)
-			}
-		}
-		cur, exists := current[rel]
-		if entry.Symlink {
-			target, err := os.Readlink(src)
-			if err != nil {
-				return fmt.Errorf("settle: read staged symlink %s: %w", src, err)
-			}
-			if exists && cur.symlink {
-				if curTarget, err := os.Readlink(dst); err == nil && curTarget == target {
-					continue
-				}
-			}
-			if err := replaceWithSymlink(dst, target); err != nil {
-				return err
-			}
-			continue
-		}
-		if exists && cur.other {
-			// A special file where a regular file belongs: the
-			// probe snapshot has already refused unrecordable
-			// trees, so this is a shape the target simply
-			// replaces.
-			if err := os.Remove(dst); err != nil {
-				return fmt.Errorf("settle: remove %s: %w", dst, err)
-			}
-			exists = false
-		}
-		if exists && !cur.symlink {
-			same, err := filesEqual(src, dst)
-			if err != nil {
-				return err
-			}
-			if same {
-				if cur.mode != entry.Mode {
-					if err := os.Chmod(dst, permForMode(entry.Mode)); err != nil {
-						return fmt.Errorf("settle: chmod %s: %w", dst, err)
-					}
-				}
-				continue
-			}
-		}
-		if err := copyFileAtomic(src, dst, permForMode(entry.Mode)); err != nil {
-			return err
-		}
-	}
-
-	// Delete extras, then prune directories the target tree
-	// does not imply (deepest first; a prune only succeeds on an
-	// empty directory, so implied directories — non-empty with
-	// wanted files — are never at risk).
-	for rel := range current {
-		if _, ok := want[rel]; ok {
-			continue
-		}
-		if err := os.Remove(filepath.Join(dir, filepath.FromSlash(rel))); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("settle: remove extra %s: %w", rel, err)
-		}
-	}
-	implied := map[string]bool{}
-	for rel := range want {
-		for parent := pathParent(rel); parent != ""; parent = pathParent(parent) {
-			implied[parent] = true
-		}
-	}
-	sort.Slice(dirs, func(i, j int) bool {
-		return strings.Count(dirs[i], "/") > strings.Count(dirs[j], "/")
-	})
-	for _, d := range dirs {
-		if implied[d] {
-			continue
-		}
-		_ = os.Remove(filepath.Join(dir, filepath.FromSlash(d)))
-	}
-	return nil
 }
 
 // pathParent returns rel's parent path in slash form, or "" for
