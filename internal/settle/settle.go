@@ -438,6 +438,23 @@ func Select(ctx *Context, parentScope, parentDir, runScope, opID string) (store.
 // its create and its delete: both refs then name the same
 // head, nothing is lost, and the retry fails with the
 // archive's own already-exists refusal, descriptively.
+//
+// Before any of that, a pending settlement on the run's
+// parent is resolved: a Select or Apply that crashed with a
+// verified journal but before minting its fact left no fact
+// for the consume-once scan to see, so without resolution
+// Discard would archive the run and mint its own fact while
+// the journal survived — and a later Recover would still
+// complete the earlier settlement and mint its fact on top
+// of the discard, even advancing the parent (in the pre-CAS
+// window) to output Discard had reported discarded; a crashed
+// applying journal would likewise leave the parent diverged
+// from its scope head with no fact recording it. Discard
+// therefore runs Recover for the parent scope the sidecar
+// names — completing a verified settlement or rolling back
+// an applying one — and rechecks consumption before any
+// discard effect: a settlement Recover completed has consumed
+// the scope, and Discard refuses as consumed.
 func Discard(ctx *Context, runScope, opID string) (store.Receipt, error) {
 	if opID == "" {
 		return store.Receipt{}, errors.New("settle: discard: op ID is empty")
@@ -450,6 +467,18 @@ func Discard(ctx *Context, runScope, opID string) (store.Receipt, error) {
 	}
 	sc, err := readSidecar(ctx.Root, runScope)
 	if err != nil {
+		return store.Receipt{}, err
+	}
+	// Journal recovery for the parent scope (see the doc
+	// comment): the sidecar is the only record that names the
+	// parent whose journal may be pending, so resolution runs
+	// here — after provenance is known, before any discard
+	// effect — and consumption is rechecked against whatever
+	// Recover minted.
+	if err := Recover(ctx, sc.ParentScope); err != nil {
+		return store.Receipt{}, err
+	}
+	if err := ensureNotConsumed(ctx, runScope); err != nil {
 		return store.Receipt{}, err
 	}
 	head, err := ctx.Snaps.ScopeHead(runScope)
