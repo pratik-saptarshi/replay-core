@@ -398,3 +398,95 @@ func TestRecoverCompletesVerifiedSelectJournal(t *testing.T) {
 		t.Fatalf("settle facts after second Recover = %d, want exactly 1", len(facts))
 	}
 }
+
+// TestRecoverRepeatsInterruptedFileToDirRollback (PR #7
+// review, Codex P2): rollback must be repeatable across an
+// interruption of recovery itself. A first Recover of the
+// file→directory swap undoes the write unit (removing the
+// created old.txt/inner.txt) and then the delete unit
+// (restoring the file old.txt from its preimage); if the
+// process dies there — both undos done, journal not yet
+// cleared — the repeated Recover runs the same undos against
+// the restored tree. The repeated write-unit undo reaches
+// removeOccupant("old.txt/inner.txt"), whose stat now fails
+// ENOTDIR (old.txt is a file again): that is absence — the
+// state the undo asks for already holds — not a wedge. On the
+// unfixed code the repeated Recover fails permanently, and
+// Select/Apply, which call Recover at entry, refuse forever.
+//
+// The crash hook fires only at forward unit marks, never
+// inside Recover, so the interrupted state is built by running
+// rollbackJournal's own undo steps directly (undoWriteUnit,
+// then undoDeleteUnit — rollback's exact order) and stopping
+// before clearJournalState: the journal bytes, the preimage
+// staging, and the parent tree are then exactly what a Recover
+// killed at that line leaves behind.
+func TestRecoverRepeatsInterruptedFileToDirRollback(t *testing.T) {
+	f := newJournalFixture(t)
+	layer, err := Fork(f.ctx, "parent", "run-a")
+	if err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+	if err := os.Remove(filepath.Join(layer.Dir, "old.txt")); err != nil {
+		t.Fatalf("remove layer old.txt: %v", err)
+	}
+	journalWriteFile(t, filepath.Join(layer.Dir, "old.txt", "inner.txt"), "inner\n", 0o644)
+	advanceRun(t, f, "run-a", layer.Dir)
+
+	preHash := hashTree(t, f.parentDir)
+
+	// The select is killed after the write mark: both units
+	// (write old.txt/inner.txt, delete old.txt) are done.
+	runCrashed(t, 2, func() {
+		_, _ = Select(f.ctx, "parent", f.parentDir, "run-a", "op-r2")
+	})
+
+	// The interrupted first Recover: both undos performed with
+	// rollback's own code, journal and staging left in place.
+	preDir := filepath.Join(stagingDirFor(f.root, "op-r2"), "pre")
+	if err := undoWriteUnit(f.parentDir, preDir, "old.txt/inner.txt"); err != nil {
+		t.Fatalf("interrupted Recover, write undo: %v", err)
+	}
+	if err := undoDeleteUnit(f.parentDir, preDir, "old.txt"); err != nil {
+		t.Fatalf("interrupted Recover, delete undo: %v", err)
+	}
+	if got := hashTree(t, f.parentDir); got != preHash {
+		t.Fatalf("parent walk hash after interrupted Recover = %s, want pre-select %s (the first rollback had converged the tree)", got, preHash)
+	}
+	if _, err := os.Stat(journalPath(f.root, "parent")); err != nil {
+		t.Fatalf("journal after interrupted Recover: %v, want still present", err)
+	}
+
+	// The repeated Recover must converge, not wedge.
+	if err := Recover(f.ctx, "parent"); err != nil {
+		t.Fatalf("repeated Recover: %v", err)
+	}
+	if got := hashTree(t, f.parentDir); got != preHash {
+		t.Fatalf("parent walk hash after repeated Recover = %s, want pre-select %s", got, preHash)
+	}
+	if _, err := os.Stat(journalPath(f.root, "parent")); !os.IsNotExist(err) {
+		t.Fatalf("journal after repeated Recover: err = %v, want gone", err)
+	}
+	if facts := f.journalFacts(t, "run-a"); len(facts) != 0 {
+		t.Fatalf("rolled-back select left %d facts, want 0", len(facts))
+	}
+	if head, err := f.snaps.ScopeHead("parent"); err != nil || head != f.parent0 {
+		t.Fatalf("parent head = %s, %v after repeated Recover; want %s unmoved", head, err, f.parent0)
+	}
+
+	// Never wedged at the verb level either: the same select
+	// (whose entry calls Recover) succeeds whole.
+	if _, err := Select(f.ctx, "parent", f.parentDir, "run-a", "op-r2"); err != nil {
+		t.Fatalf("fresh Select after repeated Recover: %v", err)
+	}
+	expected := filepath.Join(f.scratch, "expected")
+	journalWriteFile(t, filepath.Join(expected, "keep.txt"), "keep\n", 0o644)
+	journalWriteFile(t, filepath.Join(expected, "mod.txt"), "original\n", 0o644)
+	journalWriteFile(t, filepath.Join(expected, "old.txt", "inner.txt"), "inner\n", 0o644)
+	if got, want := hashTree(t, f.parentDir), hashTree(t, expected); got != want {
+		t.Fatalf("parent walk hash after fresh Select = %s, want %s", got, want)
+	}
+	if facts := f.journalFacts(t, "run-a"); len(facts) != 1 {
+		t.Fatalf("settle facts after fresh Select = %d, want exactly 1", len(facts))
+	}
+}

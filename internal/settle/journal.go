@@ -918,10 +918,18 @@ func undoDeleteUnit(parentDir, preDir, rel string) error {
 
 // removeOccupant removes whatever stands at dst — a file, a
 // symlink, or a directory tree (a shape a later unit's writes
-// may have left above a restored path). Absence is success.
+// may have left above a restored path). Absence is success —
+// absence in targetGone's full sense: a stat that fails
+// ENOTDIR means an ancestor is a file again, which is exactly
+// the state a repeated rollback meets after an interrupted
+// Recover restored a swapped path's file and died before
+// clearing the journal. Recognizing only ErrNotExist there
+// wedges recovery permanently — every later Recover repeats
+// the same undo and fails the same way, and the verbs that
+// call Recover at entry refuse with it.
 func removeOccupant(dst string) error {
 	info, err := os.Lstat(dst)
-	if errors.Is(err, fs.ErrNotExist) {
+	if targetGone(err) {
 		return nil
 	}
 	if err != nil {
