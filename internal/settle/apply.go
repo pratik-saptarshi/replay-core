@@ -264,14 +264,21 @@ func buildUnionTree(ctx *Context, forkCommit, parentCommit, runCommit string, pa
 // no content is merged. Sorted order places a prefix path
 // before its descendants, so a deletion that changes a path's
 // shape lands before the entries beneath it are written, and a
-// deletion whose path is already gone is not an error. Already
-// gone includes the shape-swap case (targetGone, the journal's
-// tolerance mirrored): a directory→file swap in the same pass
-// lands the file at the prefix path first, clearing the
-// directory, so the delete of a descendant beneath it fails
-// ENOTDIR — the descendant was destroyed by that write, and
-// the absence the delete asks for holds. Any other delete
-// failure still aborts.
+// deletion whose path is already gone is not an error.
+//
+// A deletion whose ancestor this same pass already replaced is
+// skipped outright, lexically: the replacement destroyed
+// whatever stood beneath it in staging (both writers remove a
+// directory standing at their target), so the absence the
+// delete asks for already holds — and performing the remove
+// anyway would resolve the path through the replacement. For a
+// directory→file swap that resolution is merely ENOTDIR (the
+// targetGone tolerance below, the journal's mirrored); for a
+// directory→symlink swap it is a confinement breach: the
+// remove follows the freshly installed link and deletes the
+// named file from the link's target, outside the staging tree.
+// The pass therefore never touches a path whose ancestor it
+// itself replaced. Any other delete failure still aborts.
 func overlayDelta(ctx *Context, stage, commit string, d treeDelta) error {
 	if len(d.paths) == 0 {
 		return nil
@@ -285,9 +292,13 @@ func overlayDelta(ctx *Context, stage, commit string, d treeDelta) error {
 	if err := ctx.Snaps.ExtractWorkspace(commit, src); err != nil {
 		return err
 	}
+	replaced := map[string]bool{}
 	for _, rel := range d.paths {
 		dst := filepath.Join(stage, filepath.FromSlash(rel))
 		if d.deleted[rel] {
+			if replacedAncestor(rel, replaced) {
+				continue
+			}
 			if err := os.Remove(dst); err != nil && !targetGone(err) {
 				return fmt.Errorf("settle: apply deletion of %s in union staging: %w", rel, err)
 			}
@@ -303,11 +314,26 @@ func overlayDelta(ctx *Context, stage, commit string, d treeDelta) error {
 			if err := replaceWithSymlink(dst, target); err != nil {
 				return err
 			}
+			replaced[rel] = true
 			continue
 		}
 		if err := copyFileAtomic(srcPath, dst, permForMode(entry.Mode)); err != nil {
 			return err
 		}
+		replaced[rel] = true
 	}
 	return nil
+}
+
+// replacedAncestor reports whether any proper ancestor of rel
+// is in the pass's replaced set — see overlayDelta for why a
+// deletion under a replaced ancestor is skipped lexically
+// rather than performed.
+func replacedAncestor(rel string, replaced map[string]bool) bool {
+	for p := pathParent(rel); p != ""; p = pathParent(p) {
+		if replaced[p] {
+			return true
+		}
+	}
+	return false
 }

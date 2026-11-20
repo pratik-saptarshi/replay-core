@@ -837,3 +837,118 @@ func TestApplySettlesFileToDirSwap(t *testing.T) {
 			[]string{"r.txt"})
 	})
 }
+
+// TestApplyDirToSymlinkSwapStaysInStaging (PR #7 review,
+// Codex P1): a delta that replaces a directory with a symlink
+// installs the link before the descendant deletion in the
+// overlay's sorted order (old sorts before old/inner.txt). The
+// deletion must never be performed through the freshly
+// installed link: os.Remove follows the ancestor symlink and
+// would delete inner.txt from the link's target — a real
+// directory outside the staging tree — while merely building
+// the union artifact. The outside tree must survive byte-for-
+// byte, and the apply must still settle to the exact union.
+func TestApplyDirToSymlinkSwapStaysInStaging(t *testing.T) {
+	build := func(dir string) {
+		writeTestFile(t, filepath.Join(dir, "old", "inner.txt"), "inner original\n", 0o644)
+		writeTestFile(t, filepath.Join(dir, "p.txt"), "p original\n", 0o644)
+		writeTestFile(t, filepath.Join(dir, "r.txt"), "r original\n", 0o644)
+	}
+	// outside stands outside every staging tree, holding its
+	// own inner.txt — the file a traversing delete would kill.
+	newOutside := func(t *testing.T, f *fixture) string {
+		t.Helper()
+		outside := filepath.Join(filepath.Dir(f.root), "outside")
+		writeTestFile(t, filepath.Join(outside, "inner.txt"), "outside inner — must survive\n", 0o644)
+		writeTestFile(t, filepath.Join(outside, "other.txt"), "outside other\n", 0o644)
+		return outside
+	}
+	linkSwap := func(t *testing.T, dir, target string) {
+		t.Helper()
+		if err := os.RemoveAll(filepath.Join(dir, "old")); err != nil {
+			t.Fatalf("remove old directory: %v", err)
+		}
+		if err := os.Symlink(target, filepath.Join(dir, "old")); err != nil {
+			t.Fatalf("symlink old -> %s: %v", target, err)
+		}
+	}
+	buildExpected := func(t *testing.T, f *fixture, name, target, pContent, rContent string) string {
+		t.Helper()
+		expectedDir := filepath.Join(filepath.Dir(f.root), name)
+		writeTestFile(t, filepath.Join(expectedDir, "keep.txt"), "keep\n", 0o644)
+		writeTestFile(t, filepath.Join(expectedDir, "mod.txt"), "original\n", 0o644)
+		if err := os.Symlink(target, filepath.Join(expectedDir, "old")); err != nil {
+			t.Fatalf("symlink expected old: %v", err)
+		}
+		writeTestFile(t, filepath.Join(expectedDir, "p.txt"), pContent, 0o644)
+		writeTestFile(t, filepath.Join(expectedDir, "r.txt"), rContent, 0o644)
+		return expectedDir
+	}
+	assertOutsideIntact := func(t *testing.T, outside, hashBefore string) {
+		t.Helper()
+		if got := walkHash(t, outside); got != hashBefore {
+			t.Fatalf("outside tree changed across Apply: hash %s, want %s (the union build escaped staging)", got, hashBefore)
+		}
+		b, err := os.ReadFile(filepath.Join(outside, "inner.txt"))
+		if err != nil {
+			t.Fatalf("outside inner.txt after Apply: %v (deleted through the installed symlink?)", err)
+		}
+		if string(b) != "outside inner — must survive\n" {
+			t.Fatalf("outside inner.txt = %q, want its original bytes", b)
+		}
+	}
+
+	t.Run("run side", func(t *testing.T) {
+		f := newFixture(t)
+		forkHead := extendParentTree(t, f, build)
+		outside := newOutside(t, f)
+		layer, err := settle.Fork(f.ctx, "parent", "run-a")
+		if err != nil {
+			t.Fatalf("Fork: %v", err)
+		}
+		linkSwap(t, layer.Dir, outside)
+		runHead := f.advanceRun(t, layer, "run-a", forkHead)
+
+		// The parent changes a disjoint path.
+		writeTestFile(t, filepath.Join(f.parentDir, "p.txt"), "p parent\n", 0o644)
+		parentHead := advanceParent(t, f)
+
+		outsideHash := walkHash(t, outside)
+		receipt, err := settle.Apply(f.ctx, "parent", f.parentDir, "run-a", "op-1")
+		if err != nil {
+			t.Fatalf("Apply of disjoint run-side dir-to-symlink swap: %v", err)
+		}
+		assertOutsideIntact(t, outside, outsideHash)
+		expectedDir := buildExpected(t, f, "expected-run-link-swap", outside, "p parent\n", "r original\n")
+		assertSettledUnion(t, f, receipt, forkHead, parentHead, runHead, expectedDir,
+			[]string{"old", "old/inner.txt"})
+	})
+
+	t.Run("parent side", func(t *testing.T) {
+		f := newFixture(t)
+		forkHead := extendParentTree(t, f, build)
+		outside := newOutside(t, f)
+		layer, err := settle.Fork(f.ctx, "parent", "run-a")
+		if err != nil {
+			t.Fatalf("Fork: %v", err)
+		}
+		writeTestFile(t, filepath.Join(layer.Dir, "r.txt"), "r run\n", 0o644)
+		runHead := f.advanceRun(t, layer, "run-a", forkHead)
+
+		// The parent performs the swap on its side; its delta
+		// is overlaid first, so the escape would happen in the
+		// parent's own pass.
+		linkSwap(t, f.parentDir, outside)
+		parentHead := advanceParent(t, f)
+
+		outsideHash := walkHash(t, outside)
+		receipt, err := settle.Apply(f.ctx, "parent", f.parentDir, "run-a", "op-1")
+		if err != nil {
+			t.Fatalf("Apply of disjoint parent-side dir-to-symlink swap: %v", err)
+		}
+		assertOutsideIntact(t, outside, outsideHash)
+		expectedDir := buildExpected(t, f, "expected-parent-link-swap", outside, "p original\n", "r run\n")
+		assertSettledUnion(t, f, receipt, forkHead, parentHead, runHead, expectedDir,
+			[]string{"r.txt"})
+	})
+}
