@@ -242,11 +242,14 @@ func buildUnionTree(ctx *Context, forkCommit, parentCommit, runCommit string, pa
 	return resultCommit, nil
 }
 
-// overlayDelta applies one side's delta to the staging tree:
-// deletions first (a deletion can clear the way for a path
-// whose shape changed), then the added/changed entries copied
-// whole from an extraction of the side's tree — blobs come from
-// that tree and nothing else; no content is merged.
+// overlayDelta applies one side's delta to the staging tree in
+// a single pass over the delta's paths in sorted order: each
+// path is either deleted or copied whole from an extraction of
+// the side's tree — blobs come from that tree and nothing else;
+// no content is merged. Sorted order places a prefix path
+// before its descendants, so a deletion that changes a path's
+// shape lands before the entries beneath it are written, and a
+// deletion whose path is already gone is not an error.
 func overlayDelta(ctx *Context, stage, commit string, d treeDelta) error {
 	if len(d.paths) == 0 {
 		return nil

@@ -52,8 +52,10 @@ func pathsOverlapIn(parentDir, a, b string) bool {
 // canonicalPath returns rel's canonical form inside root (an
 // already-resolved absolute directory): the path cleaned, then
 // symlinks resolved over its longest existing ancestor inside
-// root, with the remainder re-appended. A path whose every
-// ancestor exists resolves in full; a path to a not-yet-existing
+// root, with the remainder re-appended. The final component is
+// always part of the remainder, never resolved: a path that IS
+// a symlink denotes the symlink itself — a delta may delete or
+// replace it — not its target. A path to a not-yet-existing
 // file resolves as far as its deepest existing ancestor — which
 // is exactly where an alias can hide, since an alias is an
 // existing symlinked component. A prefix that exists but does
@@ -63,7 +65,7 @@ func pathsOverlapIn(parentDir, a, b string) bool {
 func canonicalPath(root, rel string) string {
 	clean := path.Clean(rel)
 	parts := strings.Split(clean, "/")
-	for n := len(parts); n >= 1; n-- {
+	for n := len(parts) - 1; n >= 0; n-- {
 		cand := filepath.Join(root, filepath.FromSlash(strings.Join(parts[:n], "/")))
 		if _, err := os.Lstat(cand); err != nil {
 			continue

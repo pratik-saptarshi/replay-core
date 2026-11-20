@@ -367,6 +367,77 @@ func TestApplySettlesAliasShapedDisjoint(t *testing.T) {
 	}
 }
 
+// TestApplySettlesReplacedAliasDisjoint (plan Task 7,
+// amendment F5; pins review finding F-1): the run REPLACES the
+// alias with a real directory — its delta is {link deleted,
+// link/f.txt added} — while the parent modifies sub/g.txt.
+// Canonical form resolves a path's ancestors only, never the
+// path itself, so the deleted symlink's canonical form is link,
+// not sub: it does not drag everything under its target into
+// the run's delta. The changes are genuinely disjoint and
+// settle: the parent tree serves link/f.txt with the run's
+// bytes (under a real directory), sub/g.txt with the parent's,
+// and sub/f.txt with the fork's.
+func TestApplySettlesReplacedAliasDisjoint(t *testing.T) {
+	f := newFixture(t)
+	forkHead := extendParentTree(t, f, func(dir string) {
+		writeTestFile(t, filepath.Join(dir, "sub", "f.txt"), "f original\n", 0o644)
+		writeTestFile(t, filepath.Join(dir, "sub", "g.txt"), "g original\n", 0o644)
+		if err := os.Symlink("sub", filepath.Join(dir, "link")); err != nil {
+			t.Fatalf("create link -> sub: %v", err)
+		}
+	})
+	layer, err := settle.Fork(f.ctx, "parent", "run-a")
+	if err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+
+	// The run replaces the alias with a real directory and
+	// writes link/f.txt inside it.
+	if err := os.Remove(filepath.Join(layer.Dir, "link")); err != nil {
+		t.Fatalf("run removes the link alias: %v", err)
+	}
+	writeTestFile(t, filepath.Join(layer.Dir, "link", "f.txt"), "f run\n", 0o644)
+	f.advanceRun(t, layer, "run-a", forkHead)
+
+	// The parent modifies sub/g.txt — genuinely disjoint from
+	// the run's {link, link/f.txt}.
+	writeTestFile(t, filepath.Join(f.parentDir, "sub", "g.txt"), "g parent\n", 0o644)
+	advanceParent(t, f)
+
+	if _, err := settle.Apply(f.ctx, "parent", f.parentDir, "run-a", "op-1"); err != nil {
+		t.Fatalf("Apply of genuinely disjoint replaced-alias changes: %v (no false refusal)", err)
+	}
+	if got := readParentFile(t, f, "link/f.txt"); got != "f run\n" {
+		t.Fatalf("parent link/f.txt = %q, want run's bytes %q", got, "f run\n")
+	}
+	if got := readParentFile(t, f, "sub/g.txt"); got != "g parent\n" {
+		t.Fatalf("parent sub/g.txt = %q, want parent's bytes %q", got, "g parent\n")
+	}
+	if got := readParentFile(t, f, "sub/f.txt"); got != "f original\n" {
+		t.Fatalf("parent sub/f.txt = %q, want fork's bytes %q", got, "f original\n")
+	}
+	// The alias is gone from the settled tree: link is now the
+	// run's real directory.
+	info, err := os.Lstat(filepath.Join(f.parentDir, "link"))
+	if err != nil {
+		t.Fatalf("lstat parent link: %v", err)
+	}
+	if !info.IsDir() || info.Mode()&fs.ModeSymlink != 0 {
+		t.Fatalf("parent link mode = %v, want a real directory (the alias replaced)", info.Mode())
+	}
+	// Exactly one apply fact; its settled_paths are the run
+	// delta — the deleted alias and the added file — sorted.
+	facts := applyFacts(t, f, "run-a")
+	if len(facts) != 1 {
+		t.Fatalf("apply facts on run-a = %d, want 1", len(facts))
+	}
+	got := factStringList(t, factBody(t, facts[0]), "settled_paths")
+	if want := []string{"link", "link/f.txt"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("settled_paths = %v, want run delta sorted %v", got, want)
+	}
+}
+
 // TestConsumeOnceAcrossVerbsWithApply (plan Task 7, Step 7;
 // AC-F6-6, amendment F13): the consume-once scan is shared by
 // every verb, so a run settled by any one of them is consumed
