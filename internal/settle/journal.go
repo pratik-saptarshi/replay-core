@@ -865,19 +865,147 @@ func targetGone(err error) bool {
 	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
 }
 
+// statPreimage stats rel's preimage inside the preimage tree,
+// lexically: the ancestor components are walked one by one
+// with Lstat, and the walk stops — reporting no preimage — at
+// the first ancestor that does not stand as a real directory
+// there. The stop matters because the preimage tree stores a
+// symlink occupant's preimage AS a symlink: a plain Lstat of
+// the full path would resolve through that stored link and
+// find the link target's live file, mistaking another tree's
+// file for this unit's preimage (the symlink→directory swap:
+// pre/old is the restored link, and pre/old/inner.txt reads as
+// the outside target's unchanged inner.txt). Capture is
+// lexical — it never records anything beneath a symlink or a
+// file — so a path whose preimage-tree ancestors do not all
+// stand as real directories has no preimage of its own,
+// whatever a resolving stat would find there.
+func statPreimage(preDir, rel string) (fs.FileInfo, bool, error) {
+	parts := strings.Split(rel, "/")
+	cur := preDir
+	for _, part := range parts[:len(parts)-1] {
+		cur = filepath.Join(cur, part)
+		info, err := os.Lstat(cur)
+		if err != nil {
+			if targetGone(err) {
+				return nil, false, nil
+			}
+			return nil, false, fmt.Errorf("settle: stat preimage ancestor %s: %w", cur, err)
+		}
+		if !info.IsDir() {
+			return nil, false, nil
+		}
+	}
+	pre := filepath.Join(preDir, filepath.FromSlash(rel))
+	info, err := os.Lstat(pre)
+	if err != nil {
+		if targetGone(err) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("settle: stat preimage %s: %w", pre, err)
+	}
+	return info, true, nil
+}
+
+// blockedByAncestor reports whether rel, read inside the live
+// parentDir, fails to resolve through real directories of that
+// tree: some proper ancestor component stands as a symlink
+// (the path then names another tree's file — above all a
+// symlink an earlier rollback pass restored from its
+// preimage), a plain file (the path names nothing), or is
+// missing (likewise). Rollback decides such paths lexically
+// and never reaches through the replacement: the occupant a
+// unit created beneath a since-restored ancestor is not
+// reachable in this tree, and removing or restoring through
+// the ancestor would delete and write in the tree the symlink
+// names. The walk is component-wise from the top, stopping at
+// the first non-directory, so no step ever resolves through a
+// component a previous step has not cleared.
+func blockedByAncestor(parentDir, rel string) (bool, error) {
+	parts := strings.Split(rel, "/")
+	cur := parentDir
+	for _, part := range parts[:len(parts)-1] {
+		cur = filepath.Join(cur, part)
+		info, err := os.Lstat(cur)
+		if err != nil {
+			if targetGone(err) {
+				return true, nil
+			}
+			return false, fmt.Errorf("settle: stat ancestor %s: %w", cur, err)
+		}
+		if !info.IsDir() {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// symlinkAncestor reports whether some proper ancestor
+// component of rel inside parentDir stands as a symlink. The
+// walk is component-wise from the top and stops at the first
+// component that names nothing or is not a directory: nothing
+// beneath such a component can be a symlink of this tree, and
+// no step resolves through a component a previous step has
+// not cleared.
+func symlinkAncestor(parentDir, rel string) (bool, error) {
+	parts := strings.Split(rel, "/")
+	cur := parentDir
+	for _, part := range parts[:len(parts)-1] {
+		cur = filepath.Join(cur, part)
+		info, err := os.Lstat(cur)
+		if err != nil {
+			if targetGone(err) {
+				return false, nil
+			}
+			return false, fmt.Errorf("settle: stat ancestor %s: %w", cur, err)
+		}
+		if info.Mode()&fs.ModeSymlink != 0 {
+			return true, nil
+		}
+		if !info.IsDir() {
+			return false, nil
+		}
+	}
+	return false, nil
+}
+
+// removeCreatedOccupant removes the occupant a write unit
+// created at dst — unless an ancestor of rel stands replaced
+// in the live tree (blockedByAncestor), in which case the
+// occupant is not reachable in this tree and the absence the
+// undo asks for already holds: an earlier rollback pass
+// restored the ancestor's pre-state occupant, destroying (or
+// shadowing) whatever the unit created beneath it, and the
+// only thing still naming the unit's path is the replacement
+// itself, above all a restored symlink whose target settlement
+// has no claim to.
+func removeCreatedOccupant(parentDir, rel, dst string) error {
+	blocked, err := blockedByAncestor(parentDir, rel)
+	if err != nil {
+		return err
+	}
+	if blocked {
+		return nil
+	}
+	return removeOccupant(dst)
+}
+
 // undoWriteUnit reverses one applied write unit: if the target
 // had a preimage, the preimage is restored; if it had none, the
 // unit created the occupant and it is removed.
 //
 // Two shape-changing cases (Task 8 fix round) have no file
-// preimage of their own, and both end at removeOccupant:
+// preimage of their own, and both end at removeCreatedOccupant:
 //
-//   - the preimage stat fails ENOTDIR: an ancestor component of
-//     the preimage path is a file — another unit's preimage
-//     (the file→directory swap: the delete unit's preimage sits
-//     at pre/old.txt, shadowing everything beneath it). Capture
-//     is lexical, so nothing was ever recorded beneath a file;
-//     there is no preimage at this path.
+//   - no preimage beneath a non-directory ancestor of the
+//     preimage path: another unit's preimage stands there (the
+//     file→directory swap: the delete unit's file preimage sits
+//     at pre/old.txt, shadowing everything beneath it; the
+//     symlink→directory swap: the delete unit's SYMLINK preimage
+//     sits at pre/old). Capture is lexical, so nothing was ever
+//     recorded beneath either; there is no preimage at this
+//     path — and statPreimage decides that lexically, never by
+//     resolving through the stored preimage.
 //   - the preimage path is a directory: it exists only to hold
 //     the preimages of the units beneath the target (the
 //     directory→file swap: pre/old.txt/ holds inner.txt's
@@ -887,18 +1015,14 @@ func targetGone(err error) bool {
 //     would wedge recovery on a lawful shape.
 func undoWriteUnit(parentDir, preDir, rel string) error {
 	dst := filepath.Join(parentDir, filepath.FromSlash(rel))
-	pre := filepath.Join(preDir, filepath.FromSlash(rel))
-	preInfo, err := os.Lstat(pre)
+	preInfo, hasPreimage, err := statPreimage(preDir, rel)
 	if err != nil {
-		if targetGone(err) {
-			return removeOccupant(dst)
-		}
-		return fmt.Errorf("settle: stat preimage %s: %w", pre, err)
+		return err
 	}
-	if preInfo.IsDir() {
-		return removeOccupant(dst)
+	if !hasPreimage || preInfo.IsDir() {
+		return removeCreatedOccupant(parentDir, rel, dst)
 	}
-	return restorePreimage(dst, pre)
+	return restorePreimage(parentDir, preDir, rel)
 }
 
 // undoDeleteUnit reverses one applied delete unit by restoring
@@ -906,14 +1030,12 @@ func undoWriteUnit(parentDir, preDir, rel string) error {
 // so a missing preimage contradicts the journal: a descriptive
 // refusal, never a guess.
 func undoDeleteUnit(parentDir, preDir, rel string) error {
-	dst := filepath.Join(parentDir, filepath.FromSlash(rel))
-	pre := filepath.Join(preDir, filepath.FromSlash(rel))
-	if _, err := os.Lstat(pre); errors.Is(err, fs.ErrNotExist) {
+	if _, hasPreimage, err := statPreimage(preDir, rel); err != nil {
+		return err
+	} else if !hasPreimage {
 		return fmt.Errorf("settle: delete unit %q is marked done but has no preimage — journal and staging disagree", rel)
-	} else if err != nil {
-		return fmt.Errorf("settle: stat preimage %s: %w", pre, err)
 	}
-	return restorePreimage(dst, pre)
+	return restorePreimage(parentDir, preDir, rel)
 }
 
 // removeOccupant removes whatever stands at dst — a file, a
@@ -947,11 +1069,33 @@ func removeOccupant(dst string) error {
 	return nil
 }
 
-// restorePreimage puts the preimage at pre back at dst: the
-// current occupant is removed, the parent directory recreated,
-// and the preimage's kind restored — a symlink's target, or a
-// regular file's bytes and mode.
-func restorePreimage(dst, pre string) error {
+// restorePreimage puts rel's preimage back at its path in
+// parentDir: the current occupant is removed, the parent
+// directory recreated, and the preimage's kind restored — a
+// symlink's target, or a regular file's bytes and mode.
+//
+// A unit that HAS a preimage had real directories for
+// ancestors when the preimage was captured (capture is
+// lexical), and no unit's undo can have restored a symlink at
+// an ancestor of such a path — that unit's preimage would be
+// the symlink, contradicting this unit's preimage beneath it.
+// So a symlink standing at an ancestor here means the journal
+// and the tree disagree, and restoration refuses descriptively
+// rather than remove, create, or write through the link into
+// whatever tree it names. A MISSING ancestor is lawful, not a
+// disagreement: an earlier undo in the same rollback removed
+// what stood there (the directory→file swap's landed file),
+// and the restore recreates the directory itself.
+func restorePreimage(parentDir, preDir, rel string) error {
+	dst := filepath.Join(parentDir, filepath.FromSlash(rel))
+	pre := filepath.Join(preDir, filepath.FromSlash(rel))
+	throughLink, err := symlinkAncestor(parentDir, rel)
+	if err != nil {
+		return err
+	}
+	if throughLink {
+		return fmt.Errorf("settle: restore %s: an ancestor stands as a symlink — journal and staging disagree", rel)
+	}
 	preInfo, err := os.Lstat(pre)
 	if err != nil {
 		return fmt.Errorf("settle: stat preimage %s: %w", pre, err)
