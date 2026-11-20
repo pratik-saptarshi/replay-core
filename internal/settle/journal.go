@@ -585,11 +585,29 @@ func materialize(ctx *Context, req materializeRequest) error {
 			implied[parent] = true
 		}
 	}
+	// Directories beneath a path a write unit replaced are
+	// excluded lexically, without resolving them: the write
+	// destroyed the pre-materialization directory at its own
+	// target (both writers remove what stood there), so a
+	// curDirs entry beneath it no longer names a directory of
+	// this tree — resolving it now would follow the
+	// replacement, and for a directory→symlink swap the Lstat
+	// below would find the LINK TARGET's directory at that
+	// relative path and the prune would remove it, outside the
+	// tree, invisible to the verify and unrestorable by the
+	// journal. The same lexical decision the union builder
+	// makes for its deletions (replacedAncestor, apply.go).
+	replaced := map[string]bool{}
+	for _, u := range j.Units {
+		if u.Kind == unitWrite {
+			replaced[u.Path] = true
+		}
+	}
 	sort.Slice(curDirs, func(a, b int) bool {
 		return strings.Count(curDirs[a], "/") > strings.Count(curDirs[b], "/")
 	})
 	for _, d := range curDirs {
-		if implied[d] {
+		if implied[d] || replacedAncestor(d, replaced) {
 			continue
 		}
 		dst := filepath.Join(req.parentDir, filepath.FromSlash(d))

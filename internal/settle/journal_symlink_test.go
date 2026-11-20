@@ -92,6 +92,156 @@ func newSymlinkSwapFixture(t *testing.T) (*journalFixture, string) {
 	}, targetDir
 }
 
+// newDirToSymlinkFixture mirrors newDirSwapFixture, but the
+// shape swap runs the other way: the parent tree holds old as
+// a real DIRECTORY (old/inner.txt, and an empty old/sub), and
+// an outside target directory — holding its own inner.txt and
+// its own empty sub — waits for the run to point a symlink at
+// it. A third directory, gone, stands empty in the parent and
+// in no tree: the pruning control, legitimately pruned by any
+// correct settle.
+func newDirToSymlinkFixture(t *testing.T) (*journalFixture, string) {
+	t.Helper()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	scratch, err := os.MkdirTemp(wd, ".settle-journal-fixture-")
+	if err != nil {
+		t.Fatalf("create btrfs scratch dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(scratch) })
+
+	targetDir := filepath.Join(scratch, "target")
+	journalWriteFile(t, filepath.Join(targetDir, "inner.txt"), "target inner\n", 0o644)
+	if err := os.MkdirAll(filepath.Join(targetDir, "sub"), 0o755); err != nil {
+		t.Fatalf("create target sub: %v", err)
+	}
+
+	parentDir := filepath.Join(scratch, "parent")
+	journalWriteFile(t, filepath.Join(parentDir, "keep.txt"), "keep\n", 0o644)
+	journalWriteFile(t, filepath.Join(parentDir, "mod.txt"), "original\n", 0o644)
+	journalWriteFile(t, filepath.Join(parentDir, "old", "inner.txt"), "inner\n", 0o644)
+	if err := os.MkdirAll(filepath.Join(parentDir, "old", "sub"), 0o755); err != nil {
+		t.Fatalf("create parent old/sub: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(parentDir, "gone"), 0o755); err != nil {
+		t.Fatalf("create parent gone: %v", err)
+	}
+	for _, args := range [][]string{
+		{"init", "-q"},
+		{"add", "-A"},
+		{"-c", "user.name=settle-test", "-c", "user.email=settle-test@localhost", "commit", "-q", "-m", "parent"},
+	} {
+		full := append([]string{"-C", parentDir}, args...)
+		cmd := exec.Command("git", full...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+
+	tracePath := filepath.Join(scratch, "trace.db")
+	traceStore, err := store.Open(tracePath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = traceStore.Close() })
+	snapsPath := filepath.Join(scratch, "snaps.git")
+	snaps, err := snapshot.Open(snapsPath)
+	if err != nil {
+		t.Fatalf("snapshot.Open: %v", err)
+	}
+	parent0, err := snaps.Snapshot(parentDir, map[string]string{"run": "settle-journal-fixture"})
+	if err != nil {
+		t.Fatalf("Snapshot parent: %v", err)
+	}
+	if err := snaps.Fork("parent", parent0); err != nil {
+		t.Fatalf("Fork parent scope: %v", err)
+	}
+	root := filepath.Join(scratch, "settle-root")
+	return &journalFixture{
+		ctx:       &Context{Trace: traceStore, Snaps: snaps, Root: root},
+		trace:     traceStore,
+		snaps:     snaps,
+		root:      root,
+		parentDir: parentDir,
+		parent0:   parent0,
+		scratch:   scratch,
+		tracePath: tracePath,
+		snapsPath: snapsPath,
+	}, targetDir
+}
+
+// TestSelectDirToSymlinkSwapPruneStaysInTree (PR #7 wave 2,
+// Codex P2): the materializer's directory pruning must not
+// resolve through a symlink the same materialization
+// installed. The run replaces the directory old with a symlink
+// to an outside target. The pre-materialization inventory
+// still lists old/sub as a directory of the parent; after the
+// write lands, resolving old/sub follows the freshly installed
+// link and names the TARGET's sub — and the prune, which
+// removes any still-directory it finds there, deletes the
+// outside directory. The snapshot verification cannot see it
+// (the parent's file map is exactly right) and the journal
+// cannot restore it (no unit ever named it). The prune must
+// exclude descendants of replaced ancestors lexically, the
+// same decision the union builder makes — while still pruning
+// a genuinely stale directory (gone) in the same settle.
+func TestSelectDirToSymlinkSwapPruneStaysInTree(t *testing.T) {
+	f, targetDir := newDirToSymlinkFixture(t)
+	layer, err := Fork(f.ctx, "parent", "run-a")
+	if err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+	if err := os.Remove(filepath.Join(layer.Dir, "old", "inner.txt")); err != nil {
+		t.Fatalf("remove layer inner.txt: %v", err)
+	}
+	if err := os.Remove(filepath.Join(layer.Dir, "old")); err != nil {
+		t.Fatalf("remove layer old dir: %v", err)
+	}
+	if err := os.Symlink(targetDir, filepath.Join(layer.Dir, "old")); err != nil {
+		t.Fatalf("symlink layer old: %v", err)
+	}
+	advanceRun(t, f, "run-a", layer.Dir)
+
+	targetHash := hashTree(t, targetDir)
+
+	if _, err := Select(f.ctx, "parent", f.parentDir, "run-a", "op-w2p"); err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+
+	// The outside tree is byte-identical, including the empty
+	// directory no file-map hash can see.
+	if got := hashTree(t, targetDir); got != targetHash {
+		t.Fatalf("target walk hash after Select = %s, want %s", got, targetHash)
+	}
+	if info, err := os.Stat(filepath.Join(targetDir, "sub")); err != nil || !info.IsDir() {
+		t.Fatalf("target sub after Select: info = %v, err = %v; want the outside directory untouched (pruning escaped the tree)", info, err)
+	}
+	if b, err := os.ReadFile(filepath.Join(targetDir, "inner.txt")); err != nil || string(b) != "target inner\n" {
+		t.Fatalf("target inner.txt after Select = %q, %v; want the unchanged outside file", b, err)
+	}
+
+	// The parent serves exactly the settled tree, and pruning
+	// itself still works inside it: the stale empty directory
+	// is gone.
+	expected := filepath.Join(f.scratch, "expected")
+	journalWriteFile(t, filepath.Join(expected, "keep.txt"), "keep\n", 0o644)
+	journalWriteFile(t, filepath.Join(expected, "mod.txt"), "original\n", 0o644)
+	if err := os.Symlink(targetDir, filepath.Join(expected, "old")); err != nil {
+		t.Fatalf("symlink expected old: %v", err)
+	}
+	if got, want := hashTree(t, f.parentDir), hashTree(t, expected); got != want {
+		t.Fatalf("parent walk hash after Select = %s, want %s", got, want)
+	}
+	if _, err := os.Stat(filepath.Join(f.parentDir, "gone")); !os.IsNotExist(err) {
+		t.Fatalf("parent gone after Select: err = %v, want pruned", err)
+	}
+	if facts := f.journalFacts(t, "run-a"); len(facts) != 1 {
+		t.Fatalf("settle facts after Select = %d, want exactly 1", len(facts))
+	}
+}
+
 // TestRecoverRepeatsSymlinkToDirRollback (PR #7 wave 2, Codex
 // P1): rollback must never traverse a symlink it restored
 // itself. The fork tree holds old as a symlink to an outside
