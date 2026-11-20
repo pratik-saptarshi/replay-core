@@ -47,7 +47,10 @@ func rawUnit(path, kind string, done, started bool) canonical.Value {
 // writeRawJournal writes a select journal for op in state
 // applying directly in canonical form (the shape writeJournal
 // produces), bypassing the journal struct so the fixture does
-// not depend on fields the unfixed code does not have.
+// not depend on fields the unfixed code does not have. It
+// also records the parent anchor writeJournal leaves beside
+// every journal it writes, so the fixture's on-disk state is
+// the full state a crash in the window leaves.
 func writeRawJournal(t *testing.T, f *journalFixture, op string, units []canonical.Value) {
 	t.Helper()
 	v := canonical.ObjectOf(
@@ -72,6 +75,9 @@ func writeRawJournal(t *testing.T, f *journalFixture, op string, units []canonic
 	}
 	if err := os.WriteFile(jpath, b, 0o644); err != nil {
 		t.Fatal(err)
+	}
+	if err := writeParentAnchor(f.root, "parent", f.parentDir); err != nil {
+		t.Fatalf("write parent anchor: %v", err)
 	}
 }
 

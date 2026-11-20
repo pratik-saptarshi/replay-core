@@ -1,6 +1,7 @@
 package settle
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -106,6 +107,16 @@ type journalUnit struct {
 // recovering process can reach, so the materializer records the
 // target directory at planned time alongside the rest. (Flagged
 // in the Task 8 report.)
+//
+// Because ParentDir steers every write rollback makes, the
+// journal never vouches for it alone: writeJournal records the
+// directory in an independent parent anchor (see
+// writeParentAnchor) before the journal itself lands, and
+// Recover acts on a journal only when the anchor vouches for
+// the directory it names — a journal file that arrives without
+// the system's writer (planted, transplanted from another
+// root, restored from a stray backup) carries no anchor and
+// is refused, never acted on.
 type journal struct {
 	Op           string
 	Verb         string // verbSelect | verbApply
@@ -127,10 +138,151 @@ func stagingDirFor(root, op string) string {
 	return filepath.Join(root, "staging", op)
 }
 
+// journalAnchorPath returns the path of parentScope's parent
+// anchor: Root/journals/<parentScope>.anchor. The name
+// deliberately carries no .json suffix, so otherStagingOwner's
+// census of the journals directory (which scans for *.json)
+// never mistakes the anchor for a journal.
+func journalAnchorPath(root, parentScope string) string {
+	return filepath.Join(root, "journals", parentScope+".anchor")
+}
+
+// parentAnchor is the independent record that vouches for a
+// journal's parent directory: the (scope, directory) pair the
+// system's writer recorded under the settle root when the
+// settlement was materialized. It is the anchor the stored-
+// state rule requires — a durable record's field that steers
+// filesystem effects (the journal's parent_dir, which selects
+// the tree every validated unit path applies to) is checked
+// against a record the journal itself is not, so a journal
+// whose parent_dir no anchor vouches for is refused rather
+// than acted on.
+type parentAnchor struct {
+	ParentScope string
+	ParentDir   string
+}
+
+// writeParentAnchor records (parentScope, parentDir) as the
+// scope's parent anchor: canonical JSON to a temp file in the
+// journals directory, fsynced, renamed into place, and the
+// directory fsynced — the writeJournal discipline, so the
+// anchor is durable before the journal it vouches for lands.
+func writeParentAnchor(root, parentScope, parentDir string) error {
+	v := canonical.ObjectOf(
+		canonical.Pair{Key: "parent_dir", Value: canonical.StringOf(parentDir)},
+		canonical.Pair{Key: "parent_scope", Value: canonical.StringOf(parentScope)},
+	)
+	b, err := canonical.MarshalKernel(v)
+	if err != nil {
+		return fmt.Errorf("settle: marshal parent anchor for %q: %w", parentScope, err)
+	}
+	dir := filepath.Join(root, "journals")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("settle: create journals dir: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, ".anchor-*")
+	if err != nil {
+		return fmt.Errorf("settle: create parent anchor temp: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if _, err := tmp.Write(b); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("settle: write parent anchor temp: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("settle: fsync parent anchor temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("settle: close parent anchor temp: %w", err)
+	}
+	if err := os.Rename(tmpName, journalAnchorPath(root, parentScope)); err != nil {
+		return fmt.Errorf("settle: rename parent anchor into place: %w", err)
+	}
+	return syncDir(dir)
+}
+
+// readParentAnchor loads parentScope's parent anchor. A
+// missing anchor is (zero, false, nil) — no settlement's
+// writer recorded one. An anchor that does not decode to the
+// recorded shape is a descriptive error: the anchor is never
+// guessed at either.
+func readParentAnchor(root, parentScope string) (parentAnchor, bool, error) {
+	b, err := os.ReadFile(journalAnchorPath(root, parentScope))
+	if errors.Is(err, fs.ErrNotExist) {
+		return parentAnchor{}, false, nil
+	}
+	if err != nil {
+		return parentAnchor{}, false, fmt.Errorf("settle: read parent anchor for %q: %w", parentScope, err)
+	}
+	v, err := canonical.DecodeKernel(b)
+	if err != nil {
+		return parentAnchor{}, false, fmt.Errorf("settle: parent anchor for %q does not decode: %w", parentScope, err)
+	}
+	var a parentAnchor
+	for key, dst := range map[string]*string{
+		"parent_scope": &a.ParentScope,
+		"parent_dir":   &a.ParentDir,
+	} {
+		s, ok := stringField(v, key)
+		if !ok || s == "" {
+			return parentAnchor{}, false, fmt.Errorf("settle: parent anchor for %q: field %q is missing or not a non-empty string", parentScope, key)
+		}
+		*dst = s
+	}
+	return a, true, nil
+}
+
+// ensureParentAnchor makes the anchor state match the journal
+// writeJournal is about to land: an anchor already vouching
+// for the journal's directory stands; a missing anchor is
+// recorded. An anchor naming a DIFFERENT directory while its
+// journal is still live is a refusal — re-anchoring under a
+// live journal would let a later writer redirect the earlier
+// settlement's recovery — but with no journal live the anchor
+// is debris of a settlement whose cleanup died between
+// removing the journal and removing the anchor, and the new
+// settlement's writer replaces it.
+func ensureParentAnchor(root string, j *journal) error {
+	a, found, err := readParentAnchor(root, j.ParentScope)
+	if err != nil {
+		return err
+	}
+	if found {
+		if a.ParentScope == j.ParentScope && a.ParentDir == j.ParentDir {
+			return nil
+		}
+		if _, serr := os.Stat(journalPath(root, j.ParentScope)); serr == nil {
+			return fmt.Errorf("settle: journal for %q is anchored to parent directory %q — refusing to record it under %q while that journal is live", j.ParentScope, a.ParentDir, j.ParentDir)
+		} else if !errors.Is(serr, fs.ErrNotExist) {
+			return fmt.Errorf("settle: stat journal for %q: %w", j.ParentScope, serr)
+		}
+	}
+	return writeParentAnchor(root, j.ParentScope, j.ParentDir)
+}
+
 // validOpID reports whether op is safe to name a staging
 // directory: a single path component, never a traversal.
 func validOpID(op string) bool {
 	return op != "" && op != "." && op != ".." && !strings.ContainsAny(op, `/\`)
+}
+
+// validCommitID reports whether s is a full lowercase-hex
+// SHA-1 object ID — the snapshot store's isObjectID law,
+// mirrored: the only form git's plumbing emits, and the only
+// form a journal's commit-point endpoints (old_head,
+// result_commit, the apply fact's fork_commit) may take.
+func validCommitID(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for _, c := range s {
+		if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // validUnitPath reports whether p is a safe journal unit path:
@@ -185,6 +337,12 @@ func writeJournal(root string, j *journal) error {
 	dir := filepath.Join(root, "journals")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("settle: create journals dir: %w", err)
+	}
+	// The parent anchor lands before the journal it vouches
+	// for: at no moment does a journal exist on disk whose
+	// parent directory no anchor records.
+	if err := ensureParentAnchor(root, j); err != nil {
+		return err
 	}
 	tmp, err := os.CreateTemp(dir, ".journal-*")
 	if err != nil {
@@ -335,6 +493,27 @@ func decodeJournal(v canonical.Value) (*journal, error) {
 	if !validOpID(j.Op) {
 		return nil, fmt.Errorf("op %q is not a single path component", j.Op)
 	}
+	// The journal's own names obey the same laws the verbs
+	// enforce at entry (checkScopeName): readJournal's
+	// parent_scope equality check is a self-consistency check
+	// a traversal string satisfies trivially, so decode itself
+	// refuses an unlawful name in either scope field.
+	if !validScopeName(j.ParentScope) {
+		return nil, fmt.Errorf("parent_scope %q is not a lawful scope name", j.ParentScope)
+	}
+	if !validScopeName(j.RunScope) {
+		return nil, fmt.Errorf("run_scope %q is not a lawful scope name", j.RunScope)
+	}
+	// The commit-point endpoints are object IDs or they are
+	// nothing: a free-form string here is refused at decode,
+	// not left for git to trip over downstream — or, in the
+	// rollback branch, never checked at all.
+	if !validCommitID(j.OldHead) {
+		return nil, fmt.Errorf("old_head %q is not a well-formed object ID", j.OldHead)
+	}
+	if !validCommitID(j.ResultCommit) {
+		return nil, fmt.Errorf("result_commit %q is not a well-formed object ID", j.ResultCommit)
+	}
 	if !filepath.IsAbs(j.ParentDir) {
 		return nil, fmt.Errorf("parent_dir %q is not an absolute path", j.ParentDir)
 	}
@@ -398,8 +577,12 @@ func decodeJournal(v canonical.Value) (*journal, error) {
 			return nil, errors.New("select fact's run_head does not match result_commit")
 		}
 	case verbApply:
-		if _, ok := stringField(fact, "fork_commit"); !ok {
+		forkCommit, ok := stringField(fact, "fork_commit")
+		if !ok {
 			return nil, errors.New("apply fact has no fork_commit")
+		}
+		if !validCommitID(forkCommit) {
+			return nil, fmt.Errorf("apply fact's fork_commit %q is not a well-formed object ID", forkCommit)
 		}
 		if got, ok := stringField(fact, "result_commit"); !ok || got != j.ResultCommit {
 			return nil, errors.New("apply fact's result_commit does not match result_commit")
@@ -407,6 +590,32 @@ func decodeJournal(v canonical.Value) (*journal, error) {
 		if _, ok := arrayField(fact, "settled_paths"); !ok {
 			return nil, errors.New("apply fact has no settled_paths array")
 		}
+	}
+	// The recorded fact body must be EXACTLY the body the
+	// store's constructors build from the journal's own
+	// fields — no extra field, no missing one. The cross-
+	// checks above say the parts agree; this says the whole
+	// is one the system's one construction site could have
+	// produced, so the body Recover mints from carries
+	// nothing no verb ever computed.
+	var wantBody canonical.Value
+	switch j.Verb {
+	case verbSelect:
+		wantBody = store.SettleSelectBody(j.Op, j.ParentScope, j.RunScope, j.OldHead, j.ResultCommit)
+	case verbApply:
+		forkCommit, _ := stringField(fact, "fork_commit")
+		wantBody = store.SettleApplyBody(j.Op, j.ParentScope, j.RunScope, forkCommit, j.ResultCommit, stringArrayField(fact, "settled_paths"))
+	}
+	wantBytes, err := canonical.MarshalKernel(wantBody)
+	if err != nil {
+		return nil, fmt.Errorf("rebuild fact body from the journal's fields: %w", err)
+	}
+	gotBytes, err := canonical.MarshalKernel(j.Fact)
+	if err != nil {
+		return nil, fmt.Errorf("marshal recorded fact body: %w", err)
+	}
+	if !bytes.Equal(gotBytes, wantBytes) {
+		return nil, errors.New("fact body is not the body the settlement constructors build from the journal's fields")
 	}
 	return &j, nil
 }
@@ -448,16 +657,24 @@ func otherStagingOwner(root, parentScope, op string) (owner string, unreadable b
 	return "", false
 }
 
-// clearJournalState removes parentScope's journal and the op's
-// staging directory (preimages and the result-artifact tree):
-// the settlement is complete or undone, and its operational
-// state goes with it. The staging directory is removed only
+// clearJournalState removes parentScope's journal, the parent
+// anchor that vouched for it, and the op's staging directory
+// (preimages and the result-artifact tree): the settlement is
+// complete or undone, and its operational state goes with it. The staging directory is removed only
 // when no other parent scope's journal still owns it under
 // the same op ID: one scope's cleanup must never destroy
 // another scope's durable preimages.
 func clearJournalState(root, parentScope, op string) error {
 	if err := os.Remove(journalPath(root, parentScope)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("settle: remove journal for %q: %w", parentScope, err)
+	}
+	// The parent anchor goes with the journal it vouched for:
+	// the settlement is complete or undone, and no record of
+	// its directory outlives it. (A crash between the two
+	// removals leaves anchor debris the next settlement's
+	// writer replaces — see ensureParentAnchor.)
+	if err := os.Remove(journalAnchorPath(root, parentScope)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("settle: remove parent anchor for %q: %w", parentScope, err)
 	}
 	if owner, unreadable := otherStagingOwner(root, parentScope, op); owner != "" || unreadable {
 		return nil
@@ -953,7 +1170,11 @@ func capturePreimage(parentDir, preDir, rel string) error {
 // completed or rolled back before any new work is judged
 // against the scope. No journal → nil. A journal that fails to
 // decode or validate → a descriptive error, no writes, the
-// journal left in place as evidence.
+// journal left in place as evidence. A journal whose parent
+// directory the scope's parent anchor does not vouch for —
+// no anchor recorded, or a different directory anchored — is
+// refused the same way, before any state is judged: the
+// journal never vouches for its own scope.
 //
 // State verified → the commit point is completed idempotently:
 // the parent scope advances old_head → result_commit if it has
@@ -986,6 +1207,25 @@ func Recover(ctx *Context, parentScope string) error {
 	}
 	if j == nil {
 		return nil
+	}
+	// The anchor gate: the journal's parent_dir selects the
+	// tree every effect below applies to — rollback's deletes
+	// and restores, and (in the verified branch) the act the
+	// minted fact attests — so it is re-validated against the
+	// parent anchor, the independent record the settlement's
+	// writer left under the settle root, before any state is
+	// judged. A journal with no anchor, or one naming a
+	// different directory than the anchor records, is refused
+	// with the journal left in place.
+	a, found, err := readParentAnchor(ctx.Root, parentScope)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("settle: recover %q: journal names parent directory %q but no parent anchor is recorded for the scope — refusing to act on an unanchored journal", parentScope, j.ParentDir)
+	}
+	if a.ParentScope != parentScope || a.ParentDir != j.ParentDir {
+		return fmt.Errorf("settle: recover %q: journal's parent directory %q disagrees with the recorded parent anchor %q — refusing to act on it", parentScope, j.ParentDir, a.ParentDir)
 	}
 	switch j.State {
 	case journalStateVerified:

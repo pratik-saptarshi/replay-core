@@ -70,6 +70,7 @@ var writeAllowlist = map[string]string{
 	"settle.restorePreimage":   "journal rollback: restores one unit's staged preimage into the parent directory",
 	"settle.removeOccupant":    "journal rollback helper: removes whatever currently occupies a restore target in the parent directory",
 	"settle.writeJournal":      "the journal writer: canonical JSON to a temp file in the journal directory under the settle Root, fsynced and renamed into place",
+	"settle.writeParentAnchor": "the parent anchor writer: records the parent directory a scope's settlement acts on, in the journals directory under the settle Root, fsynced and renamed into place before the journal it vouches for lands",
 	"settle.clearJournalState": "journal cleanup after a commit or a completed rollback: removes the journal file and its staging area under the settle Root",
 	// internal/settle — the staging builders and file writers
 	// the materializer drives.
