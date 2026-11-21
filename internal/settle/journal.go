@@ -844,16 +844,21 @@ func materialize(ctx *Context, req materializeRequest) error {
 	// decodeJournal's absolute-path validation: the journal a
 	// crashed verb most needs read back would be the one
 	// recovery cannot read, and every later verb on that parent
-	// would fail at its entry Recover. Normalize here — the one
-	// path both materializing verbs take, before the journal is
-	// written or the parent is touched; decodeJournal's
-	// requirement stays as the backstop for journals written by
-	// anything else.
-	absDir, err := filepath.Abs(req.parentDir)
+	// would fail at its entry Recover. A directory spelled
+	// through a symlink is worse: the inventory walk does not
+	// follow a symlinked root, so the settlement would plan
+	// against the link itself and fail in preflight (see
+	// resolveParentDir). Normalize here — the one path both
+	// materializing verbs take, before the journal is written
+	// or the parent is touched — to the absolute, symlink-free
+	// path the verbs already resolved at their entries;
+	// decodeJournal's absolute-path requirement stays as the
+	// backstop for journals written by anything else.
+	resolvedDir, err := resolveParentDir(req.parentDir)
 	if err != nil {
-		return fmt.Errorf("settle: %s %q: resolve parent directory %q: %w", req.verb, req.runScope, req.parentDir, err)
+		return fmt.Errorf("settle: %s %q: %w", req.verb, req.runScope, err)
 	}
-	req.parentDir = absDir
+	req.parentDir = resolvedDir
 	// Staging is keyed only by op ID, so a pending journal on
 	// another parent scope with the same op ID owns the staging
 	// directory below: removing it here (or clearing it when

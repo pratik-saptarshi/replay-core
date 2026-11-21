@@ -106,6 +106,18 @@ func Apply(ctx *Context, parentScope, parentDir, runScope, opID string) (store.R
 	if err := Recover(ctx, parentScope); err != nil {
 		return store.Receipt{}, err
 	}
+	// The parent root is resolved once, here (see
+	// resolveParentDir in settle.go): the probe snapshot
+	// below resolves it internally, the disjointness census
+	// resolves it, and the materializer records the resolved
+	// path in the journal, so resolving at the entry makes
+	// every consumer of parentDir in this verb agree on the
+	// real tree's path, whatever spelling the caller used.
+	resolvedDir, err := resolveParentDir(parentDir)
+	if err != nil {
+		return store.Receipt{}, err
+	}
+	parentDir = resolvedDir
 	if err := ensureNotConsumed(ctx, runScope); err != nil {
 		return store.Receipt{}, err
 	}

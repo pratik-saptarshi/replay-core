@@ -102,6 +102,51 @@ func checkScopeName(kind, scope string) error {
 	return nil
 }
 
+// resolveParentDir returns the absolute, symlink-free form of
+// a settlement parent directory, or a descriptive error naming
+// the path as given when it cannot be resolved or does not
+// name a directory. It is the settle half of the root law the
+// snapshot store states for its workspace root
+// (resolveWorkspaceRoot) and the carrier for its base root: a
+// directory handed over as a tree root is resolved once,
+// before it is inventoried, captured, or recorded, so every
+// consumer of the directory agrees on the one spelling — the
+// real tree's path. filepath.WalkDir does not follow a
+// symlinked root: settle's inventory walk visited the link
+// itself as the parent's only entry, so a settlement spelled
+// through a symlink planned every wanted file as a creation
+// and the root link as a deletion, and preflight failed
+// capturing the link's preimage over the file preimages —
+// while the same verb's probe snapshot, resolving its root,
+// succeeded on the very same spelling. The verbs resolve at
+// their entries, and the materializer resolves again on the
+// one path both verbs record the journal through, so the
+// journal's parent_dir — and with it the anchor's vouch and
+// Recover's rollback target — names the real tree whatever
+// spelling the caller used: relative (the wave-2 arc) or
+// symlinked (the wave-6 arc).
+func resolveParentDir(dir string) (string, error) {
+	if dir == "" {
+		return "", errors.New("settle: parent directory is empty")
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("settle: resolve parent directory %s: %w", dir, err)
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", fmt.Errorf("settle: resolve parent directory %s: %w", dir, err)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("settle: stat parent directory %s: %w", dir, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("settle: parent directory %s is not a directory", dir)
+	}
+	return resolved, nil
+}
+
 // forkSidecar is a fork's provenance (plan Decision 3): the
 // parent scope, the fork commit (the parent head at fork time),
 // and the base (workspace) tree the layer was materialized from.
@@ -362,6 +407,18 @@ func Select(ctx *Context, parentScope, parentDir, runScope, opID string) (store.
 	if err := Recover(ctx, parentScope); err != nil {
 		return store.Receipt{}, err
 	}
+	// The parent root is resolved once, here (see
+	// resolveParentDir): the probe snapshot below resolves it
+	// internally and the materializer records the resolved
+	// path in the journal, so resolving at the entry makes
+	// every consumer of parentDir in this verb — inventory,
+	// preimage capture, journal — agree on the real tree's
+	// path, whatever spelling the caller used.
+	resolvedDir, err := resolveParentDir(parentDir)
+	if err != nil {
+		return store.Receipt{}, err
+	}
+	parentDir = resolvedDir
 	if err := ensureNotConsumed(ctx, runScope); err != nil {
 		return store.Receipt{}, err
 	}
