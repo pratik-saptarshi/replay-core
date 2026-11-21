@@ -506,11 +506,14 @@ func Select(ctx *Context, parentScope, parentDir, runScope, opID string) (store.
 // retried Discard resolves its head from the archive, finishes
 // the cleanup, and mints the fact; a Discard that dies after
 // the mint leaves a fact the consume-once scan reads, and the
-// retry reports the scope consumed. The one window this does
-// not close is a crash inside ArchiveScope itself, between
-// its create and its delete: both refs then name the same
-// head, nothing is lost, and the retry fails with the
-// archive's own already-exists refusal, descriptively.
+// retry reports the scope consumed. A crash inside
+// ArchiveScope itself, between its create and its delete,
+// leaves both refs naming the same head — and ArchiveScope
+// resumes exactly that state (the standing archive is its own
+// half-done work, completed at the delete; an archive naming
+// a different head is a genuine conflict it refuses), so a
+// retried Discard that still finds the active scope completes
+// the archival on its way through, with no special routing.
 //
 // Before any of that, a pending settlement on the run's
 // parent is resolved: a Select or Apply that crashed with a

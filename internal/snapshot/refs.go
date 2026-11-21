@@ -156,25 +156,44 @@ func (s *Store) AdvanceScope(scope, oldCommit, newCommit string) error {
 
 // ArchiveScope retires a scope without deleting its history: it
 // creates refs/vcscore/archive/<scope> at the scope's head
-// (create-only — an existing archive of the same name is a
-// descriptive error, never an overwrite) and then deletes
-// refs/vcscore/scopes/<scope>. The archived commit stays fully
-// readable through the tree surface; archiving is a move, not a
-// deletion (AC-F6-5).
+// (create-only — an existing archive of the same name is never
+// an overwrite) and then deletes refs/vcscore/scopes/<scope>.
+// The archived commit stays fully readable through the tree
+// surface; archiving is a move, not a deletion (AC-F6-5).
+//
+// The create and the delete are separate operations, so a
+// process that dies between them — or a delete that fails, e.g.
+// on a stale ref lock — leaves both refs standing. That state
+// is resumable, and the heads decide which kind it is: if the
+// archive ref names the scope's current head, the standing
+// archive is this archival's own half-done work, and a retry
+// completes it at the delete; if it names a different commit,
+// the name was archived at another head — a genuine conflict,
+// refused descriptively with nothing moved. No state a crash
+// can leave behind wedges a retry permanently.
 func (s *Store) ArchiveScope(scope string) error {
 	head, err := s.ScopeHead(scope)
 	if err != nil {
 		return err
 	}
 	archiveRef := archiveRefPrefix + scope
-	if _, err := s.git(nil, "rev-parse", "--verify", "--quiet", archiveRef); err == nil {
-		return fmt.Errorf("snapshot: archive scope %q: archive ref %s already exists", scope, archiveRef)
-	}
-	if _, err := s.git(nil, "update-ref", archiveRef, head, zeroOID); err != nil {
-		if _, cerr := s.git(nil, "rev-parse", "--verify", "--quiet", archiveRef); cerr == nil {
-			return fmt.Errorf("snapshot: archive scope %q: archive ref %s already exists", scope, archiveRef)
+	existing, aerr := s.git(nil, "rev-parse", "--verify", "--quiet", archiveRef+"^{commit}")
+	switch {
+	case aerr == nil && existing != head:
+		return fmt.Errorf("snapshot: archive scope %q: archive ref %s already exists at %s, but the scope's head is %s", scope, archiveRef, existing, head)
+	case aerr == nil:
+		// The archive already names this scope's head: a
+		// previous ArchiveScope died after the create but
+		// before the delete (or the delete failed). The
+		// archival is half-done, not conflicted — fall
+		// through to the delete and complete it.
+	default:
+		if _, err := s.git(nil, "update-ref", archiveRef, head, zeroOID); err != nil {
+			if _, cerr := s.git(nil, "rev-parse", "--verify", "--quiet", archiveRef); cerr == nil {
+				return fmt.Errorf("snapshot: archive scope %q: archive ref %s already exists", scope, archiveRef)
+			}
+			return fmt.Errorf("snapshot: archive scope %q: update-ref: %w", scope, err)
 		}
-		return fmt.Errorf("snapshot: archive scope %q: update-ref: %w", scope, err)
 	}
 	if _, err := s.git(nil, "update-ref", "-d", scopesRefPrefix+scope, head); err != nil {
 		return fmt.Errorf("snapshot: archive scope %q: delete scope ref: %w", scope, err)
