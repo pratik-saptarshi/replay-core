@@ -47,7 +47,10 @@ type Layer struct {
 // baseDir, whose content identity is baseID (Decision 8(b): the
 // snapshot workspace tree ID). Layout: layerRoot/layer.json is
 // the marker ({base_id, driver}, canonical JSON); layerRoot/view
-// is the writable directory (Layer.Dir).
+// is the writable directory (Layer.Dir). baseDir is resolved
+// under the root law (see resolveBaseRoot): a symlinked base
+// root materializes the tree it names, never an empty view
+// under that tree's identity.
 //
 // The marker law: a root carrying a marker whose base_id and
 // driver match the request is returned as-is (idempotent
@@ -83,6 +86,27 @@ func Materialize(sel Selection, baseDir, baseID, layerRoot string) (*Layer, erro
 	}
 	if !baseInfo.IsDir() {
 		return nil, fmt.Errorf("carrier: base %q: not a directory", baseDir)
+	}
+	// The root law: a directory handed to the carrier as a
+	// tree root is resolved to its absolute, symlink-free form
+	// before it is walked, mounted, or otherwise traversed as
+	// a tree — the same law the snapshot store states for its
+	// workspace root. The resolution happens here, once, before
+	// any driver is dispatched, so every driver receives the
+	// resolved root and no driver's mechanism can diverge on
+	// the caller's spelling: filepath.WalkDir does not follow
+	// a symlinked root (it visits the link itself as the walk's
+	// only entry, and the root callback skips it), so the copy
+	// and reflink drivers built an EMPTY view from a symlinked
+	// base and the marker law then handed that empty layer out
+	// under the base's identity, while the kernel-overlay
+	// driver served the same base whole because the kernel
+	// resolves a lowerdir path itself. A symlinked base is
+	// never refused and never silently emptied: it is resolved,
+	// and the layer materializes the tree the base ID names.
+	baseDir, err = resolveBaseRoot(baseDir)
+	if err != nil {
+		return nil, err
 	}
 
 	preExisted := false
@@ -349,6 +373,29 @@ func (l *Layer) Remove() error {
 		return fmt.Errorf("carrier: delete layer root %q: %w", l.root, err)
 	}
 	return nil
+}
+
+// resolveBaseRoot returns the absolute, symlink-free form of
+// a base directory — the root law's enforcement point (see
+// Materialize). The base has already been stat-checked through
+// the caller's spelling by the time this runs. An empty path
+// is refused outright, as in the snapshot store's root law:
+// filepath.Abs("") is the process working directory, so an
+// empty root from a missing flag or config value would
+// materialize whatever directory the process runs in.
+func resolveBaseRoot(dir string) (string, error) {
+	if dir == "" {
+		return "", errors.New("carrier: base root is empty")
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("carrier: resolve base %q: %w", dir, err)
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", fmt.Errorf("carrier: resolve base %q: %w", dir, err)
+	}
+	return resolved, nil
 }
 
 // readMarker reads the layer root's marker. found is false when
