@@ -813,10 +813,12 @@ type materializeRequest struct {
 //
 //   - preflight: extract the result commit's workspace into the
 //     op's staging tree (the durable result artifact), compute
-//     the unit list against the parent's current inventory, and
-//     copy the preimage of every unit target that exists into
-//     the staging preimage tree — all before the first side
-//     effect;
+//     the unit list against the parent's current inventory,
+//     refuse any replacement whose wholesale directory removal
+//     would destroy inventory-excluded content no preimage
+//     captures, and copy the preimage of every unit target
+//     that exists into the staging preimage tree — all before
+//     the first side effect;
 //   - write the journal in state planned and fsync it;
 //   - apply: per unit, first record the unit's in-flight intent
 //     (its started mark, plus the started marks of every unit
@@ -897,6 +899,9 @@ func materialize(ctx *Context, req materializeRequest) error {
 	}
 	units, writeEntry, err := planUnits(req, treeDir, current)
 	if err != nil {
+		return err
+	}
+	if err := refuseUncapturedReplacements(req, units); err != nil {
 		return err
 	}
 
@@ -1132,6 +1137,51 @@ func materialize(ctx *Context, req materializeRequest) error {
 		return err
 	}
 	callCrashHook(done)
+	return nil
+}
+
+// refuseUncapturedReplacements is materialize's preflight
+// guard against destroying content the settlement never
+// captured (PR #7 wave 7, Codex P1 on b96ae2c). A write unit
+// whose target is a pre-existing directory removes that
+// directory wholesale when it lands — copyFileAtomic's
+// clearBlockingDirs and replaceWithSymlink both RemoveAll
+// it — but the inventory the unit list was planned against
+// excludes every entry inventoryExcludedName names, at any
+// depth: no snapshot records such content, no unit names it,
+// no preimage captures it, and verification, which compares
+// the inventory's file maps, cannot see its loss. A nested
+// repository's metadata beneath a replaced directory would
+// be deleted silently and unrestorably. Refuse instead,
+// here in preflight — after the unit list is known, before
+// preimage capture, the journal write, and any mutation —
+// so the refusal leaves no partial state and is retry-safe:
+// with the excluded content moved out of the tree, the same
+// operation proceeds.
+func refuseUncapturedReplacements(req materializeRequest, units []journalUnit) error {
+	for _, u := range units {
+		if u.Kind != unitWrite {
+			continue
+		}
+		dst := filepath.Join(req.parentDir, filepath.FromSlash(u.Path))
+		info, err := os.Lstat(dst)
+		if targetGone(err) {
+			continue // nothing stands there: nothing is removed wholesale
+		}
+		if err != nil {
+			return fmt.Errorf("settle: %s %q: stat replacement target %s: %w", req.verb, req.runScope, dst, err)
+		}
+		if !info.IsDir() || info.Mode()&fs.ModeSymlink != 0 {
+			continue // a file or symlink target is replaced in place, never removed wholesale
+		}
+		excluded, err := excludedEntryBeneath(dst)
+		if err != nil {
+			return err
+		}
+		if excluded != "" {
+			return fmt.Errorf("settle: %s %q: replacing the directory at %q would delete %q, which the workspace inventory excludes — no snapshot records it, no journal unit names it, and no preimage captures it, so its loss could neither be verified nor rolled back; refusing before any mutation (move the excluded content out of the tree and retry)", req.verb, req.runScope, u.Path, u.Path+"/"+excluded)
+		}
+	}
 	return nil
 }
 

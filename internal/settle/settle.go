@@ -650,10 +650,66 @@ type dirFile struct {
 	mode    string
 }
 
+// inventoryExcludedName reports whether an entry name is
+// excluded from the workspace inventory: an entry with this
+// name is never workspace content, whatever its filesystem
+// type — a directory in an ordinary checkout, a regular file
+// in a linked worktree or submodule checkout (where it holds
+// a "gitdir:" pointer), a symlink in stranger layouts. The
+// law is one law stated in three places: the snapshot walk
+// (internal/snapshot, which spells the same test literally),
+// walkDirFiles below, and the journal's unit-path validation
+// (journal.go). This predicate is the settle package's single
+// spelling of it — the inventory skips what it names, and
+// materialize's replacement refusal
+// (refuseUncapturedReplacements, journal.go) keys off it —
+// so the set of content a wholesale directory removal must
+// not destroy uncaptured is by construction the set the
+// inventory excludes, and the two can never diverge.
+func inventoryExcludedName(name string) bool {
+	return name == ".git"
+}
+
+// errExcludedEntryFound stops excludedEntryBeneath's walk
+// early: the first excluded entry is the whole answer.
+var errExcludedEntryFound = errors.New("settle: excluded entry found")
+
+// excludedEntryBeneath returns the slash-separated path,
+// relative to dir, of the first inventory-excluded entry
+// beneath dir, or "" if there is none. The walk does not
+// follow symlinks, mirroring the inventory walks: content
+// beneath a symlinked entry is neither inventoried nor
+// destroyed by a wholesale removal of dir (RemoveAll unlinks
+// the symlink itself, never its target's tree), so it is not
+// this scan's concern. dir itself is exempt, as in the
+// walks: it is the tree being examined, not an entry in it.
+func excludedEntryBeneath(dir string) (string, error) {
+	found := ""
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path != dir && inventoryExcludedName(d.Name()) {
+			rel, rerr := filepath.Rel(dir, path)
+			if rerr != nil {
+				return rerr
+			}
+			found = filepath.ToSlash(rel)
+			return errExcludedEntryFound
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errExcludedEntryFound) {
+		return "", fmt.Errorf("settle: scan %s for excluded content: %w", dir, err)
+	}
+	return found, nil
+}
+
 // walkDirFiles inventories dir's non-directory entries by
 // slash-separated relative path, plus every directory below dir
-// (for empty-dir pruning). Entries named .git are skipped
-// whatever their type, as in the snapshot walk.
+// (for empty-dir pruning). Entries the inventory excludes
+// (see inventoryExcludedName) are skipped whatever their
+// type, as in the snapshot walk.
 func walkDirFiles(dir string) (map[string]dirFile, []string, error) {
 	files := map[string]dirFile{}
 	var dirs []string
@@ -661,7 +717,7 @@ func walkDirFiles(dir string) (map[string]dirFile, []string, error) {
 		if err != nil {
 			return fmt.Errorf("settle: walk %s: %w", path, err)
 		}
-		if path != dir && d.Name() == ".git" {
+		if path != dir && inventoryExcludedName(d.Name()) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
