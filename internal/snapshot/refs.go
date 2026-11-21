@@ -14,6 +14,17 @@ import (
 // would rewrite what those citations name.
 var ErrScopeExists = errors.New("snapshot: fork scope already exists")
 
+// ErrScopeNotFound is returned by the scope operations when the
+// named scope ref does not exist: a name that matches no ref —
+// including a name the scope-name law rejects outright, which can
+// name no scope — is an absence, not a different kind of failure.
+var ErrScopeNotFound = errors.New("snapshot: scope not found")
+
+// ErrScopeHeadMoved is returned by AdvanceScope when the scope's
+// current head differs from the caller's expected old value: the
+// compare-and-swap refused, and the head is left where it was.
+var ErrScopeHeadMoved = errors.New("snapshot: scope head moved")
+
 // Refs layout law (AC-F4-5): every ref in the store lives under
 // refs/vcscore/, with second component one of ground, materialized,
 // scopes, ops, or archive. The snapshot chain lives under ops/ (one
@@ -90,6 +101,83 @@ func (s *Store) Fork(scope, commitID string) error {
 			return fmt.Errorf("%w: %q", ErrScopeExists, scope)
 		}
 		return fmt.Errorf("snapshot: fork: update-ref: %w", err)
+	}
+	return nil
+}
+
+// ScopeHead returns the commit refs/vcscore/scopes/<scope>
+// names, or ErrScopeNotFound when no such scope exists.
+func (s *Store) ScopeHead(scope string) (string, error) {
+	if !scopeNamePattern.MatchString(scope) {
+		return "", fmt.Errorf("%w: %q", ErrScopeNotFound, scope)
+	}
+	head, err := s.git(nil, "rev-parse", "--verify", "--quiet", scopesRefPrefix+scope+"^{commit}")
+	if err != nil {
+		return "", fmt.Errorf("%w: %q", ErrScopeNotFound, scope)
+	}
+	return head, nil
+}
+
+// AdvanceScope moves refs/vcscore/scopes/<scope> from oldCommit
+// to newCommit as a compare-and-swap: the ref is rewritten only
+// if its current head is exactly oldCommit, so two advancers
+// racing one scope cannot both succeed — the loser is refused
+// with ErrScopeHeadMoved and the head stays where the winner put
+// it. A scope that does not exist is ErrScopeNotFound, and
+// newCommit must name a commit; both are established before the
+// write, so a refused advance changes nothing.
+func (s *Store) AdvanceScope(scope, oldCommit, newCommit string) error {
+	if _, err := s.git(nil, "rev-parse", "--verify", "--quiet", newCommit+"^{commit}"); err != nil {
+		return fmt.Errorf("snapshot: advance scope %q: %q does not name a commit: %w", scope, newCommit, err)
+	}
+	head, err := s.ScopeHead(scope)
+	if err != nil {
+		return err
+	}
+	if head != oldCommit {
+		return fmt.Errorf("%w: scope %q is at %s, not %s", ErrScopeHeadMoved, scope, head, oldCommit)
+	}
+	if _, err := s.git(nil, "update-ref", scopesRefPrefix+scope, newCommit, oldCommit); err != nil {
+		// The swap lost a race between the check above and the
+		// write: re-read and classify, so a moved head always
+		// reports as ErrScopeHeadMoved rather than a raw
+		// plumbing failure.
+		now, rerr := s.ScopeHead(scope)
+		if rerr != nil {
+			return rerr
+		}
+		if now != oldCommit {
+			return fmt.Errorf("%w: scope %q is at %s, not %s", ErrScopeHeadMoved, scope, now, oldCommit)
+		}
+		return fmt.Errorf("snapshot: advance scope %q: update-ref: %w", scope, err)
+	}
+	return nil
+}
+
+// ArchiveScope retires a scope without deleting its history: it
+// creates refs/vcscore/archive/<scope> at the scope's head
+// (create-only — an existing archive of the same name is a
+// descriptive error, never an overwrite) and then deletes
+// refs/vcscore/scopes/<scope>. The archived commit stays fully
+// readable through the tree surface; archiving is a move, not a
+// deletion (AC-F6-5).
+func (s *Store) ArchiveScope(scope string) error {
+	head, err := s.ScopeHead(scope)
+	if err != nil {
+		return err
+	}
+	archiveRef := archiveRefPrefix + scope
+	if _, err := s.git(nil, "rev-parse", "--verify", "--quiet", archiveRef); err == nil {
+		return fmt.Errorf("snapshot: archive scope %q: archive ref %s already exists", scope, archiveRef)
+	}
+	if _, err := s.git(nil, "update-ref", archiveRef, head, zeroOID); err != nil {
+		if _, cerr := s.git(nil, "rev-parse", "--verify", "--quiet", archiveRef); cerr == nil {
+			return fmt.Errorf("snapshot: archive scope %q: archive ref %s already exists", scope, archiveRef)
+		}
+		return fmt.Errorf("snapshot: archive scope %q: update-ref: %w", scope, err)
+	}
+	if _, err := s.git(nil, "update-ref", "-d", scopesRefPrefix+scope, head); err != nil {
+		return fmt.Errorf("snapshot: archive scope %q: delete scope ref: %w", scope, err)
 	}
 	return nil
 }

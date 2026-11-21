@@ -33,6 +33,17 @@ const (
 	SystemPath         = "replaycore.system"
 )
 
+// Settlement schema_refs (Phase 2, plan Decision 4), minted only
+// by the constructors in settle.go: the settlement verbs' facts,
+// which consume-once enforcement and crash recovery read as
+// authority, so they join the reserved set beside the Phase 1
+// refs above.
+const (
+	SettleSelectSchemaRef  = "replaycore.settle-select.v1"
+	SettleApplySchemaRef   = "replaycore.settle-apply.v1"
+	SettleDiscardSchemaRef = "replaycore.settle-discard.v1"
+)
+
 // ErrNotFound is returned by GetRecord when no record carries the
 // requested ID.
 var ErrNotFound = errors.New("store: record not found")
