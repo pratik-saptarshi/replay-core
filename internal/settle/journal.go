@@ -824,8 +824,11 @@ type materializeRequest struct {
 //     (its started mark, plus the started marks of every unit
 //     its landing destroys as a side effect) and rewrite +
 //     fsync the journal, then write (temp file + rename in the
-//     target directory, atomic per file) or delete, mark the
-//     unit done, rewrite + fsync the journal;
+//     target directory, atomic per file — the temp under the
+//     name derived from the destination, syncTempName, so a
+//     crash before the rename leaves a temp rollback can name
+//     and remove) or delete, mark the unit done, rewrite +
+//     fsync the journal;
 //   - verify: re-snapshot the parent; its file map must equal
 //     want, then journal state verified and fsync.
 //
@@ -1458,12 +1461,29 @@ func Recover(ctx *Context, parentScope string) error {
 // and undoing writes first guarantees a restored delete never
 // has to pass through a file a write unit created — the
 // parent is then exactly pre-apply.
+//
+// A write unit's undo begins by removing the unit's temp
+// files (removeUnitTemps): a write lands through a temp in
+// the destination directory, and a crash between the temp's
+// creation and its rename leaves the temp standing in the
+// parent tree, outside every unit's destination — restoring
+// destinations alone would leave the parent holding a file
+// the pre-operation tree never had, for a later verb to
+// snapshot as a parent change. The temp's name is derived
+// from the destination the journal records (syncTempName),
+// so no record made after the temp's creation is needed to
+// name it. Rollback's own restores land through the same
+// derived names, so a crash inside recovery itself leaves a
+// temp the next Recover names and removes the same way.
 func rollbackJournal(ctx *Context, j *journal) error {
 	preDir := filepath.Join(stagingDirFor(ctx.Root, j.Op), "pre")
 	for i := len(j.Units) - 1; i >= 0; i-- {
 		u := j.Units[i]
 		if u.Kind != unitWrite || (!u.Done && !u.Started) {
 			continue
+		}
+		if err := removeUnitTemps(j.ParentDir, u.Path); err != nil {
+			return fmt.Errorf("settle: recover %q: roll back %s: %w", j.ParentScope, u.Path, err)
 		}
 		if err := undoWriteUnit(j.ParentDir, preDir, u.Path); err != nil {
 			return fmt.Errorf("settle: recover %q: roll back %s: %w", j.ParentScope, u.Path, err)
@@ -1479,6 +1499,42 @@ func rollbackJournal(ctx *Context, j *journal) error {
 		}
 	}
 	return clearJournalState(ctx.Root, j.ParentScope, j.Op)
+}
+
+// removeUnitTemps removes the temp files a write unit for
+// rel may have left in the parent tree — the file temp and
+// the symlink temp, each under its derived name
+// (syncTempName). A unit that was never started created no
+// temp and is not visited here; a unit whose rename landed
+// has no temp standing, and absence (in targetGone's full
+// sense) is success. A real directory at a derived name is
+// left standing: no temp this writer makes is a directory,
+// so the name's occupant is not the settlement's to remove.
+// Temps left by writers from before the derived-name
+// discipline carry random names nothing can derive; they are
+// left as visible debris rather than swept by prefix — a
+// sweep could not tell debris from a genuine file of the
+// same shape, and this branch has no production deployment
+// carrying such debris.
+func removeUnitTemps(parentDir, rel string) error {
+	dst := filepath.Join(parentDir, filepath.FromSlash(rel))
+	for _, link := range []bool{false, true} {
+		tmp := filepath.Join(filepath.Dir(dst), syncTempName(dst, link))
+		info, err := os.Lstat(tmp)
+		if err != nil {
+			if targetGone(err) {
+				continue
+			}
+			return fmt.Errorf("settle: stat temp %s: %w", tmp, err)
+		}
+		if info.IsDir() && info.Mode()&fs.ModeSymlink == 0 {
+			continue
+		}
+		if err := removeOccupant(tmp); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // targetGone reports whether a remove error means the target

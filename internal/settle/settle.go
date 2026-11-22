@@ -26,6 +26,8 @@ package settle
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -795,10 +797,37 @@ func permForMode(mode string) os.FileMode {
 	return 0o644
 }
 
+// syncTempName returns the temp name a write to dst lands
+// through, in dst's directory: ".synctree-" (a regular file)
+// or ".synctree-link-" (a symlink) plus the first 32 hex
+// chars of the destination path's SHA-256. The name is a pure
+// function of the destination — state the settlement journal
+// already records for every write unit — so it is knowable
+// before any temp exists, and rollback can compute and
+// remove a killed write's temp without any record made after
+// the temp's creation (PR #7 wave 9). The hash keeps the
+// name from colliding with a sibling unit's temp or with any
+// name a tree plausibly carries; creation is exclusive
+// (O_EXCL / symlink's own exclusivity), so a file already
+// standing at the derived name is refused descriptively,
+// never overwritten — it is not a temp this writer made.
+func syncTempName(dst string, link bool) string {
+	sum := sha256.Sum256([]byte(dst))
+	prefix := ".synctree-"
+	if link {
+		prefix = ".synctree-link-"
+	}
+	return prefix + hex.EncodeToString(sum[:])[:32]
+}
+
 // copyFileAtomic writes src's bytes to dst with perm,
 // atomically: a temp file in dst's directory, renamed over dst.
 // A directory standing at dst is removed first — the target
-// tree's shape wins.
+// tree's shape wins. The temp takes its derived name
+// (syncTempName) and is created exclusively: a kill between
+// the creation and the rename leaves a temp rollback can
+// name and remove, and a file already at that name is a
+// refusal, not an overwrite.
 func copyFileAtomic(src, dst string, perm os.FileMode) error {
 	if err := clearBlockingDirs(dst); err != nil {
 		return err
@@ -811,11 +840,11 @@ func copyFileAtomic(src, dst string, perm os.FileMode) error {
 	if err != nil {
 		return fmt.Errorf("settle: read staged %s: %w", src, err)
 	}
-	tmp, err := os.CreateTemp(parent, ".synctree-*")
+	tmpName := filepath.Join(parent, syncTempName(dst, false))
+	tmp, err := os.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return fmt.Errorf("settle: create temp in %s: %w", parent, err)
+		return fmt.Errorf("settle: create temp %s: %w", tmpName, err)
 	}
-	tmpName := tmp.Name()
 	defer func() { _ = os.Remove(tmpName) }()
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
@@ -836,7 +865,12 @@ func copyFileAtomic(src, dst string, perm os.FileMode) error {
 
 // replaceWithSymlink makes dst a symlink to target, atomically:
 // the link is created at a temp name in dst's directory and
-// renamed over dst.
+// renamed over dst. The temp name is the derived one
+// (syncTempName): a symlink creation is itself exclusive, so
+// a name already taken is a descriptive refusal and nothing
+// is removed that this writer did not create — and a kill
+// between the creation and the rename leaves a temp link
+// rollback can name and remove.
 func replaceWithSymlink(dst, target string) error {
 	parent := filepath.Dir(dst)
 	if err := os.MkdirAll(parent, 0o755); err != nil {
@@ -847,17 +881,14 @@ func replaceWithSymlink(dst, target string) error {
 			return fmt.Errorf("settle: remove directory at %s: %w", dst, err)
 		}
 	}
-	tmp, err := os.CreateTemp(parent, ".synctree-link-*")
-	if err != nil {
-		return fmt.Errorf("settle: create temp in %s: %w", parent, err)
-	}
-	tmpName := tmp.Name()
-	_ = tmp.Close()
-	_ = os.Remove(tmpName)
-	defer func() { _ = os.Remove(tmpName) }()
+	tmpName := filepath.Join(parent, syncTempName(dst, true))
 	if err := os.Symlink(target, tmpName); err != nil {
-		return fmt.Errorf("settle: symlink %s: %w", tmpName, err)
+		return fmt.Errorf("settle: create temp symlink %s: %w", tmpName, err)
 	}
+	// The removal is deferred only once the link exists and
+	// is this writer's: a creation that failed because the
+	// name was already taken must leave that file untouched.
+	defer func() { _ = os.Remove(tmpName) }()
 	if err := os.Rename(tmpName, dst); err != nil {
 		return fmt.Errorf("settle: rename %s to %s: %w", tmpName, dst, err)
 	}
