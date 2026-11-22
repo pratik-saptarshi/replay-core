@@ -83,6 +83,10 @@
 <li>The <b>settlement gates apply before anything touches a real tree</b>: fail-closed settlement (fast-forward-only select, path-disjoint apply, archive-on-discard) governs the live segment of a replay just as it governs any run.</li>
 </ul>
 
+<h2>9. Settlement caller contract</h2>
+<p>Settlement — the settle layer's Fork, Select, Apply, Discard, and Recover — is <b>single-caller</b>: for a given settle Root and parent scope, at most one caller may be executing a settlement verb or a recovery at a time. Concurrent callers acting on the same parent scope, <b>including separate processes</b>, are outside the model.</p>
+<p>This is a contract on the caller, not a property the system enforces: settlement does not detect, lock against, or prevent concurrent use. The reason is structural. A verb's entry recovery cannot distinguish a live operation from a crashed one — a journal on disk looks the same either way — so a second caller's entry recovery can roll back an in-flight operation's journal and staging, and two callers that both pass entry recovery can overwrite the same parent journal, either one's cleanup removing the other's recovery record. The parent ref's compare-and-swap protects the ref alone; it does not protect the filesystem mutations or the journal state, which have already occurred by the time the ref moves. A caller that needs settlement from more than one goroutine or process must serialize it externally: one caller per settle Root and parent scope at a time.</p>
+
 <p class="src"><b>Sources:</b> features development plan (AEP goal workspace, 2026-11-18) §2 (effect boundary, record by value, replay by digest match, fork-replay, projection-only revert, honesty rule) and §3 (memory rule, ghg accounting, settlement gates); Phase 0 plan <code>docs/plans/2026-11-18-replay-core-phase-0-plan.html</code> (Global Constraints: claims discipline, memory rule); reverse-engineering findings held in the AEP goal workspace (Cut/Slice and projection-only revert in the reference store; replay excluded from the reference kernel's frozen scope).</p>
 </body>
 </html>

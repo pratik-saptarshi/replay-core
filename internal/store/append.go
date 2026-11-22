@@ -28,9 +28,11 @@ var ErrEmptyBatch = errors.New("store: append batch is empty")
 
 // ErrReservedSchemaRef is returned by AppendFact and AppendBatch
 // when a caller draft carries one of the system schema refs
-// (CutSchemaRef, MilestoneSchemaRef, AbandonSchemaRef). Those refs
-// may be minted only by their constructors — AppendMilestone,
-// MintCut, MintAbandon — which derive the record body from
+// (CutSchemaRef, MilestoneSchemaRef, AbandonSchemaRef, and the
+// settlement refs SettleSelectSchemaRef, SettleApplySchemaRef,
+// SettleDiscardSchemaRef). Those refs may be minted only by their
+// constructors — AppendMilestone, MintCut, MintAbandon, and the
+// MintSettle* constructors — which derive the record body from
 // validated records; a caller-built body under a system ref could
 // claim placements the store never checked (a cut naming an
 // arbitrary through_owner_ordinal, resolving a slice that grows as
@@ -59,7 +61,8 @@ var ErrDuplicateRecord = errors.New("store: record already exists")
 // schema refs the public append boundary must refuse.
 func isReservedSchemaRef(ref string) bool {
 	switch ref {
-	case CutSchemaRef, MilestoneSchemaRef, AbandonSchemaRef:
+	case CutSchemaRef, MilestoneSchemaRef, AbandonSchemaRef,
+		SettleSelectSchemaRef, SettleApplySchemaRef, SettleDiscardSchemaRef:
 		return true
 	}
 	return false
