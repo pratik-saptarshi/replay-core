@@ -800,19 +800,29 @@ func permForMode(mode string) os.FileMode {
 // syncTempName returns the temp name a write to dst lands
 // through, in dst's directory: ".synctree-" (a regular file)
 // or ".synctree-link-" (a symlink) plus the first 32 hex
-// chars of the destination path's SHA-256. The name is a pure
-// function of the destination — state the settlement journal
-// already records for every write unit — so it is knowable
-// before any temp exists, and rollback can compute and
-// remove a killed write's temp without any record made after
-// the temp's creation (PR #7 wave 9). The hash keeps the
-// name from colliding with a sibling unit's temp or with any
-// name a tree plausibly carries; creation is exclusive
-// (O_EXCL / symlink's own exclusivity), so a file already
-// standing at the derived name is refused descriptively,
-// never overwritten — it is not a temp this writer made.
-func syncTempName(dst string, link bool) string {
-	sum := sha256.Sum256([]byte(dst))
+// chars of the SHA-256 of the destination path and the
+// operation ID, NUL-separated. The name is a pure function
+// of state the settlement journal already records — every
+// write unit's destination, and the journal's op — so it is
+// knowable before any temp exists, and rollback can compute
+// a killed write's temp name from the journal alone (PR #7
+// wave 9). The op ID is in the derivation so two operations
+// settling the same destination — the concurrent-Select
+// shape — write through different temp names and never
+// refuse each other at exclusive creation; one operation's
+// creation and its cleanup derivations agree exactly,
+// because both read the op from the same journal.
+// Computing the name is not removing it: rollback removes a
+// derived-name temp only for a unit whose journaled
+// temp-created record proves this settlement created it
+// (see removeUnitTemps). The hash keeps the name from
+// colliding with a sibling unit's temp or with any name a
+// tree plausibly carries; creation is exclusive (O_EXCL /
+// symlink's own exclusivity), so a file already standing at
+// the derived name is refused descriptively, never
+// overwritten — it is not a temp this writer made.
+func syncTempName(dst, op string, link bool) string {
+	sum := sha256.Sum256([]byte(dst + "\x00" + op))
 	prefix := ".synctree-"
 	if link {
 		prefix = ".synctree-link-"
@@ -824,11 +834,20 @@ func syncTempName(dst string, link bool) string {
 // atomically: a temp file in dst's directory, renamed over dst.
 // A directory standing at dst is removed first — the target
 // tree's shape wins. The temp takes its derived name
-// (syncTempName) and is created exclusively: a kill between
-// the creation and the rename leaves a temp rollback can
-// name and remove, and a file already at that name is a
-// refusal, not an overwrite.
-func copyFileAtomic(src, dst string, perm os.FileMode) error {
+// (syncTempName, from dst and the governing operation's ID)
+// and is created exclusively: a kill between the creation
+// and the rename leaves a temp rollback can name, and a
+// file already at that name is a refusal, not an overwrite.
+// onTempCreated, when non-nil, is invoked after the temp's
+// exclusive creation succeeds and before its bytes are
+// written — the journaled materializer's hook for persisting
+// the write unit's temp-ownership record at the one moment
+// the proof exists, so rollback may later remove the temp
+// as the settlement's own. Rollback's restores pass their
+// own hook, recording the restore temp on the unit being
+// restored; callers whose temps need no ownership record
+// (preimage capture, the staging builders) pass nil.
+func copyFileAtomic(src, dst string, perm os.FileMode, op string, onTempCreated func() error) error {
 	if err := clearBlockingDirs(dst); err != nil {
 		return err
 	}
@@ -840,12 +859,18 @@ func copyFileAtomic(src, dst string, perm os.FileMode) error {
 	if err != nil {
 		return fmt.Errorf("settle: read staged %s: %w", src, err)
 	}
-	tmpName := filepath.Join(parent, syncTempName(dst, false))
+	tmpName := filepath.Join(parent, syncTempName(dst, op, false))
 	tmp, err := os.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return fmt.Errorf("settle: create temp %s: %w", tmpName, err)
 	}
 	defer func() { _ = os.Remove(tmpName) }()
+	if onTempCreated != nil {
+		if err := onTempCreated(); err != nil {
+			_ = tmp.Close()
+			return err
+		}
+	}
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("settle: write %s: %w", tmpName, err)
@@ -870,8 +895,12 @@ func copyFileAtomic(src, dst string, perm os.FileMode) error {
 // a name already taken is a descriptive refusal and nothing
 // is removed that this writer did not create — and a kill
 // between the creation and the rename leaves a temp link
-// rollback can name and remove.
-func replaceWithSymlink(dst, target string) error {
+// rollback can name. onTempCreated, when non-nil, is
+// invoked after the link's creation succeeds and before the
+// rename — the materializer's hook for persisting the write
+// unit's temp-ownership record, as in copyFileAtomic;
+// callers whose temp links need no record pass nil.
+func replaceWithSymlink(dst, target, op string, onTempCreated func() error) error {
 	parent := filepath.Dir(dst)
 	if err := os.MkdirAll(parent, 0o755); err != nil {
 		return fmt.Errorf("settle: create %s: %w", parent, err)
@@ -881,7 +910,7 @@ func replaceWithSymlink(dst, target string) error {
 			return fmt.Errorf("settle: remove directory at %s: %w", dst, err)
 		}
 	}
-	tmpName := filepath.Join(parent, syncTempName(dst, true))
+	tmpName := filepath.Join(parent, syncTempName(dst, op, true))
 	if err := os.Symlink(target, tmpName); err != nil {
 		return fmt.Errorf("settle: create temp symlink %s: %w", tmpName, err)
 	}
@@ -889,6 +918,11 @@ func replaceWithSymlink(dst, target string) error {
 	// is this writer's: a creation that failed because the
 	// name was already taken must leave that file untouched.
 	defer func() { _ = os.Remove(tmpName) }()
+	if onTempCreated != nil {
+		if err := onTempCreated(); err != nil {
+			return err
+		}
+	}
 	if err := os.Rename(tmpName, dst); err != nil {
 		return fmt.Errorf("settle: rename %s to %s: %w", tmpName, dst, err)
 	}

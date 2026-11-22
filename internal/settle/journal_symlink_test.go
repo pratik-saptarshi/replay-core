@@ -289,10 +289,10 @@ func TestRecoverRepeatsSymlinkToDirRollback(t *testing.T) {
 	// (the construction TestRecoverRepeatsInterruptedFileToDirRollback
 	// established — the crash hook never fires inside Recover).
 	preDir := filepath.Join(stagingDirFor(f.root, "op-w2"), "pre")
-	if err := undoWriteUnit(f.parentDir, preDir, "old/inner.txt"); err != nil {
+	if err := undoWriteUnit(f.parentDir, preDir, journalUnit{Path: "old/inner.txt", Kind: unitWrite, Done: true, Started: true, TempCreated: true}, "op-w2", nil); err != nil {
 		t.Fatalf("interrupted Recover, write undo: %v", err)
 	}
-	if err := undoDeleteUnit(f.parentDir, preDir, "old"); err != nil {
+	if err := undoDeleteUnit(f.parentDir, preDir, journalUnit{Path: "old", Kind: unitDelete, Done: true, Started: true}, "op-w2", nil); err != nil {
 		t.Fatalf("interrupted Recover, delete undo: %v", err)
 	}
 	if got := hashTree(t, f.parentDir); got != preHash {

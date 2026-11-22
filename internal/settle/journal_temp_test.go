@@ -13,13 +13,22 @@ package settle
 // and preserve it as a parent change.
 //
 // The fix makes the temp's name a pure function of the
-// destination path the journal already records — the file
-// temp is ".synctree-" + the first 32 hex chars of the
-// destination's SHA-256, the symlink temp ".synctree-link-"
-// + the same — so the name is knowable from durable state
+// destination path and the operation ID the journal already
+// records — the file temp is ".synctree-" + the first 32
+// hex chars of the SHA-256 of the destination and the op,
+// NUL-separated, the symlink temp ".synctree-link-" + the
+// same — so the name is knowable from durable state
 // before any temp exists, and rollback removes the temps of
 // done and started write units beside undoing the units
-// themselves. The fixtures below plant temps under those
+// themselves. (The post-merge fix wave added the ownership
+// gate on that removal — issue #9: a unit's journal must
+// carry the temp-created record the writer persists at
+// creation, which is why the fixtures below build their
+// units with rawUnitWithTemp — and folded the op ID into
+// the derivation, so concurrent operations on one
+// destination never share a temp name; the destination-only
+// derivation it replaced is pinned as underivable debris by
+// the legacy fixture below.) The fixtures below plant temps under those
 // literal derived names (computed here, independently of the
 // production helper) beside hand-built journals in the
 // current on-disk format, so they compile and run against
@@ -38,16 +47,53 @@ import (
 )
 
 // derivedTempName computes the temp name the write path uses
-// for a destination, in the test's own terms: the pin that
-// the production derivation and the recovery derivation are
-// one function of the recorded destination path.
-func derivedTempName(dst string, link bool) string {
+// for a destination under an operation, in the test's own
+// terms: the pin that the production derivation and the
+// recovery derivation are one function of the recorded
+// destination path and the journal's op.
+func derivedTempName(dst, op string, link bool) string {
+	sum := sha256.Sum256([]byte(dst + "\x00" + op))
+	prefix := ".synctree-"
+	if link {
+		prefix = ".synctree-link-"
+	}
+	return prefix + hex.EncodeToString(sum[:])[:32]
+}
+
+// legacyDerivedTempName computes the temp name the
+// destination-only derivation (the scheme the per-op
+// derivation replaced) used for a destination: the pin for
+// the previous generation's names, which the current
+// derivation can no longer produce and rollback must
+// therefore leave standing as debris.
+func legacyDerivedTempName(dst string, link bool) string {
 	sum := sha256.Sum256([]byte(dst))
 	prefix := ".synctree-"
 	if link {
 		prefix = ".synctree-link-"
 	}
 	return prefix + hex.EncodeToString(sum[:])[:32]
+}
+
+// rawUnitWithTemp builds one journal unit carrying the
+// temp-created record: the ownership record the write path
+// persists between a temp's exclusive creation and its
+// content write, and the only warrant rollback accepts
+// before removing a derived-name temp (post-merge fix wave,
+// issue #9). The killed writes in this file DID create
+// their temps — the partial content planted below is what
+// they wrote — so their hand-built journals carry the
+// record the writer would have left, in the same canonical
+// form. (The pre-fix debris fixture below deliberately
+// carries none: its writer predates the record.)
+func rawUnitWithTemp(path, kind string, done, started bool) canonical.Value {
+	return canonical.ObjectOf(
+		canonical.Pair{Key: "done", Value: canonical.BoolOf(done)},
+		canonical.Pair{Key: "kind", Value: canonical.StringOf(kind)},
+		canonical.Pair{Key: "path", Value: canonical.StringOf(path)},
+		canonical.Pair{Key: "started", Value: canonical.BoolOf(started)},
+		canonical.Pair{Key: "temp_created", Value: canonical.BoolOf(true)},
+	)
 }
 
 // TestRecoverRemovesFileTempLeftByKilledWrite: the write of
@@ -65,14 +111,14 @@ func TestRecoverRemovesFileTempLeftByKilledWrite(t *testing.T) {
 
 	// The temp the killed write left: partial content, the
 	// rename never ran, the destination untouched.
-	tempName := derivedTempName(filepath.Join(f.parentDir, "mod.txt"), false)
+	tempName := derivedTempName(filepath.Join(f.parentDir, "mod.txt"), "op-temp", false)
 	journalWriteFile(t, filepath.Join(f.parentDir, tempName), "run mo", 0o644)
 	// The unit's captured preimage.
 	preDir := filepath.Join(f.root, "staging", "op-temp", "pre")
 	journalWriteFile(t, filepath.Join(preDir, "mod.txt"), "original\n", 0o644)
 
 	writeRawJournal(t, f, "op-temp", []canonical.Value{
-		rawUnit("mod.txt", unitWrite, false, true),
+		rawUnitWithTemp("mod.txt", unitWrite, false, true),
 	})
 
 	if err := Recover(f.ctx, "parent"); err != nil {
@@ -113,13 +159,13 @@ func TestRecoverRemovesSymlinkTempLeftByKilledWrite(t *testing.T) {
 
 	// The temp link the killed write left, pointing at the
 	// target the rename would have installed.
-	tempName := derivedTempName(filepath.Join(f.parentDir, "link.txt"), true)
+	tempName := derivedTempName(filepath.Join(f.parentDir, "link.txt"), "op-temp", true)
 	if err := os.Symlink("keep.txt", filepath.Join(f.parentDir, tempName)); err != nil {
 		t.Fatal(err)
 	}
 
 	writeRawJournal(t, f, "op-temp", []canonical.Value{
-		rawUnit("link.txt", unitWrite, false, true),
+		rawUnitWithTemp("link.txt", unitWrite, false, true),
 	})
 
 	if err := Recover(f.ctx, "parent"); err != nil {
@@ -167,5 +213,44 @@ func TestRecoverLeavesPreFixRandomTempDebris(t *testing.T) {
 	}
 	if _, err := os.Stat(debris); err != nil {
 		t.Fatalf("pre-fix random temp after Recover: err = %v, want it left in place (underivable, not swept)", err)
+	}
+}
+
+// TestRecoverLeavesLegacyDerivedTempDebris: the same
+// disposition for the previous generation's DERIVED names.
+// The destination-only derivation named a temp from the
+// destination alone; the per-op derivation that replaced it
+// cannot produce that name from anything the journal
+// records, so a temp standing under it is debris of the
+// accepted class — left standing, never swept — even for a
+// unit whose temp-created record makes rollback actively
+// look for the unit's temp under the current derivation.
+func TestRecoverLeavesLegacyDerivedTempDebris(t *testing.T) {
+	f := newJournalFixture(t)
+
+	// The mutation landed; the mark did not.
+	journalWriteFile(t, filepath.Join(f.parentDir, "mod.txt"), "run mod\n", 0o644)
+	preDir := filepath.Join(f.root, "staging", "op-temp", "pre")
+	journalWriteFile(t, filepath.Join(preDir, "mod.txt"), "original\n", 0o644)
+	// The previous generation's temp for the same
+	// destination, under the destination-only derivation.
+	debris := filepath.Join(f.parentDir, legacyDerivedTempName(filepath.Join(f.parentDir, "mod.txt"), false))
+	journalWriteFile(t, debris, "partial", 0o644)
+
+	writeRawJournal(t, f, "op-temp", []canonical.Value{
+		rawUnitWithTemp("mod.txt", unitWrite, false, true),
+	})
+
+	if err := Recover(f.ctx, "parent"); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(f.parentDir, "mod.txt")); err != nil || string(got) != "original\n" {
+		t.Fatalf("mod.txt after Recover = %q, %v; want the restored preimage", got, err)
+	}
+	if _, err := os.Stat(journalPath(f.root, "parent")); !os.IsNotExist(err) {
+		t.Fatalf("journal after Recover: err = %v, want gone", err)
+	}
+	if b, err := os.ReadFile(debris); err != nil || string(b) != "partial" {
+		t.Fatalf("legacy-derived temp after Recover = %q, %v; want left standing byte-identical (underivable under the current derivation, not swept)", b, err)
 	}
 }
