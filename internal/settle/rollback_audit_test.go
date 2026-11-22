@@ -35,14 +35,18 @@ import (
 // guard names the ancestor-guard callee the function body
 // must call before it deletes through a live-tree path (""
 // where the function's deletions resolve no live-tree
-// path). gate requires the body to reference the journaled
-// temp-created ownership record. why states the discipline
-// in words — the rationale a future editor must preserve or
-// consciously amend here.
+// path). recordFields names the journaled per-kind
+// temp-created ownership record fields the body must
+// reference — the gate is checked per field, because the
+// record itself is per kind: a cleanup that consults only
+// one kind's record while deleting both kinds' names is
+// the divergence the per-kind record exists to close.
+// why states the discipline in words — the rationale a
+// future editor must preserve or consciously amend here.
 type deletionClass struct {
-	guard string
-	gate  bool
-	why   string
+	guard        string
+	recordFields []string
+	why          string
 }
 
 // deletionClasses classifies every function in journal.go
@@ -53,18 +57,18 @@ type deletionClass struct {
 var deletionClasses = map[string]deletionClass{
 	// The rollback path proper.
 	"removeUnitTemps": {
-		guard: "blockedByAncestor",
-		gate:  true,
-		why:   "derived-name temp cleanup: removes only temps the unit's journaled temp-created record proves this settlement created, and only through ancestors that stand as real directories of this tree",
+		guard:        "blockedByAncestor",
+		recordFields: []string{"TempCreatedFile", "TempCreatedLink"},
+		why:          "derived-name temp cleanup: removes each kind's temp only under that kind's journaled temp-created record (a write unit creates one kind; the other kind's name is not its record's to vouch for), and only through ancestors that stand as real directories of this tree",
 	},
 	"removeCreatedOccupant": {
 		guard: "blockedByAncestor",
 		why:   "removes only the occupant a write unit created at its recorded path, and only when no ancestor stands replaced in the live tree",
 	},
 	"restorePreimage": {
-		guard: "symlinkAncestor",
-		gate:  true,
-		why:   "restores a unit's preimage at its recorded path: refuses outright rather than remove or write through a symlink ancestor; its one derived-name removal — the restore temp a killed earlier Recover left — is ownership-gated on the unit's journaled temp-created record, and a collision without the record stays a refusal",
+		guard:        "symlinkAncestor",
+		recordFields: []string{"TempCreatedFile"},
+		why:          "restores a unit's preimage at its recorded path: refuses outright rather than remove or write through a symlink ancestor; its one derived-name removal — the restore temp a killed earlier Recover left — is ownership-gated on the unit's journaled file-kind temp-created record (a restore creates only file-kind temps, so the file kind is the only record that can vouch for it), and a collision without the record stays a refusal",
 	},
 	"removeOccupant": {
 		why: "the deletion primitive itself: removes the single occupant at an exact path (a tree, for a directory); absence in targetGone's sense is success. It carries no discipline of its own — every caller must be classified above",
@@ -151,7 +155,7 @@ func auditJournalDeletions(src []byte) ([]deletionSite, []string, error) {
 		name := fd.Name.Name
 		class, classified := deletionClasses[name]
 		callsGuard := map[string]bool{}
-		referencesRecord := false
+		referencedRecords := map[string]bool{}
 		ast.Inspect(fd.Body, func(n ast.Node) bool {
 			switch node := n.(type) {
 			case *ast.CallExpr:
@@ -169,8 +173,8 @@ func auditJournalDeletions(src []byte) ([]deletionSite, []string, error) {
 					}
 				}
 			case *ast.SelectorExpr:
-				if node.Sel.Name == "TempCreated" {
-					referencesRecord = true
+				if node.Sel.Name == "TempCreatedFile" || node.Sel.Name == "TempCreatedLink" {
+					referencedRecords[node.Sel.Name] = true
 				}
 			}
 			return true
@@ -181,8 +185,10 @@ func auditJournalDeletions(src []byte) ([]deletionSite, []string, error) {
 		if class.guard != "" && !callsGuard[class.guard] {
 			violations = append(violations, fmt.Sprintf("%s is classified ancestor-guarded but never calls %s", name, class.guard))
 		}
-		if class.gate && !referencesRecord {
-			violations = append(violations, fmt.Sprintf("%s is classified ownership-gated but never references the TempCreated record", name))
+		for _, field := range class.recordFields {
+			if !referencedRecords[field] {
+				violations = append(violations, fmt.Sprintf("%s is classified ownership-gated but never references the %s record", name, field))
+			}
 		}
 	}
 	return sites, violations, nil
@@ -211,7 +217,8 @@ func rogueDelete() error { return os.Remove("x") }
 
 	// Negative control 2: removeUnitTemps present and
 	// deleting, but with neither its ancestor guard nor its
-	// ownership gate — both disciplines must be flagged.
+	// ownership gate — the guard and BOTH per-kind record
+	// references must be flagged.
 	unguarded := `package settle
 
 func removeUnitTemps(parentDir, op string, u journalUnit) error {
@@ -225,8 +232,37 @@ func removeOccupant(dst string) error { return nil }
 		t.Fatalf("audit unguarded control: %v", err)
 	}
 	joined := strings.Join(unguardedViolations, "\n")
-	if !strings.Contains(joined, "blockedByAncestor") || !strings.Contains(joined, "TempCreated") {
-		t.Fatalf("unguarded control violations = %v, want both the missing guard and the missing ownership gate flagged", unguardedViolations)
+	if !strings.Contains(joined, "blockedByAncestor") || !strings.Contains(joined, "TempCreatedFile") || !strings.Contains(joined, "TempCreatedLink") {
+		t.Fatalf("unguarded control violations = %v, want the missing guard and both missing per-kind ownership gates flagged", unguardedViolations)
+	}
+
+	// Negative control 3: removeUnitTemps guarded and gated
+	// on ONE kind's record only — the per-kind gate must
+	// flag the kind it never consults, since a cleanup that
+	// checks one record while deleting both kinds' names is
+	// the scope divergence the per-kind record closes.
+	oneKind := `package settle
+
+func removeUnitTemps(parentDir, op string, u journalUnit) error {
+	if !u.TempCreatedFile {
+		return nil
+	}
+	if _, err := blockedByAncestor(parentDir, u.Path); err != nil {
+		return err
+	}
+	return removeOccupant(parentDir)
+}
+
+func blockedByAncestor(parentDir, rel string) (bool, error) { return false, nil }
+
+func removeOccupant(dst string) error { return nil }
+`
+	_, oneKindViolations, err := auditJournalDeletions([]byte(oneKind))
+	if err != nil {
+		t.Fatalf("audit one-kind control: %v", err)
+	}
+	if len(oneKindViolations) != 1 || !strings.Contains(oneKindViolations[0], "TempCreatedLink") {
+		t.Fatalf("one-kind control violations = %v, want exactly the unconsulted TempCreatedLink gate flagged", oneKindViolations)
 	}
 
 	// The real tree.

@@ -76,23 +76,26 @@ func legacyDerivedTempName(dst string, link bool) string {
 }
 
 // rawUnitWithTemp builds one journal unit carrying the
-// temp-created record: the ownership record the write path
-// persists between a temp's exclusive creation and its
+// per-kind temp-created record for ONE temp kind (link
+// selects which): the ownership record the write path
+// persists between that kind's temp creation and its
 // content write, and the only warrant rollback accepts
-// before removing a derived-name temp (post-merge fix wave,
-// issue #9). The killed writes in this file DID create
-// their temps — the partial content planted below is what
-// they wrote — so their hand-built journals carry the
-// record the writer would have left, in the same canonical
+// before removing that kind's derived-name temp
+// (post-merge fix wave, issue #9). The killed writes in
+// this file DID create their temps — the partial content
+// planted below is what they wrote — so their hand-built
+// journals carry the record the writer would have left,
+// for exactly the kind it created, in the same canonical
 // form. (The pre-fix debris fixture below deliberately
 // carries none: its writer predates the record.)
-func rawUnitWithTemp(path, kind string, done, started bool) canonical.Value {
+func rawUnitWithTemp(path, kind string, done, started, link bool) canonical.Value {
 	return canonical.ObjectOf(
 		canonical.Pair{Key: "done", Value: canonical.BoolOf(done)},
 		canonical.Pair{Key: "kind", Value: canonical.StringOf(kind)},
 		canonical.Pair{Key: "path", Value: canonical.StringOf(path)},
 		canonical.Pair{Key: "started", Value: canonical.BoolOf(started)},
-		canonical.Pair{Key: "temp_created", Value: canonical.BoolOf(true)},
+		canonical.Pair{Key: "temp_created_file", Value: canonical.BoolOf(!link)},
+		canonical.Pair{Key: "temp_created_link", Value: canonical.BoolOf(link)},
 	)
 }
 
@@ -118,7 +121,7 @@ func TestRecoverRemovesFileTempLeftByKilledWrite(t *testing.T) {
 	journalWriteFile(t, filepath.Join(preDir, "mod.txt"), "original\n", 0o644)
 
 	writeRawJournal(t, f, "op-temp", []canonical.Value{
-		rawUnitWithTemp("mod.txt", unitWrite, false, true),
+		rawUnitWithTemp("mod.txt", unitWrite, false, true, false),
 	})
 
 	if err := Recover(f.ctx, "parent"); err != nil {
@@ -165,7 +168,7 @@ func TestRecoverRemovesSymlinkTempLeftByKilledWrite(t *testing.T) {
 	}
 
 	writeRawJournal(t, f, "op-temp", []canonical.Value{
-		rawUnitWithTemp("link.txt", unitWrite, false, true),
+		rawUnitWithTemp("link.txt", unitWrite, false, true, true),
 	})
 
 	if err := Recover(f.ctx, "parent"); err != nil {
@@ -238,7 +241,7 @@ func TestRecoverLeavesLegacyDerivedTempDebris(t *testing.T) {
 	journalWriteFile(t, debris, "partial", 0o644)
 
 	writeRawJournal(t, f, "op-temp", []canonical.Value{
-		rawUnitWithTemp("mod.txt", unitWrite, false, true),
+		rawUnitWithTemp("mod.txt", unitWrite, false, true, false),
 	})
 
 	if err := Recover(f.ctx, "parent"); err != nil {

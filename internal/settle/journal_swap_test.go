@@ -444,7 +444,7 @@ func TestRecoverRepeatsInterruptedFileToDirRollback(t *testing.T) {
 	// The interrupted first Recover: both undos performed with
 	// rollback's own code, journal and staging left in place.
 	preDir := filepath.Join(stagingDirFor(f.root, "op-r2"), "pre")
-	if err := undoWriteUnit(f.parentDir, preDir, journalUnit{Path: "old.txt/inner.txt", Kind: unitWrite, Done: true, Started: true, TempCreated: true}, "op-r2", nil); err != nil {
+	if err := undoWriteUnit(f.parentDir, preDir, journalUnit{Path: "old.txt/inner.txt", Kind: unitWrite, Done: true, Started: true, TempCreatedFile: true}, "op-r2", nil); err != nil {
 		t.Fatalf("interrupted Recover, write undo: %v", err)
 	}
 	if err := undoDeleteUnit(f.parentDir, preDir, journalUnit{Path: "old.txt", Kind: unitDelete, Done: true, Started: true}, "op-r2", nil); err != nil {

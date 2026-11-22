@@ -92,23 +92,32 @@ type journalUnit struct {
 	Kind    string // unitWrite | unitDelete
 	Done    bool
 	Started bool
-	// TempCreated is the ownership record for the unit's
-	// derived-name temp files: persisted — a journal rewrite
-	// in the recordIntent style — after a temp's exclusive
-	// creation succeeds and before its content is written,
-	// so a durable record proves this settlement created the
-	// temp before any byte of it lands. The materializer's
-	// write loop sets it for the unit's write temps;
-	// rollback's restore path sets it for a restore temp
-	// (see rollbackJournal), so a later Recover may remove
-	// that temp instead of wedging on it. It is rollback's
-	// only warrant for removing a derived-name temp (see
-	// removeUnitTemps): a computable name is not ownership,
-	// and a unit without the record — its creation was
-	// refused by a pre-existing occupant, or its journal
-	// predates the record — has no temp removed on its
-	// behalf.
-	TempCreated bool
+	// TempCreatedFile and TempCreatedLink are the ownership
+	// records for the unit's derived-name temps, one per
+	// temp kind: persisted — a journal rewrite in the
+	// recordIntent style — after a temp's exclusive creation
+	// succeeds and before its content is written, so a
+	// durable record proves this settlement created that
+	// kind's temp before any byte of it lands. The record
+	// is per kind because the deletion is: a write unit
+	// creates exactly one kind (a regular file lands through
+	// copyFileAtomic, a symlink through replaceWithSymlink),
+	// and a unit-wide record would vouch for a temp of the
+	// other kind this settlement never created — the same
+	// scope divergence as no record at all, one kind over.
+	// The materializer's write loop sets the kind its writer
+	// created; rollback's restore path sets the file kind
+	// for a restore temp (restores create no other kind; see
+	// rollbackJournal), so a later Recover may remove that
+	// temp instead of wedging on it. The records are
+	// rollback's only warrant for removing a derived-name
+	// temp (see removeUnitTemps): a computable name is not
+	// ownership, and a unit without a kind's record — its
+	// creation was refused by a pre-existing occupant, or
+	// its journal predates the record — has no temp of that
+	// kind removed on its behalf.
+	TempCreatedFile bool
+	TempCreatedLink bool
 }
 
 // journal is one parent scope's in-flight settlement, recorded
@@ -422,7 +431,8 @@ func writeJournal(root string, j *journal) error {
 			canonical.Pair{Key: "kind", Value: canonical.StringOf(u.Kind)},
 			canonical.Pair{Key: "path", Value: canonical.StringOf(u.Path)},
 			canonical.Pair{Key: "started", Value: canonical.BoolOf(u.Started)},
-			canonical.Pair{Key: "temp_created", Value: canonical.BoolOf(u.TempCreated)},
+			canonical.Pair{Key: "temp_created_file", Value: canonical.BoolOf(u.TempCreatedFile)},
+			canonical.Pair{Key: "temp_created_link", Value: canonical.BoolOf(u.TempCreatedLink)},
 		))
 	}
 	v := canonical.ObjectOf(
@@ -675,24 +685,49 @@ func decodeJournal(v canonical.Value) (*journal, error) {
 			}
 			started = pr.Value.Bool
 		}
-		// The temp_created flag is optional on read, on the
-		// started flag's precedent: journals written before
-		// temp ownership was journaled carry no such field,
-		// and their units are simply unproven — rollback
-		// removes no temp for them. When present it must be
-		// a bool: an ownership record that cannot be read is
-		// not a record recovery may guess at.
-		tempCreated := false
+		// The temp_created_file / temp_created_link flags are
+		// optional on read, on the started flag's precedent:
+		// journals written before temp ownership was journaled
+		// per kind carry neither field, and their units are
+		// simply unproven for both kinds — rollback removes
+		// no temp for them. When present each must be a bool:
+		// an ownership record that cannot be read is not a
+		// record recovery may guess at.
+		//
+		// The predecessor form — a single unit-wide
+		// temp_created flag, written only by an intermediate
+		// version of this code that was never merged — is
+		// validated the same way when present but grants
+		// neither kind: it cannot say WHICH kind the unit
+		// created, and crediting it with either would let
+		// rollback delete a temp of the other kind on a
+		// record that never vouched for it. A journal
+		// carrying only the old flag decodes with both kinds
+		// unrecorded; its genuine temps stand as inert
+		// debris, the same disposition as a journal predating
+		// ownership entirely.
+		tempCreatedFile, tempCreatedLink := false, false
 		for _, pr := range uv.Pairs {
-			if pr.Key != "temp_created" {
-				continue
+			switch pr.Key {
+			case "temp_created_file":
+				if pr.Value.Kind != canonical.KindBool {
+					return nil, fmt.Errorf("unit %d has an invalid temp_created_file flag", i)
+				}
+				tempCreatedFile = pr.Value.Bool
+			case "temp_created_link":
+				if pr.Value.Kind != canonical.KindBool {
+					return nil, fmt.Errorf("unit %d has an invalid temp_created_link flag", i)
+				}
+				tempCreatedLink = pr.Value.Bool
+			case "temp_created":
+				if pr.Value.Kind != canonical.KindBool {
+					return nil, fmt.Errorf("unit %d has an invalid temp_created flag", i)
+				}
+				// Validated, and deliberately uncredited:
+				// see the comment above.
 			}
-			if pr.Value.Kind != canonical.KindBool {
-				return nil, fmt.Errorf("unit %d has an invalid temp_created flag", i)
-			}
-			tempCreated = pr.Value.Bool
 		}
-		j.Units = append(j.Units, journalUnit{Path: p, Kind: kind, Done: done, Started: started, TempCreated: tempCreated})
+		j.Units = append(j.Units, journalUnit{Path: p, Kind: kind, Done: done, Started: started, TempCreatedFile: tempCreatedFile, TempCreatedLink: tempCreatedLink})
 	}
 	// The recorded fact body must agree with the journal: it is
 	// the authority Recover mints from, so a disagreement means
@@ -1054,19 +1089,28 @@ func materialize(ctx *Context, req materializeRequest) error {
 		// Temp ownership, recorded at the one moment the
 		// proof exists: the writers invoke this between the
 		// temp's exclusive creation and its content write,
-		// and it persists the unit's temp-created record —
+		// reporting the kind they created, and it persists
+		// the unit's per-kind temp-created record —
 		// recordIntent's discipline, a journal rewrite with
 		// no completion count and no crash hook — so
-		// rollback may later remove the temp as this
+		// rollback may later remove that kind's temp as this
 		// settlement's own. A unit whose writer never
 		// invokes it (its creation was refused by a
-		// pre-existing occupant) carries no record, and
-		// rollback removes no temp for it.
-		recordTemp := func() error {
-			if u.TempCreated {
-				return nil
+		// pre-existing occupant) carries no record for the
+		// kind, and rollback removes no temp of that kind
+		// for it.
+		recordTemp := func(link bool) error {
+			if link {
+				if u.TempCreatedLink {
+					return nil
+				}
+				u.TempCreatedLink = true
+			} else {
+				if u.TempCreatedFile {
+					return nil
+				}
+				u.TempCreatedFile = true
 			}
-			u.TempCreated = true
 			return recordIntent()
 		}
 		if err := applyWriteUnit(req, treeDir, u.Path, writeEntry[u.Path], recordTemp); err != nil {
@@ -1309,9 +1353,11 @@ func planUnits(req materializeRequest, treeDir string, current map[string]dirFil
 // (atomic per file) with the tree's mode. onTempCreated is
 // the writers' ownership hook, passed through to them: it
 // fires between the temp's exclusive creation and its
-// content write, and the materializer uses it to persist the
-// unit's temp-created record in the journal.
-func applyWriteUnit(req materializeRequest, treeDir, rel string, entry snapshot.WorkspaceEntry, onTempCreated func() error) error {
+// content write, reporting the kind created (the writer this
+// function chose is the unit's only temp source, so the kind
+// is exact), and the materializer uses it to persist the
+// unit's per-kind temp-created record in the journal.
+func applyWriteUnit(req materializeRequest, treeDir, rel string, entry snapshot.WorkspaceEntry, onTempCreated func(link bool) error) error {
 	src := filepath.Join(treeDir, filepath.FromSlash(rel))
 	dst := filepath.Join(req.parentDir, filepath.FromSlash(rel))
 	if entry.Symlink {
@@ -1546,16 +1592,21 @@ func rollbackJournal(ctx *Context, j *journal) error {
 	// that temp's creation and its rename would otherwise leave
 	// a temp no cleanup pass visits — the next Recover's restore
 	// retries into the same name and wedges on the collision.
-	// The hook persists the unit's temp-created record (a
-	// journal rewrite, no crash hook — rollback has none) at
-	// the one moment the proof exists, so the next restore may
-	// remove the recorded temp and proceed (see restorePreimage).
-	recordRestoreTemp := func(idx int) func() error {
-		return func() error {
-			if j.Units[idx].TempCreated {
+	// The hook persists the unit's file-kind temp-created
+	// record (a journal rewrite, no crash hook — rollback has
+	// none) at the one moment the proof exists, so the next
+	// restore may remove the recorded temp and proceed (see
+	// restorePreimage).
+	recordRestoreTemp := func(idx int) func(bool) error {
+		return func(link bool) error {
+			// The restore path's only hooked writer is
+			// copyFileAtomic, so link is always false here:
+			// a restore temp is a file-kind temp, and the
+			// file kind is the kind the record vouches for.
+			if j.Units[idx].TempCreatedFile {
 				return nil
 			}
-			j.Units[idx].TempCreated = true
+			j.Units[idx].TempCreatedFile = true
 			return writeJournal(ctx.Root, j)
 		}
 	}
@@ -1592,18 +1643,22 @@ func rollbackJournal(ctx *Context, j *journal) error {
 //   - Ownership: the derived name is a pure function of the
 //     destination and the operation, computable by anyone
 //     who can read the journal — it does not prove this
-//     settlement created the file standing at it. Only a
-//     unit carrying the journaled temp-created record has
-//     its temps removed: the record was persisted between
-//     the temp's exclusive creation and its content write,
-//     so it names a temp this settlement made. A unit
-//     without the record — its creation was refused by a
-//     pre-existing occupant, the kill struck between
-//     creation and record, or the journal predates the
-//     record — has no temp removed on its behalf: the
-//     occupant may be a genuine file, and it has no unit
-//     and no preimage rollback could restore it from, so
-//     deleting it would be unrecoverable loss on a guess.
+//     settlement created the file standing at it. Each
+//     kind's name is removed only under that kind's
+//     journaled temp-created record: the record was
+//     persisted between that temp's exclusive creation and
+//     its content write, so it names a temp this settlement
+//     made. The gate is per kind because the creation is —
+//     a write unit creates exactly one kind, and its other
+//     kind's record says nothing about the file standing at
+//     that name. A kind without its record — its creation
+//     was refused by a pre-existing occupant, the kill
+//     struck between creation and record, or the journal
+//     predates the record — has no temp of that kind
+//     removed on the unit's behalf: the occupant may be a
+//     genuine file, and it has no unit and no preimage
+//     rollback could restore it from, so deleting it would
+//     be unrecoverable loss on a guess.
 //   - Confinement: the temp path is decided lexically,
 //     through the unit's ancestors in the live tree
 //     (blockedByAncestor) — the decision removeCreatedOccupant
@@ -1629,7 +1684,7 @@ func rollbackJournal(ctx *Context, j *journal) error {
 // debris from a genuine file of the same shape, and this
 // branch has no production deployment carrying such debris.
 func removeUnitTemps(parentDir, op string, u journalUnit) error {
-	if !u.TempCreated {
+	if !u.TempCreatedFile && !u.TempCreatedLink {
 		return nil
 	}
 	blocked, err := blockedByAncestor(parentDir, u.Path)
@@ -1640,8 +1695,14 @@ func removeUnitTemps(parentDir, op string, u journalUnit) error {
 		return nil
 	}
 	dst := filepath.Join(parentDir, filepath.FromSlash(u.Path))
-	for _, link := range []bool{false, true} {
-		tmp := filepath.Join(filepath.Dir(dst), syncTempName(dst, op, link))
+	for _, kind := range []struct {
+		link     bool
+		recorded bool
+	}{{false, u.TempCreatedFile}, {true, u.TempCreatedLink}} {
+		if !kind.recorded {
+			continue
+		}
+		tmp := filepath.Join(filepath.Dir(dst), syncTempName(dst, op, kind.link))
 		info, err := os.Lstat(tmp)
 		if err != nil {
 			if targetGone(err) {
@@ -1816,7 +1877,7 @@ func removeCreatedOccupant(parentDir, rel, dst string) error {
 //     restored by their own undo steps; the directory itself is
 //     outside the file-map contract, and reading it as a file
 //     would wedge recovery on a lawful shape.
-func undoWriteUnit(parentDir, preDir string, u journalUnit, op string, recordTemp func() error) error {
+func undoWriteUnit(parentDir, preDir string, u journalUnit, op string, recordTemp func(bool) error) error {
 	rel := u.Path
 	dst := filepath.Join(parentDir, filepath.FromSlash(rel))
 	preInfo, hasPreimage, err := statPreimage(preDir, rel)
@@ -1833,7 +1894,7 @@ func undoWriteUnit(parentDir, preDir string, u journalUnit, op string, recordTem
 // its preimage. A delete unit's target existed by construction,
 // so a missing preimage contradicts the journal: a descriptive
 // refusal, never a guess.
-func undoDeleteUnit(parentDir, preDir string, u journalUnit, op string, recordTemp func() error) error {
+func undoDeleteUnit(parentDir, preDir string, u journalUnit, op string, recordTemp func(bool) error) error {
 	rel := u.Path
 	if _, hasPreimage, err := statPreimage(preDir, rel); err != nil {
 		return err
@@ -1905,7 +1966,7 @@ func removeOccupant(dst string) error {
 // creation retried once. A collision with no record is a
 // foreign occupant: the refusal stands, byte-identical,
 // because a computable name is not ownership.
-func restorePreimage(parentDir, preDir string, u journalUnit, op string, recordTemp func() error) error {
+func restorePreimage(parentDir, preDir string, u journalUnit, op string, recordTemp func(bool) error) error {
 	rel := u.Path
 	dst := filepath.Join(parentDir, filepath.FromSlash(rel))
 	pre := filepath.Join(preDir, filepath.FromSlash(rel))
@@ -1960,14 +2021,15 @@ func restorePreimage(parentDir, preDir string, u journalUnit, op string, recordT
 		return nil
 	}
 	err = copyFileAtomic(pre, dst, preInfo.Mode().Perm(), op, recordTemp)
-	if err == nil || !u.TempCreated || !errors.Is(err, fs.ErrExist) {
+	if err == nil || !u.TempCreatedFile || !errors.Is(err, fs.ErrExist) {
 		return err
 	}
-	// The recorded-temp collision above: the unit's record
-	// proves this settlement created the temp standing at the
-	// derived name, so removing it removes the settlement's
-	// own — never a foreign file, which carries no record and
-	// keeps the refusal.
+	// The recorded-temp collision above: the unit's file-kind
+	// record proves this settlement created the temp standing
+	// at the derived name (a restore temp is always the file
+	// kind — the only kind this path creates), so removing it
+	// removes the settlement's own — never a foreign file,
+	// which carries no record and keeps the refusal.
 	tmp := filepath.Join(filepath.Dir(dst), syncTempName(dst, op, false))
 	if rerr := os.Remove(tmp); rerr != nil && !targetGone(rerr) {
 		return fmt.Errorf("settle: remove recorded restore temp %s: %w", tmp, rerr)
