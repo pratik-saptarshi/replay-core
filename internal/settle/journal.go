@@ -242,8 +242,8 @@ type journal struct {
 	// same way an identity-absent journal is; a journal
 	// carrying one is held to every element of it.
 	ParentChain []string
-	Fact           canonical.Value
-	Units          []journalUnit
+	Fact        canonical.Value
+	Units       []journalUnit
 
 	// digest is the digest of the exact bytes readJournal
 	// loaded this journal from — its provenance mark, checked
