@@ -2171,8 +2171,12 @@ func rollbackJournal(ctx *Context, j *journal) error {
 //     flag), the occupant must match it before removal —
 //     verifyTempOccupant: a file occupant whose content is
 //     the recorded content, or a strict prefix of it (the
-//     kill inside the temp's single content write) checked
-//     against the settlement's own staged source; a link
+//     kill inside the temp's single content write — the
+//     prefix includes the empty one: a temp killed before
+//     its first byte stands empty, and the bytes removed
+//     are in every case a prefix of the settlement's own
+//     content) checked against the settlement's own staged
+//     source; a link
 //     occupant naming the recorded target. A mismatch is
 //     left standing and the undo proceeds around it: the
 //     occupant is not the settlement's, and nothing in the
