@@ -74,8 +74,8 @@ var deletionClasses = map[string]deletionClass{
 		why: "the deletion primitive itself: removes the single occupant at an exact path (a tree, for a directory); absence in targetGone's sense is success. It carries no discipline of its own — every caller must be classified above",
 	},
 	"rollbackJournal": {
-		guards: []string{"parentRootReplaced", "symlinkInParentPath", "verifyParentIdentity"},
-		why:    "rollback's conductor: before any undo it refuses a journal whose parent root's final component stands as a symlink (parentRootReplaced) — the journaled path was resolved when written, so a link there now means the root was replaced after the crash and every undo path would resolve into the tree the link names — it refuses a journal whose recorded path passes through a symlink at ANY component (symlinkInParentPath), since the recorded path was symlink-free when written and an ancestor's substitution is invisible to the component guards that start inside the parent, and it verifies the root's identity against the journal's recorded parent identity (verifyParentIdentity), since a different REAL directory placed at the recorded path passes every form check while rollback's restores and removals land in the wrong tree; a journal carrying no recorded identity — written before identities were recorded — proceeds under the form guards alone, because refusing it would wedge the scope permanently (every verb reaches the journal only through entry recovery), so the identity is grandfathered for that one generation while every journal carrying one is held to it exactly. Its only deletion call is removeUnitTemps, whose guard and gate travel with it; the undo helpers it drives are classified in their own entries",
+		guards: []string{"parentRootReplaced", "symlinkInParentPath", "verifyParentIdentity", "verifyParentChain"},
+		why:    "rollback's conductor: before any undo it refuses a journal whose parent root's final component stands as a symlink (parentRootReplaced) — the journaled path was resolved when written, so a link there now means the root was replaced after the crash and every undo path would resolve into the tree the link names — it refuses a journal whose recorded path passes through a symlink at ANY component (symlinkInParentPath), since the recorded path was symlink-free when written and an ancestor's substitution is invisible to the component guards that start inside the parent, and it verifies the root's identity against the journal's recorded parent identity (verifyParentIdentity), since a different REAL directory placed at the recorded path passes every form check while rollback's restores and removals land in the wrong tree; a journal carrying no recorded identity — written before identities were recorded — proceeds under the form guards alone, because refusing it would wedge the scope permanently (every verb reaches the journal only through entry recovery), so the identity is grandfathered for that one generation while every journal carrying one is held to it exactly, and it verifies the recorded path's whole ancestor chain (verifyParentChain), since an ancestor replaced by a different REAL directory — the parent moved into it, inode intact — passes both the symlink walk and the final-component identity while rollback resolves through a directory object no record vouches for; a journal carrying no chain is grandfathered the same way. Its only deletion call is removeUnitTemps, whose guard and gate travel with it; the undo helpers it drives are classified in their own entries",
 	},
 	// The materializer's deletions: the verb's own journal
 	// units and its own staging, never unrecorded content.
@@ -305,12 +305,17 @@ func rollbackJournal(ctx *Context, j *journal) error {
 	if _, through, err := symlinkInParentPath(j.ParentDir); err != nil || through {
 		return err
 	}
+	if err := verifyParentChain(j); err != nil {
+		return err
+	}
 	return removeUnitTemps(j.ParentDir, j.Op, j.Units[0])
 }
 
 func parentRootReplaced(dir string) bool { return false }
 
 func symlinkInParentPath(dir string) (string, bool, error) { return "", false, nil }
+
+func verifyParentChain(j *journal) error { return nil }
 
 func removeUnitTemps(parentDir, op string, u journalUnit) error {
 	if !u.TempCreatedFile && !u.TempCreatedLink {
@@ -349,12 +354,17 @@ func rollbackJournal(ctx *Context, j *journal) error {
 	if err := verifyParentIdentity(j); err != nil {
 		return err
 	}
+	if err := verifyParentChain(j); err != nil {
+		return err
+	}
 	return removeUnitTemps(j.ParentDir, j.Op, j.Units[0])
 }
 
 func parentRootReplaced(dir string) bool { return false }
 
 func verifyParentIdentity(j *journal) error { return nil }
+
+func verifyParentChain(j *journal) error { return nil }
 
 func removeUnitTemps(parentDir, op string, u journalUnit) error {
 	if !u.TempCreatedFile && !u.TempCreatedLink {
@@ -376,6 +386,57 @@ func removeOccupant(dst string) error { return nil }
 	}
 	if len(unwalkedViolations) != 1 || !strings.Contains(unwalkedViolations[0], "symlinkInParentPath") {
 		t.Fatalf("unwalked control violations = %v, want exactly rollbackJournal's missing symlinkInParentPath check flagged", unwalkedViolations)
+	}
+
+	// Negative control 7: rollbackJournal judging the parent
+	// root's form, its ancestor symlinks, and its identity,
+	// but never verifying the ancestor CHAIN — the missing
+	// verifyParentChain call must be flagged, since a
+	// conductor that skips the chain resolves every undo
+	// through an ancestor replaced by a different real
+	// directory, which neither the walk nor the
+	// final-component identity can see.
+	unchained := `package settle
+
+func rollbackJournal(ctx *Context, j *journal) error {
+	if parentRootReplaced(j.ParentDir) {
+		return nil
+	}
+	if _, through, err := symlinkInParentPath(j.ParentDir); err != nil || through {
+		return err
+	}
+	if err := verifyParentIdentity(j); err != nil {
+		return err
+	}
+	return removeUnitTemps(j.ParentDir, j.Op, j.Units[0])
+}
+
+func parentRootReplaced(dir string) bool { return false }
+
+func symlinkInParentPath(dir string) (string, bool, error) { return "", false, nil }
+
+func verifyParentIdentity(j *journal) error { return nil }
+
+func removeUnitTemps(parentDir, op string, u journalUnit) error {
+	if !u.TempCreatedFile && !u.TempCreatedLink {
+		return nil
+	}
+	if _, err := blockedByAncestor(parentDir, u.Path); err != nil {
+		return err
+	}
+	return removeOccupant(parentDir)
+}
+
+func blockedByAncestor(parentDir, rel string) (bool, error) { return false, nil }
+
+func removeOccupant(dst string) error { return nil }
+`
+	_, unchainedViolations, err := auditJournalDeletions([]byte(unchained))
+	if err != nil {
+		t.Fatalf("audit unchained control: %v", err)
+	}
+	if len(unchainedViolations) != 1 || !strings.Contains(unchainedViolations[0], "verifyParentChain") {
+		t.Fatalf("unchained control violations = %v, want exactly rollbackJournal's missing verifyParentChain check flagged", unchainedViolations)
 	}
 
 	// The real tree.

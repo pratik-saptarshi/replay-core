@@ -223,6 +223,21 @@ type journal struct {
 	// verb reaches the journal only through entry recovery)
 	// — the grandfathering verifyParentIdentity records.
 	ParentIdentity string
+	// ParentChain is the recorded identity of EVERY
+	// component prefix of ParentDir — the ancestor chain,
+	// from the filesystem root down to the parent itself,
+	// one identity per prefix of parentPathPrefixes. The
+	// final-component identity alone cannot see an ancestor
+	// replaced by a different REAL directory: the parent
+	// directory moved into the replacement keeps its inode,
+	// every form check passes, and rollback resolves
+	// through a directory object no record vouches for.
+	// Rollback verifies the whole chain at entry (see
+	// verifyParentChain). A journal written before chains
+	// were recorded carries none and is grandfathered the
+	// same way an identity-absent journal is; a journal
+	// carrying one is held to every element of it.
+	ParentChain []string
 	Fact           canonical.Value
 	Units          []journalUnit
 
@@ -513,11 +528,71 @@ func parentDirIdentity(dir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return identityOfInfo(dir, info)
+}
+
+// componentIdentity returns the identity of the directory
+// object AT path — the component itself, judged by Lstat,
+// never the tree a symlink there would name. The ancestor
+// chain is a chain of components: each element vouches for
+// the very object standing at that prefix of the recorded
+// path.
+func componentIdentity(path string) (string, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	return identityOfInfo(path, info)
+}
+
+// identityOfInfo renders a stat'ed directory's identity in
+// the journal's recorded form.
+func identityOfInfo(path string, info fs.FileInfo) (string, error) {
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
-		return "", fmt.Errorf("settle: cannot determine the identity of directory %s on this platform", dir)
+		return "", fmt.Errorf("settle: cannot determine the identity of directory %s on this platform", path)
 	}
 	return strconv.FormatUint(st.Dev, 10) + ":" + strconv.FormatUint(uint64(st.Ino), 10), nil
+}
+
+// parentPathPrefixes returns dir's component prefixes from
+// the filesystem root down to dir itself, in order: the
+// prefixes the ancestor chain records one identity apiece
+// for. The chain's element i is the recorded identity of
+// prefix i — the final element is the parent directory's
+// own prefix, the same object parent_identity names.
+func parentPathPrefixes(dir string) []string {
+	clean := filepath.Clean(dir)
+	prefixes := []string{string(filepath.Separator)}
+	cur := string(filepath.Separator)
+	for _, part := range strings.Split(clean, string(filepath.Separator)) {
+		if part == "" {
+			continue
+		}
+		cur = filepath.Join(cur, part)
+		prefixes = append(prefixes, cur)
+	}
+	return prefixes
+}
+
+// parentChainIdentities computes the ancestor chain for
+// dir: the identity of every prefix of the recorded parent
+// path, taken from the components standing there now. The
+// recording is all-or-nothing — a prefix that cannot be
+// stat'ed fails the whole chain, and writeJournal leaves
+// the field empty rather than record a partial chain
+// recovery would have to guess at.
+func parentChainIdentities(dir string) ([]string, error) {
+	prefixes := parentPathPrefixes(dir)
+	chain := make([]string, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		id, err := componentIdentity(prefix)
+		if err != nil {
+			return nil, err
+		}
+		chain = append(chain, id)
+	}
+	return chain, nil
 }
 
 // validParentIdentity reports whether s is a well-formed
@@ -560,6 +635,19 @@ func writeJournal(root string, j *journal) error {
 			j.ParentIdentity = id
 		}
 	}
+	// The ancestor chain is recorded once, under the same
+	// discipline: at the journal's first write, from the
+	// components standing along the recorded path in that
+	// moment, and preserved on every later write. The
+	// recording is all-or-nothing — a prefix that cannot be
+	// stat'ed leaves the field empty, and a chain-absent
+	// journal is grandfathered at rollback under the other
+	// guards (see verifyParentChain).
+	if len(j.ParentChain) == 0 {
+		if chain, err := parentChainIdentities(j.ParentDir); err == nil {
+			j.ParentChain = chain
+		}
+	}
 	units := make([]canonical.Value, 0, len(j.Units))
 	for _, u := range j.Units {
 		pairs := []canonical.Pair{
@@ -582,8 +670,15 @@ func writeJournal(root string, j *journal) error {
 		{Key: "fact", Value: j.Fact},
 		{Key: "old_head", Value: canonical.StringOf(j.OldHead)},
 		{Key: "op", Value: canonical.StringOf(j.Op)},
-		{Key: "parent_dir", Value: canonical.StringOf(j.ParentDir)},
 	}
+	if len(j.ParentChain) > 0 {
+		elems := make([]canonical.Value, 0, len(j.ParentChain))
+		for _, id := range j.ParentChain {
+			elems = append(elems, canonical.StringOf(id))
+		}
+		pairs = append(pairs, canonical.Pair{Key: "parent_chain", Value: canonical.ArrayOf(elems...)})
+	}
+	pairs = append(pairs, canonical.Pair{Key: "parent_dir", Value: canonical.StringOf(j.ParentDir)})
 	if j.ParentIdentity != "" {
 		pairs = append(pairs, canonical.Pair{Key: "parent_identity", Value: canonical.StringOf(j.ParentIdentity)})
 	}
@@ -814,6 +909,33 @@ func decodeJournal(v canonical.Value) (*journal, error) {
 			return nil, fmt.Errorf("parent_identity %q is not a well-formed directory identity", p.Value.Str)
 		}
 		j.ParentIdentity = p.Value.Str
+	}
+	// The ancestor chain is optional on read for the same
+	// reason: journals written before chains were recorded
+	// carry no such field, and rollback proceeds for them
+	// under the other guards. When present it must be a
+	// full span of well-formed identities — one per prefix
+	// of parent_dir, no more and no fewer: a chain that
+	// does not span the recorded path is not one recovery
+	// may guess at.
+	for _, p := range v.Pairs {
+		if p.Key != "parent_chain" {
+			continue
+		}
+		if p.Value.Kind != canonical.KindArray {
+			return nil, errors.New("parent_chain is not an array")
+		}
+		chain := make([]string, 0, len(p.Value.Elems))
+		for _, e := range p.Value.Elems {
+			if e.Kind != canonical.KindString || !validParentIdentity(e.Str) {
+				return nil, fmt.Errorf("parent_chain entry %q is not a well-formed directory identity", e.Str)
+			}
+			chain = append(chain, e.Str)
+		}
+		if want := len(parentPathPrefixes(j.ParentDir)); len(chain) != want {
+			return nil, fmt.Errorf("parent_chain names %d components for parent_dir %q, which has %d — a chain that does not span the recorded path is not one recovery may guess at", len(chain), j.ParentDir, want)
+		}
+		j.ParentChain = chain
 	}
 	fact, ok := objectField(v, "fact")
 	if !ok {
@@ -1834,6 +1956,17 @@ func rollbackJournal(ctx *Context, j *journal) error {
 	if err := verifyParentIdentity(j); err != nil {
 		return err
 	}
+	// The ancestor chain is judged last among the entry
+	// checks: every component of the recorded path must
+	// still be the directory object the journal recorded,
+	// root to parent — an ancestor replaced by a different
+	// real directory passes the symlink walk (no link) and
+	// the final-component identity (the parent keeps its
+	// inode inside the replacement), and only the chain
+	// sees it.
+	if err := verifyParentChain(j); err != nil {
+		return err
+	}
 	preDir := filepath.Join(stagingDirFor(ctx.Root, j.Op), "pre")
 	treeDir := filepath.Join(stagingDirFor(ctx.Root, j.Op), "tree")
 	// recordRestoreTemp is the restore path's ownership hook,
@@ -2269,6 +2402,47 @@ func verifyParentIdentity(j *journal) error {
 	}
 	if id != j.ParentIdentity {
 		return fmt.Errorf("settle: recover %q: parent directory %q has identity %s, but the journal recorded identity %s — the directory has been replaced since the journal was written, and rolling back would restore and delete in a different tree; refusing", j.ParentScope, j.ParentDir, id, j.ParentIdentity)
+	}
+	return nil
+}
+
+// verifyParentChain judges the journal's claim on its
+// parent directory's whole path, component by component:
+// every prefix of the recorded path — from the filesystem
+// root down to the parent itself — must still stand as the
+// very directory object the journal recorded. The checks
+// before it cannot see the substitution this one exists
+// for: an ancestor of the parent moved aside and a
+// different REAL directory placed at its name, with the
+// parent directory itself moved into the replacement. No
+// component is a symlink, so the walk passes; the parent
+// keeps its inode, so the final-component identity passes;
+// and rollback would resolve every path through a
+// directory object no record vouches for, into whatever
+// the replacement's contents name today. A journal
+// carrying no chain — written before chains were recorded
+// — is grandfathered exactly as an identity-absent journal
+// is (see verifyParentIdentity): it proceeds under the
+// other guards. A chain that is present is enforced in
+// full: any component that cannot be stat'ed, or whose
+// identity differs from the recorded one, refuses, naming
+// the component; the journal stays as evidence.
+func verifyParentChain(j *journal) error {
+	if len(j.ParentChain) == 0 {
+		return nil
+	}
+	prefixes := parentPathPrefixes(j.ParentDir)
+	if len(prefixes) != len(j.ParentChain) {
+		return fmt.Errorf("settle: recover %q: the journal records %d parent path components for %q, which has %d — refusing to roll back on a chain that does not span the recorded path", j.ParentScope, len(j.ParentChain), j.ParentDir, len(prefixes))
+	}
+	for i, prefix := range prefixes {
+		id, err := componentIdentity(prefix)
+		if err != nil {
+			return fmt.Errorf("settle: recover %q: cannot verify the identity of parent path component %q: %v — refusing to roll back", j.ParentScope, prefix, err)
+		}
+		if id != j.ParentChain[i] {
+			return fmt.Errorf("settle: recover %q: parent path component %q has identity %s, but the journal recorded identity %s — an ancestor of parent directory %q has been replaced since the journal was written, and rolling back would resolve through the replacement; refusing", j.ParentScope, prefix, id, j.ParentChain[i], j.ParentDir)
+		}
 	}
 	return nil
 }

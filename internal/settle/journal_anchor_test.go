@@ -54,6 +54,13 @@ type rawJournalSpec struct {
 	// parentDirIdentity); plants of crafted journals leave
 	// it empty, as they leave the anchor unrecorded.
 	parentIdentity string
+	// parentChain, when non-nil, is planted as the
+	// journal's parent_chain — the ancestor-chain identities
+	// the writer records at a journal's creation. Plants
+	// that mean to stand for a writer-produced journal set
+	// it (from parentChainIdentities); plants of crafted or
+	// pre-chain journals leave it nil.
+	parentChain []string
 	fact           canonical.Value
 	units          []canonical.Value
 }
@@ -67,8 +74,15 @@ func plantRawJournal(t *testing.T, path string, spec rawJournalSpec) []byte {
 		{Key: "fact", Value: spec.fact},
 		{Key: "old_head", Value: canonical.StringOf(spec.oldHead)},
 		{Key: "op", Value: canonical.StringOf(spec.op)},
-		{Key: "parent_dir", Value: canonical.StringOf(spec.parentDir)},
 	}
+	if spec.parentChain != nil {
+		elems := make([]canonical.Value, 0, len(spec.parentChain))
+		for _, id := range spec.parentChain {
+			elems = append(elems, canonical.StringOf(id))
+		}
+		pairs = append(pairs, canonical.Pair{Key: "parent_chain", Value: canonical.ArrayOf(elems...)})
+	}
+	pairs = append(pairs, canonical.Pair{Key: "parent_dir", Value: canonical.StringOf(spec.parentDir)})
 	if spec.parentIdentity != "" {
 		pairs = append(pairs, canonical.Pair{Key: "parent_identity", Value: canonical.StringOf(spec.parentIdentity)})
 	}
