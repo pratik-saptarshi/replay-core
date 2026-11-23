@@ -30,6 +30,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -764,7 +765,11 @@ func walkDirFiles(dir string) (map[string]dirFile, []string, error) {
 }
 
 // filesEqual reports whether two regular files hold identical
-// bytes.
+// bytes. The comparison is incremental — a size fast-path,
+// then bounded chunks — because it sits on the recovery path
+// (restorePreimage's already-restored check) and in the
+// planner, where either file can be as large as the trees
+// being settled: neither file is ever loaded whole.
 func filesEqual(a, b string) (bool, error) {
 	ai, err := os.Stat(a)
 	if err != nil {
@@ -777,15 +782,37 @@ func filesEqual(a, b string) (bool, error) {
 	if ai.Size() != bi.Size() {
 		return false, nil
 	}
-	ab, err := os.ReadFile(a)
+	fa, err := os.Open(a)
 	if err != nil {
 		return false, fmt.Errorf("settle: read %s: %w", a, err)
 	}
-	bb, err := os.ReadFile(b)
+	defer fa.Close()
+	fb, err := os.Open(b)
 	if err != nil {
 		return false, fmt.Errorf("settle: read %s: %w", b, err)
 	}
-	return bytes.Equal(ab, bb), nil
+	defer fb.Close()
+	bufA := make([]byte, 64<<10)
+	bufB := make([]byte, 64<<10)
+	for {
+		na, ea := io.ReadFull(fa, bufA)
+		if ea != nil && ea != io.EOF && ea != io.ErrUnexpectedEOF {
+			return false, fmt.Errorf("settle: read %s: %w", a, ea)
+		}
+		nb, eb := io.ReadFull(fb, bufB)
+		if eb != nil && eb != io.EOF && eb != io.ErrUnexpectedEOF {
+			return false, fmt.Errorf("settle: read %s: %w", b, eb)
+		}
+		if na != nb || !bytes.Equal(bufA[:na], bufB[:nb]) {
+			return false, nil
+		}
+		if ea != nil || eb != nil {
+			// Both streams ended on this chunk — the
+			// sizes were equal, so they end together —
+			// and every chunk matched.
+			return true, nil
+		}
+	}
 }
 
 // permForMode maps a git tree mode for a regular file to the

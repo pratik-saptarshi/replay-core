@@ -74,7 +74,8 @@ var deletionClasses = map[string]deletionClass{
 		why: "the deletion primitive itself: removes the single occupant at an exact path (a tree, for a directory); absence in targetGone's sense is success. It carries no discipline of its own — every caller must be classified above",
 	},
 	"rollbackJournal": {
-		why: "rollback's conductor: its only deletion call is removeUnitTemps, whose guard and gate travel with it; the undo helpers it drives are classified in their own entries",
+		guard: "parentRootReplaced",
+		why:   "rollback's conductor: before any undo it refuses a journal whose parent root's final component stands as a symlink (parentRootReplaced) — the journaled path was resolved when written, so a link there now means the root was replaced after the crash and every undo path would resolve into the tree the link names; its only deletion call is removeUnitTemps, whose guard and gate travel with it; the undo helpers it drives are classified in their own entries",
 	},
 	// The materializer's deletions: the verb's own journal
 	// units and its own staging, never unrecorded content.
@@ -263,6 +264,28 @@ func removeOccupant(dst string) error { return nil }
 	}
 	if len(oneKindViolations) != 1 || !strings.Contains(oneKindViolations[0], "TempCreatedLink") {
 		t.Fatalf("one-kind control violations = %v, want exactly the unconsulted TempCreatedLink gate flagged", oneKindViolations)
+	}
+
+	// Negative control 4: rollbackJournal conducting its
+	// deletions without ever judging the parent root — the
+	// missing parentRootReplaced call must be flagged,
+	// since a conductor that skips the root check resolves
+	// every undo through a replaced root into another tree.
+	rootless := `package settle
+
+func rollbackJournal(ctx *Context, j *journal) error {
+	return removeUnitTemps(j.ParentDir, j.Op, j.Units[0])
+}
+
+func removeUnitTemps(parentDir, op string, u journalUnit) error { return nil }
+`
+	_, rootlessViolations, err := auditJournalDeletions([]byte(rootless))
+	if err != nil {
+		t.Fatalf("audit rootless control: %v", err)
+	}
+	joinedRootless := strings.Join(rootlessViolations, "\n")
+	if !strings.Contains(joinedRootless, "rollbackJournal") || !strings.Contains(joinedRootless, "parentRootReplaced") {
+		t.Fatalf("rootless control violations = %v, want rollbackJournal's missing parentRootReplaced check flagged", rootlessViolations)
 	}
 
 	// The real tree.

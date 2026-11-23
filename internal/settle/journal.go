@@ -116,6 +116,24 @@ type journalUnit struct {
 	// creation was refused by a pre-existing occupant, or
 	// its journal predates the record — has no temp of that
 	// kind removed on its behalf.
+	//
+	// A record's lifetime is bounded by the temp's: it may
+	// only ever vouch for a temp that may still stand. The
+	// materializer clears a write unit's records in the
+	// same journal write that first persists the unit as
+	// done — a done unit's temp was renamed onto its
+	// destination, so nothing of the unit's stands at the
+	// derived name any more — and rollback clears a unit's
+	// records, persisted by a journal write of its own,
+	// when the unit's undo completes, since the restore
+	// temp the undo may have recorded was renamed into
+	// place by that completion. A record left set past
+	// either point would vouch for whatever later comes to
+	// occupy the derived name, and a later rollback would
+	// delete a file the settlement does not own on a stale
+	// warrant. In-flight units keep their records: a unit
+	// started but not done, or mid-undo when a Recover
+	// died, may genuinely still have a temp standing.
 	TempCreatedFile bool
 	TempCreatedLink bool
 }
@@ -1117,6 +1135,21 @@ func materialize(ctx *Context, req materializeRequest) error {
 			return err
 		}
 		u.Done = true
+		// The unit's temp-created records end here: the
+		// write landed, so the temp its writer created was
+		// renamed onto the destination and no temp of this
+		// unit may still stand. Clearing them in memory now
+		// puts the clearing in the mark() below — the first
+		// journal write to persist this unit as done — so a
+		// durable journal never shows a completed unit still
+		// vouching for a derived name. A crash before that
+		// mark (the window invocation below is one) leaves
+		// the on-disk unit started with its record intact:
+		// from durable state the unit is still in flight,
+		// its temp may still stand, and rollback must still
+		// be able to remove it.
+		u.TempCreatedFile = false
+		u.TempCreatedLink = false
 		done++
 		// The symmetric accounting (Task 8 fix round): a write
 		// that lands where a directory stood clears that
@@ -1584,6 +1617,16 @@ func Recover(ctx *Context, parentScope string) error {
 // and a later verb refuses descriptively at its name
 // rather than adopt or delete it.
 func rollbackJournal(ctx *Context, j *journal) error {
+	// The parent root itself is judged before any undo
+	// work: the journal's parent directory was resolved
+	// when written, so a symlink standing at that path now
+	// means the root was replaced after the crash, and
+	// every undo below — temp cleanup first of all — would
+	// resolve through it into another tree. Refuse, and
+	// leave the journal in place as evidence.
+	if parentRootReplaced(j.ParentDir) {
+		return fmt.Errorf("settle: recover %q: parent directory %q stands as a symlink, not the directory the settlement wrote through — the parent root has been replaced since the journal was written, and rolling back would resolve into the tree the link names; refusing", j.ParentScope, j.ParentDir)
+	}
 	preDir := filepath.Join(stagingDirFor(ctx.Root, j.Op), "pre")
 	// recordRestoreTemp is the restore path's ownership hook,
 	// the materializer's recordTemp discipline pointed at
@@ -1610,6 +1653,43 @@ func rollbackJournal(ctx *Context, j *journal) error {
 			return writeJournal(ctx.Root, j)
 		}
 	}
+	// completeUnit closes a unit's record lifetime when its
+	// undo finishes, the mirror of the materializer clearing
+	// a write unit's records at its done-mark. By the time a
+	// unit's undo returns, no temp of that unit may still
+	// stand: its write temp was renamed by the verb or
+	// removed by this rollback's own removeUnitTemps pass,
+	// and its restore temp — the one recordRestoreTemp may
+	// have set during this very undo — was renamed onto the
+	// destination by the restore it served. The clearing is
+	// persisted by a journal write of its own, before the
+	// next unit is touched, because the kill points demand
+	// it: a Recover killed after this undo but before the
+	// journal is cleared leaves the on-disk journal behind,
+	// and a record still set in it would vouch, for the next
+	// Recover, for whatever then occupies the derived name —
+	// the temp it once named is gone, so the warrant would
+	// be stale and the deletion a foreign one. A kill
+	// between the restore's rename and this write leaves the
+	// record set, which is correct from durable state: the
+	// journal cannot distinguish that kill from one between
+	// the temp's creation and its rename, where the temp
+	// genuinely stands and the record must still vouch.
+	// Units carrying no record need no write — there is
+	// nothing to clear, and the journal's disposal at
+	// clearJournalState takes the rest.
+	completeUnit := func(idx int) error {
+		u := &j.Units[idx]
+		if !u.TempCreatedFile && !u.TempCreatedLink {
+			return nil
+		}
+		u.TempCreatedFile = false
+		u.TempCreatedLink = false
+		if err := writeJournal(ctx.Root, j); err != nil {
+			return fmt.Errorf("settle: recover %q: record completed undo of %s: %w", j.ParentScope, u.Path, err)
+		}
+		return nil
+	}
 	for i := len(j.Units) - 1; i >= 0; i-- {
 		u := j.Units[i]
 		if u.Kind != unitWrite || (!u.Done && !u.Started) {
@@ -1621,6 +1701,9 @@ func rollbackJournal(ctx *Context, j *journal) error {
 		if err := undoWriteUnit(j.ParentDir, preDir, u, j.Op, recordRestoreTemp(i)); err != nil {
 			return fmt.Errorf("settle: recover %q: roll back %s: %w", j.ParentScope, u.Path, err)
 		}
+		if err := completeUnit(i); err != nil {
+			return err
+		}
 	}
 	for i := len(j.Units) - 1; i >= 0; i-- {
 		u := j.Units[i]
@@ -1629,6 +1712,9 @@ func rollbackJournal(ctx *Context, j *journal) error {
 		}
 		if err := undoDeleteUnit(j.ParentDir, preDir, u, j.Op, recordRestoreTemp(i)); err != nil {
 			return fmt.Errorf("settle: recover %q: roll back %s: %w", j.ParentScope, u.Path, err)
+		}
+		if err := completeUnit(i); err != nil {
+			return err
 		}
 	}
 	return clearJournalState(ctx.Root, j.ParentScope, j.Op)
@@ -1769,6 +1855,28 @@ func statPreimage(preDir, rel string) (fs.FileInfo, bool, error) {
 		return nil, false, fmt.Errorf("settle: stat preimage %s: %w", pre, err)
 	}
 	return info, true, nil
+}
+
+// parentRootReplaced reports whether dir's final component
+// stands as a symlink. The journal's parent directory was
+// resolved — absolute and symlink-free — when the settlement
+// wrote it (resolveParentDir at the materializer's entry), so
+// a symlink standing at that exact path when rollback runs
+// means the directory itself was replaced after the crash:
+// moved aside and linked is a filesystem state, needing no
+// concurrent actor. Every path rollback computes then
+// resolves through the link into whatever tree it names, and
+// the component guards (blockedByAncestor, symlinkAncestor)
+// cannot see it — they judge components INSIDE the parent,
+// never the parent itself. A directory that cannot be
+// stat'ed is not judged here: its absence is met by the undo
+// paths in their own terms, as before this check existed.
+// Only the final component is judged — the ancestors above
+// it were the platform's business at resolution time and
+// remain so.
+func parentRootReplaced(dir string) bool {
+	info, err := os.Lstat(dir)
+	return err == nil && info.Mode()&fs.ModeSymlink != 0
 }
 
 // blockedByAncestor reports whether rel, read inside the live
