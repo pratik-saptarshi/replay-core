@@ -58,8 +58,8 @@ var deletionClasses = map[string]deletionClass{
 	// The rollback path proper.
 	"removeUnitTemps": {
 		guards:       []string{"blockedByAncestor"},
-		recordFields: []string{"TempCreatedFile", "TempCreatedLink"},
-		why:          "derived-name temp cleanup: removes each kind's temp only under that kind's journaled temp-created record (a write unit creates one kind; the other kind's name is not its record's to vouch for), and only through ancestors that stand as real directories of this tree",
+		recordFields: []string{"TempCreatedFile", "TempCreatedLink", "TempRestoreCreated"},
+		why:          "derived-name temp cleanup: removes each derivation's temp only under that derivation's journaled temp-created record (a write unit creates one write kind; the other kind's name is not its record's to vouch for — and the restore temp's name belongs to the restore record alone, never to the write record whose identity it would otherwise borrow), and only through ancestors that stand as real directories of this tree",
 	},
 	"removeCreatedOccupant": {
 		guards: []string{"blockedByAncestor"},
@@ -67,8 +67,8 @@ var deletionClasses = map[string]deletionClass{
 	},
 	"restorePreimage": {
 		guards:       []string{"symlinkAncestor"},
-		recordFields: []string{"TempCreatedFile"},
-		why:          "restores a unit's preimage at its recorded path: refuses outright rather than remove or write through a symlink ancestor; its one derived-name removal — the restore temp a killed earlier Recover left — is ownership-gated on the unit's journaled file-kind temp-created record (a restore creates only file-kind temps, so the file kind is the only record that can vouch for it), and a collision without the record stays a refusal",
+		recordFields: []string{"TempRestoreCreated"},
+		why:          "restores a unit's preimage at its recorded path: refuses outright rather than remove or write through a symlink ancestor; its one derived-name removal — the restore temp a killed earlier Recover left — is ownership-gated on the unit's journaled RESTORE temp record (a restore creates only file-kind temps, under the restore derivation, so the restore record is the only one that can vouch for that name; the write kinds' records are never consulted here), and a collision without the record stays a refusal",
 	},
 	"removeOccupant": {
 		why: "the deletion primitive itself: removes the single occupant at an exact path (a tree, for a directory); absence in targetGone's sense is success. It carries no discipline of its own — every caller must be classified above",
@@ -174,7 +174,7 @@ func auditJournalDeletions(src []byte) ([]deletionSite, []string, error) {
 					}
 				}
 			case *ast.SelectorExpr:
-				if node.Sel.Name == "TempCreatedFile" || node.Sel.Name == "TempCreatedLink" {
+				if node.Sel.Name == "TempCreatedFile" || node.Sel.Name == "TempCreatedLink" || node.Sel.Name == "TempRestoreCreated" {
 					referencedRecords[node.Sel.Name] = true
 				}
 			}
@@ -220,8 +220,8 @@ func rogueDelete() error { return os.Remove("x") }
 
 	// Negative control 2: removeUnitTemps present and
 	// deleting, but with neither its ancestor guard nor its
-	// ownership gate — the guard and BOTH per-kind record
-	// references must be flagged.
+	// ownership gate — the guard and the per-kind record
+	// references (and the restore record's) must be flagged.
 	unguarded := `package settle
 
 func removeUnitTemps(parentDir, op string, u journalUnit) error {
@@ -240,14 +240,15 @@ func removeOccupant(dst string) error { return nil }
 	}
 
 	// Negative control 3: removeUnitTemps guarded and gated
-	// on ONE kind's record only — the per-kind gate must
-	// flag the kind it never consults, since a cleanup that
-	// checks one record while deleting both kinds' names is
-	// the scope divergence the per-kind record closes.
+	// on SOME records only (the file kind's and the
+	// restore's) — the per-field gate must flag the record
+	// it never consults, since a cleanup that checks one
+	// record while deleting another's name is the scope
+	// divergence the per-record gate closes.
 	oneKind := `package settle
 
 func removeUnitTemps(parentDir, op string, u journalUnit) error {
-	if !u.TempCreatedFile {
+	if !u.TempCreatedFile && !u.TempRestoreCreated {
 		return nil
 	}
 	if _, err := blockedByAncestor(parentDir, u.Path); err != nil {
@@ -318,7 +319,7 @@ func symlinkInParentPath(dir string) (string, bool, error) { return "", false, n
 func verifyParentChain(j *journal) error { return nil }
 
 func removeUnitTemps(parentDir, op string, u journalUnit) error {
-	if !u.TempCreatedFile && !u.TempCreatedLink {
+	if !u.TempCreatedFile && !u.TempCreatedLink && !u.TempRestoreCreated {
 		return nil
 	}
 	if _, err := blockedByAncestor(parentDir, u.Path); err != nil {
@@ -367,7 +368,7 @@ func verifyParentIdentity(j *journal) error { return nil }
 func verifyParentChain(j *journal) error { return nil }
 
 func removeUnitTemps(parentDir, op string, u journalUnit) error {
-	if !u.TempCreatedFile && !u.TempCreatedLink {
+	if !u.TempCreatedFile && !u.TempCreatedLink && !u.TempRestoreCreated {
 		return nil
 	}
 	if _, err := blockedByAncestor(parentDir, u.Path); err != nil {
@@ -418,7 +419,7 @@ func symlinkInParentPath(dir string) (string, bool, error) { return "", false, n
 func verifyParentIdentity(j *journal) error { return nil }
 
 func removeUnitTemps(parentDir, op string, u journalUnit) error {
-	if !u.TempCreatedFile && !u.TempCreatedLink {
+	if !u.TempCreatedFile && !u.TempCreatedLink && !u.TempRestoreCreated {
 		return nil
 	}
 	if _, err := blockedByAncestor(parentDir, u.Path); err != nil {
@@ -437,6 +438,40 @@ func removeOccupant(dst string) error { return nil }
 	}
 	if len(unchainedViolations) != 1 || !strings.Contains(unchainedViolations[0], "verifyParentChain") {
 		t.Fatalf("unchained control violations = %v, want exactly rollbackJournal's missing verifyParentChain check flagged", unchainedViolations)
+	}
+
+	// Negative control 8: removeUnitTemps guarded and gated
+	// on both WRITE kinds' records but never consulting the
+	// RESTORE record — the missing TempRestoreCreated gate
+	// must be flagged, since a cleanup that judges the
+	// restore temp's name without the restore record is the
+	// cross-derivation borrowing the per-derivation record
+	// closes. (The audit checks each gate's PRESENCE in the
+	// body; which identity a name is judged under is beyond
+	// its expression — that application is pinned by the
+	// behavior fixtures, not here.)
+	norestore := `package settle
+
+func removeUnitTemps(parentDir, op string, u journalUnit) error {
+	if !u.TempCreatedFile && !u.TempCreatedLink {
+		return nil
+	}
+	if _, err := blockedByAncestor(parentDir, u.Path); err != nil {
+		return err
+	}
+	return removeOccupant(parentDir)
+}
+
+func blockedByAncestor(parentDir, rel string) (bool, error) { return false, nil }
+
+func removeOccupant(dst string) error { return nil }
+`
+	_, norestoreViolations, err := auditJournalDeletions([]byte(norestore))
+	if err != nil {
+		t.Fatalf("audit no-restore control: %v", err)
+	}
+	if len(norestoreViolations) != 1 || !strings.Contains(norestoreViolations[0], "TempRestoreCreated") {
+		t.Fatalf("no-restore control violations = %v, want exactly the unconsulted TempRestoreCreated gate flagged", norestoreViolations)
 	}
 
 	// The real tree.

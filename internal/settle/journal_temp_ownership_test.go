@@ -331,7 +331,7 @@ func TestRecoverLeavesUnrecordedTempDebrisAndRetryRefuses(t *testing.T) {
 // used to wedge every later Recover — no cleanup pass visits
 // a delete unit's restore temp, and the next restore retried
 // into the same name and failed on the collision. Rollback
-// now persists the unit's temp-created record for its own
+// now persists the unit's own RESTORE temp record for its
 // restore temps (the record below, with the temp's
 // identity), so the repeated restore may remove the recorded
 // temp and retry creation once. The fixture is the state
@@ -359,7 +359,7 @@ func TestRecoverRetriesRestoreOverRecordedRestoreTemp(t *testing.T) {
 	journalWriteFile(t, filepath.Join(preDir, "mod.txt"), "original\n", 0o644)
 
 	writeRawJournal(t, f, "op-restore", []canonical.Value{
-		rawUnitWithTempIdentity("mod.txt", unitDelete, true, true, false, tempFileIdentityOf("original\n")),
+		rawUnitWithRestoreTempIdentity("mod.txt", unitDelete, true, true, tempFileIdentityOf("original\n")),
 	})
 
 	if err := Recover(f.ctx, "parent"); err != nil {

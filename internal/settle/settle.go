@@ -874,8 +874,9 @@ func syncTempName(dst, op string, link bool) string {
 // collides only with a temp a previous restore of the same
 // unit left at the restore name, which is the recorded
 // case the retry exists for, and removeUnitTemps cleans
-// the restore name under the unit's file-kind record
-// beside the write name. Like the write derivation, the
+// the restore name under the unit's restore record —
+// the restore derivation's own ownership record, never
+// the write kinds'. Like the write derivation, the
 // name is a pure function of state the journal already
 // records, knowable before any restore temp exists.
 func syncRestoreTempName(dst, op string) string {

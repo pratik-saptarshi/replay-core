@@ -226,12 +226,14 @@ func TestRecoverCompletesBesideLegacyRestoreTemp(t *testing.T) {
 // TestRecoverCleansRecordedRestoreTempOfWriteUnit: a write
 // unit's undo was itself killed mid-restore — the first
 // Recover removed the unit's write temp, began restoring
-// its preimage, recorded the restore temp (flag and the
-// preimage's identity: the record re-binds to the temp
-// that may now stand), and died with the restore temp
+// its preimage, recorded the restore temp under the
+// restore derivation's OWN record (flag and the preimage's
+// identity; the write record, still standing beside it,
+// keeps the write content's identity and vouches for the
+// write name alone), and died with the restore temp
 // standing at the restore-derived name and the destination
 // already removed. removeUnitTemps cleans the restore name
-// under that record — verified against the recorded
+// under the restore record — verified against the recorded
 // identity — and the retried restore completes.
 func TestRecoverCleansRecordedRestoreTempOfWriteUnit(t *testing.T) {
 	f := newJournalFixture(t)
@@ -249,7 +251,7 @@ func TestRecoverCleansRecordedRestoreTempOfWriteUnit(t *testing.T) {
 	journalWriteFile(t, filepath.Join(preDir, "mod.txt"), "original\n", 0o644)
 
 	writeRawJournal(t, f, "op-rstclean", []canonical.Value{
-		rawUnitWithTempIdentity("mod.txt", unitWrite, true, true, false, tempFileIdentityOf("original\n")),
+		rawUnitWithWriteAndRestoreTempIdentity("mod.txt", unitWrite, true, true, tempFileIdentityOf("run mod\n"), tempFileIdentityOf("original\n")),
 	})
 
 	if err := Recover(f.ctx, "parent"); err != nil {

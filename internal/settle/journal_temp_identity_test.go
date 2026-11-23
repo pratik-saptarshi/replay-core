@@ -84,6 +84,50 @@ func rawUnitWithTempIdentity(path, kind string, done, started, link bool, identi
 	return canonical.ObjectOf(pairs...)
 }
 
+// rawUnitWithRestoreTempIdentity builds one journal unit
+// carrying the RESTORE temp's own ownership record — flag
+// and identity — in the canonical on-disk form the writer
+// now produces: rollback's restore hook records the restore
+// temp under its own derivation's record (and only there),
+// so a unit in this form is what a kill after a restore's
+// record leaves behind. The write kinds carry no record:
+// no write temp of this unit was ever recorded, or its
+// record was already cleared.
+func rawUnitWithRestoreTempIdentity(path, kind string, done, started bool, identity string) canonical.Value {
+	return canonical.ObjectOf(
+		canonical.Pair{Key: "done", Value: canonical.BoolOf(done)},
+		canonical.Pair{Key: "kind", Value: canonical.StringOf(kind)},
+		canonical.Pair{Key: "path", Value: canonical.StringOf(path)},
+		canonical.Pair{Key: "started", Value: canonical.BoolOf(started)},
+		canonical.Pair{Key: "temp_created_file", Value: canonical.BoolOf(false)},
+		canonical.Pair{Key: "temp_created_link", Value: canonical.BoolOf(false)},
+		canonical.Pair{Key: "temp_restore_created", Value: canonical.BoolOf(true)},
+		canonical.Pair{Key: "temp_restore_identity", Value: canonical.StringOf(identity)},
+	)
+}
+
+// rawUnitWithWriteAndRestoreTempIdentity builds one journal
+// unit carrying BOTH file records, each with its own
+// derivation's identity: the write record the verb left
+// (the write content's identity) and the restore record a
+// first rollback's restore hook left (the preimage's
+// identity) — the durable state of a write unit whose undo
+// was killed mid-restore, before completeUnit could clear
+// either record.
+func rawUnitWithWriteAndRestoreTempIdentity(path, kind string, done, started bool, writeIdentity, restoreIdentity string) canonical.Value {
+	return canonical.ObjectOf(
+		canonical.Pair{Key: "done", Value: canonical.BoolOf(done)},
+		canonical.Pair{Key: "kind", Value: canonical.StringOf(kind)},
+		canonical.Pair{Key: "path", Value: canonical.StringOf(path)},
+		canonical.Pair{Key: "started", Value: canonical.BoolOf(started)},
+		canonical.Pair{Key: "temp_created_file", Value: canonical.BoolOf(true)},
+		canonical.Pair{Key: "temp_created_link", Value: canonical.BoolOf(false)},
+		canonical.Pair{Key: "temp_file_identity", Value: canonical.StringOf(writeIdentity)},
+		canonical.Pair{Key: "temp_restore_created", Value: canonical.BoolOf(true)},
+		canonical.Pair{Key: "temp_restore_identity", Value: canonical.StringOf(restoreIdentity)},
+	)
+}
+
 // stageTreeFile stages the result-tree file a write unit
 // lands from — the settlement's own source bytes for the
 // unit, which staging holds until the journal clears.
@@ -316,7 +360,7 @@ func TestRecoverRefusesRestoreOverForeignTempOccupant(t *testing.T) {
 	journalWriteFile(t, filepath.Join(preDir, "mod.txt"), "original\n", 0o644)
 
 	writeRawJournal(t, f, "op-rident", []canonical.Value{
-		rawUnitWithTempIdentity("mod.txt", unitDelete, true, true, false, tempFileIdentityOf("original\n")),
+		rawUnitWithRestoreTempIdentity("mod.txt", unitDelete, true, true, tempFileIdentityOf("original\n")),
 	})
 
 	err := Recover(f.ctx, "parent")
