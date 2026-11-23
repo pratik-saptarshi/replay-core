@@ -61,8 +61,8 @@ type rawJournalSpec struct {
 	// it (from parentChainIdentities); plants of crafted or
 	// pre-chain journals leave it nil.
 	parentChain []string
-	fact           canonical.Value
-	units          []canonical.Value
+	fact        canonical.Value
+	units       []canonical.Value
 }
 
 // plantRawJournal writes spec's journal in canonical form at
