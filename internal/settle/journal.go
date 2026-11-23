@@ -1718,6 +1718,23 @@ func rollbackJournal(ctx *Context, j *journal) error {
 	if parentRootReplaced(j.ParentDir) {
 		return fmt.Errorf("settle: recover %q: parent directory %q stands as a symlink, not the directory the settlement wrote through — the parent root has been replaced since the journal was written, and rolling back would resolve into the tree the link names; refusing", j.ParentScope, j.ParentDir)
 	}
+	// The recorded path's components are judged next, every
+	// one of them, before the identity: the path was
+	// resolved — symlink-free — when the journal was
+	// written, so a symlink at any component now is a
+	// post-record substitution (an ancestor moved aside and
+	// linked), and every undo path would resolve through it
+	// into whatever tree the link names today — a target
+	// that can be repointed at will, which is why this
+	// check precedes the identity check even where the link
+	// names the recorded tree itself. The component guards
+	// below cannot see it: their walks start inside the
+	// parent, never above it.
+	if comp, throughLink, err := symlinkInParentPath(j.ParentDir); err != nil {
+		return err
+	} else if throughLink {
+		return fmt.Errorf("settle: recover %q: parent directory %q passes through %q, which stands as a symlink — the recorded path was symlink-free when the journal was written, so an ancestor of the parent directory has been replaced since, and rolling back would resolve through the link into the tree it names; refusing", j.ParentScope, j.ParentDir, comp)
+	}
 	// The root's identity is judged with its form, before
 	// any undo work dereferences the recorded path: the
 	// form checks cannot tell the directory the settlement
@@ -1977,6 +1994,44 @@ func statPreimage(preDir, rel string) (fs.FileInfo, bool, error) {
 func parentRootReplaced(dir string) bool {
 	info, err := os.Lstat(dir)
 	return err == nil && info.Mode()&fs.ModeSymlink != 0
+}
+
+// symlinkInParentPath walks dir's components from the
+// filesystem root, Lstat-ing each and following none, and
+// reports the first component that stands as a symlink.
+// The journal's parent directory was resolved to its
+// absolute, symlink-free form when the settlement wrote it
+// (resolveParentDir at the materializer's entry), so every
+// component of the recorded path stood as a real directory
+// or a plain path element at record time; a symlink at any
+// component at recovery time is therefore a substitution
+// made after the record — an ancestor moved aside and
+// linked — never the platform's own spelling (a caller's
+// symlinked spelling is resolved away before recording,
+// so legitimate platform symlinks above the parent never
+// appear in a recorded path). A component that names
+// nothing ends the walk without a verdict: the path names
+// nothing either, and its absence is met by the identity
+// check and the undo paths in their own terms.
+func symlinkInParentPath(dir string) (string, bool, error) {
+	cur := string(filepath.Separator)
+	for _, part := range strings.Split(filepath.Clean(dir), string(filepath.Separator)) {
+		if part == "" {
+			continue
+		}
+		cur = filepath.Join(cur, part)
+		info, err := os.Lstat(cur)
+		if err != nil {
+			if targetGone(err) {
+				return "", false, nil
+			}
+			return "", false, fmt.Errorf("settle: stat parent path component %s: %w", cur, err)
+		}
+		if info.Mode()&fs.ModeSymlink != 0 {
+			return cur, true, nil
+		}
+	}
+	return "", false, nil
 }
 
 // verifyParentIdentity judges the journal's claim on its
