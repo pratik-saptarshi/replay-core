@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -179,8 +180,24 @@ type journal struct {
 	OldHead      string // the parent scope's head the verb CASes from
 	ResultCommit string // the commit the verb CASes the parent scope to
 	ParentDir    string // the real tree the units apply to
-	Fact         canonical.Value
-	Units        []journalUnit
+	// ParentIdentity is the recorded identity of ParentDir —
+	// device and inode of the resolved directory, taken by
+	// writeJournal at the journal's first write, while the
+	// directory the verb resolved is the one standing there.
+	// The path alone does not identify the tree: the
+	// directory can be moved aside after a crash and a
+	// different real directory placed at its path, and every
+	// form check (not a symlink, ancestors real) passes on
+	// the replacement while rollback's restores and removals
+	// land in the wrong tree. Rollback therefore verifies
+	// the identity before dereferencing the path at all (see
+	// verifyParentIdentity). A journal written before
+	// identities were recorded carries none, and an absent
+	// identity is unverifiable: rollback refuses it, the
+	// ownership record's rule one level up.
+	ParentIdentity string
+	Fact           canonical.Value
+	Units          []journalUnit
 
 	// digest is the digest of the exact bytes readJournal
 	// loaded this journal from — its provenance mark, checked
@@ -436,12 +453,63 @@ func validUnitPath(p string) bool {
 	return true
 }
 
+// parentDirIdentity returns dir's identity in the journal's
+// recorded form: the device and inode of the directory the
+// path names, decimal, colon-separated. Two directories at
+// one path across a replacement never share it; one
+// directory keeps it for its whole life.
+func parentDirIdentity(dir string) (string, error) {
+	info, err := os.Stat(dir)
+	if err != nil {
+		return "", err
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return "", fmt.Errorf("settle: cannot determine the identity of directory %s on this platform", dir)
+	}
+	return strconv.FormatUint(st.Dev, 10) + ":" + strconv.FormatUint(uint64(st.Ino), 10), nil
+}
+
+// validParentIdentity reports whether s is a well-formed
+// recorded parent identity — the only form parentDirIdentity
+// emits.
+func validParentIdentity(s string) bool {
+	dev, ino, ok := strings.Cut(s, ":")
+	if !ok || dev == "" || ino == "" || strings.Contains(ino, ":") {
+		return false
+	}
+	if _, err := strconv.ParseUint(dev, 10, 64); err != nil {
+		return false
+	}
+	if _, err := strconv.ParseUint(ino, 10, 64); err != nil {
+		return false
+	}
+	return true
+}
+
 // writeJournal records j as parentScope's journal: canonical
 // JSON to a temp file in the journals directory, fsynced, then
 // renamed into place and the directory fsynced. A state change
 // is therefore atomic and durable — a crash mid-write leaves
 // the previous complete journal, never a torn one.
 func writeJournal(root string, j *journal) error {
+	// The parent identity is recorded once, at the journal's
+	// first write, from the directory standing at the
+	// recorded path in that moment — for the materializer,
+	// the resolved directory the verb is about to write
+	// through. Later writes preserve the recorded value (the
+	// in-memory journal carries it; a journal read back from
+	// disk carries it from there): re-recording at a later
+	// write would let a directory replaced mid-settlement
+	// re-anchor the journal to itself. A directory that
+	// cannot be stat'ed leaves the field empty, and the
+	// journal unverifiable — rollback refuses it rather than
+	// act on an unproven claim (see verifyParentIdentity).
+	if j.ParentIdentity == "" {
+		if id, err := parentDirIdentity(j.ParentDir); err == nil {
+			j.ParentIdentity = id
+		}
+	}
 	units := make([]canonical.Value, 0, len(j.Units))
 	for _, u := range j.Units {
 		units = append(units, canonical.ObjectOf(
@@ -453,11 +521,16 @@ func writeJournal(root string, j *journal) error {
 			canonical.Pair{Key: "temp_created_link", Value: canonical.BoolOf(u.TempCreatedLink)},
 		))
 	}
-	v := canonical.ObjectOf(
-		canonical.Pair{Key: "fact", Value: j.Fact},
-		canonical.Pair{Key: "old_head", Value: canonical.StringOf(j.OldHead)},
-		canonical.Pair{Key: "op", Value: canonical.StringOf(j.Op)},
-		canonical.Pair{Key: "parent_dir", Value: canonical.StringOf(j.ParentDir)},
+	pairs := []canonical.Pair{
+		{Key: "fact", Value: j.Fact},
+		{Key: "old_head", Value: canonical.StringOf(j.OldHead)},
+		{Key: "op", Value: canonical.StringOf(j.Op)},
+		{Key: "parent_dir", Value: canonical.StringOf(j.ParentDir)},
+	}
+	if j.ParentIdentity != "" {
+		pairs = append(pairs, canonical.Pair{Key: "parent_identity", Value: canonical.StringOf(j.ParentIdentity)})
+	}
+	pairs = append(pairs,
 		canonical.Pair{Key: "parent_scope", Value: canonical.StringOf(j.ParentScope)},
 		canonical.Pair{Key: "result_commit", Value: canonical.StringOf(j.ResultCommit)},
 		canonical.Pair{Key: "run_scope", Value: canonical.StringOf(j.RunScope)},
@@ -465,6 +538,7 @@ func writeJournal(root string, j *journal) error {
 		canonical.Pair{Key: "units", Value: canonical.ArrayOf(units...)},
 		canonical.Pair{Key: "verb", Value: canonical.StringOf(j.Verb)},
 	)
+	v := canonical.ObjectOf(pairs...)
 	b, err := canonical.MarshalKernel(v)
 	if err != nil {
 		return fmt.Errorf("settle: marshal journal for %q: %w", j.ParentScope, err)
@@ -665,6 +739,23 @@ func decodeJournal(v canonical.Value) (*journal, error) {
 	}
 	if !filepath.IsAbs(j.ParentDir) {
 		return nil, fmt.Errorf("parent_dir %q is not an absolute path", j.ParentDir)
+	}
+	// The parent identity is optional on read, on the
+	// started flag's precedent: journals written before
+	// identities were recorded carry no such field, and
+	// their claim on the parent directory is simply
+	// unverifiable — rollback refuses them for it (see
+	// verifyParentIdentity). When present it must be a
+	// well-formed identity: one that cannot be read is not
+	// one recovery may guess at.
+	for _, p := range v.Pairs {
+		if p.Key != "parent_identity" {
+			continue
+		}
+		if p.Value.Kind != canonical.KindString || !validParentIdentity(p.Value.Str) {
+			return nil, fmt.Errorf("parent_identity %q is not a well-formed directory identity", p.Value.Str)
+		}
+		j.ParentIdentity = p.Value.Str
 	}
 	fact, ok := objectField(v, "fact")
 	if !ok {
@@ -1627,6 +1718,15 @@ func rollbackJournal(ctx *Context, j *journal) error {
 	if parentRootReplaced(j.ParentDir) {
 		return fmt.Errorf("settle: recover %q: parent directory %q stands as a symlink, not the directory the settlement wrote through — the parent root has been replaced since the journal was written, and rolling back would resolve into the tree the link names; refusing", j.ParentScope, j.ParentDir)
 	}
+	// The root's identity is judged with its form, before
+	// any undo work dereferences the recorded path: the
+	// form checks cannot tell the directory the settlement
+	// wrote through from a different real directory placed
+	// at its path after the crash, and every undo below
+	// would land in whichever tree the path now names.
+	if err := verifyParentIdentity(j); err != nil {
+		return err
+	}
 	preDir := filepath.Join(stagingDirFor(ctx.Root, j.Op), "pre")
 	// recordRestoreTemp is the restore path's ownership hook,
 	// the materializer's recordTemp discipline pointed at
@@ -1877,6 +1977,37 @@ func statPreimage(preDir, rel string) (fs.FileInfo, bool, error) {
 func parentRootReplaced(dir string) bool {
 	info, err := os.Lstat(dir)
 	return err == nil && info.Mode()&fs.ModeSymlink != 0
+}
+
+// verifyParentIdentity judges the journal's claim on its
+// parent directory by identity, not by path: the directory
+// standing at the recorded path now must be the very
+// directory the journal recorded at its creation — same
+// device, same inode. The path's form checks
+// (parentRootReplaced and the ancestor guards) cannot see
+// the replacement this one exists for: the journaled
+// directory moved aside and a different REAL directory
+// placed at its path, a filesystem state needing no
+// concurrent actor, under which rollback's restores would
+// overwrite the replacement's files and its removals delete
+// them while the settled tree sits aside unrecovered. A
+// journal carrying no identity — written before identities
+// were recorded — is refused rather than acted on: the
+// claim is unverifiable, and recovery does not guess. A
+// directory that cannot be stat'ed at all is refused the
+// same way: its identity cannot be verified either.
+func verifyParentIdentity(j *journal) error {
+	if j.ParentIdentity == "" {
+		return fmt.Errorf("settle: recover %q: the journal records no parent identity for %q — it predates identity recording, so the directory standing there cannot be verified as the one the settlement wrote through; refusing to roll back on an unverifiable journal", j.ParentScope, j.ParentDir)
+	}
+	id, err := parentDirIdentity(j.ParentDir)
+	if err != nil {
+		return fmt.Errorf("settle: recover %q: cannot verify the identity of parent directory %q: %v — refusing to roll back", j.ParentScope, j.ParentDir, err)
+	}
+	if id != j.ParentIdentity {
+		return fmt.Errorf("settle: recover %q: parent directory %q has identity %s, but the journal recorded identity %s — the directory has been replaced since the journal was written, and rolling back would restore and delete in a different tree; refusing", j.ParentScope, j.ParentDir, id, j.ParentIdentity)
+	}
+	return nil
 }
 
 // blockedByAncestor reports whether rel, read inside the live

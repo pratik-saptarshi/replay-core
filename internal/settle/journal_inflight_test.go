@@ -54,11 +54,16 @@ func rawUnit(path, kind string, done, started bool) canonical.Value {
 // the full state a crash in the window leaves.
 func writeRawJournal(t *testing.T, f *journalFixture, op string, units []canonical.Value) {
 	t.Helper()
+	identity, err := parentDirIdentity(f.parentDir)
+	if err != nil {
+		t.Fatalf("parent identity of fixture dir: %v", err)
+	}
 	v := canonical.ObjectOf(
 		canonical.Pair{Key: "fact", Value: store.SettleSelectBody(op, "parent", "run-a", f.parent0, f.parent0)},
 		canonical.Pair{Key: "old_head", Value: canonical.StringOf(f.parent0)},
 		canonical.Pair{Key: "op", Value: canonical.StringOf(op)},
 		canonical.Pair{Key: "parent_dir", Value: canonical.StringOf(f.parentDir)},
+		canonical.Pair{Key: "parent_identity", Value: canonical.StringOf(identity)},
 		canonical.Pair{Key: "parent_scope", Value: canonical.StringOf("parent")},
 		canonical.Pair{Key: "result_commit", Value: canonical.StringOf(f.parent0)},
 		canonical.Pair{Key: "run_scope", Value: canonical.StringOf("run-a")},
