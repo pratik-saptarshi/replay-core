@@ -868,14 +868,20 @@ func syncTempName(dst, op string, link bool) string {
 // onTempCreated, when non-nil, is invoked after the temp's
 // exclusive creation succeeds and before its bytes are
 // written, with the kind created (false: this writer's file
-// kind) — the journaled materializer's hook for persisting
-// the write unit's per-kind temp-ownership record at the one
-// moment the proof exists, so rollback may later remove that
-// kind's temp as the settlement's own. Rollback's restores
-// pass their own hook, recording the restore temp on the
-// unit being restored; callers whose temps need no ownership
-// record (preimage capture, the staging builders) pass nil.
-func copyFileAtomic(src, dst string, perm os.FileMode, op string, onTempCreated func(link bool) error) error {
+// kind) and the temp's identity — for a file temp, the
+// digest and size of the content it was created to carry
+// (the bytes below, already read from src, so the identity
+// costs no second read) — the journaled materializer's hook
+// for persisting the write unit's per-kind temp-ownership
+// record, identity bound into the same journal write, at
+// the one moment the proof exists, so rollback may later
+// remove that kind's temp as the settlement's own once it
+// verifies the occupant against the identity. Rollback's
+// restores pass their own hook, recording the restore temp
+// on the unit being restored; callers whose temps need no
+// ownership record (preimage capture, the staging builders)
+// pass nil.
+func copyFileAtomic(src, dst string, perm os.FileMode, op string, onTempCreated func(link bool, identity string) error) error {
 	if err := clearBlockingDirs(dst); err != nil {
 		return err
 	}
@@ -894,7 +900,7 @@ func copyFileAtomic(src, dst string, perm os.FileMode, op string, onTempCreated 
 	}
 	defer func() { _ = os.Remove(tmpName) }()
 	if onTempCreated != nil {
-		if err := onTempCreated(false); err != nil {
+		if err := onTempCreated(false, tempFileIdentity(data)); err != nil {
 			_ = tmp.Close()
 			return err
 		}
@@ -926,11 +932,12 @@ func copyFileAtomic(src, dst string, perm os.FileMode, op string, onTempCreated 
 // rollback can name. onTempCreated, when non-nil, is
 // invoked after the link's creation succeeds and before the
 // rename, with the kind created (true: this writer's link
-// kind) — the materializer's hook for persisting the write
-// unit's per-kind temp-ownership record, as in
-// copyFileAtomic; callers whose temp links need no record
-// pass nil.
-func replaceWithSymlink(dst, target, op string, onTempCreated func(link bool) error) error {
+// kind) and the temp's identity — for a link temp, the
+// link's target, the whole of what the temp is — the
+// materializer's hook for persisting the write unit's
+// per-kind temp-ownership record, as in copyFileAtomic;
+// callers whose temp links need no record pass nil.
+func replaceWithSymlink(dst, target, op string, onTempCreated func(link bool, identity string) error) error {
 	parent := filepath.Dir(dst)
 	if err := os.MkdirAll(parent, 0o755); err != nil {
 		return fmt.Errorf("settle: create %s: %w", parent, err)
@@ -949,7 +956,7 @@ func replaceWithSymlink(dst, target, op string, onTempCreated func(link bool) er
 	// name was already taken must leave that file untouched.
 	defer func() { _ = os.Remove(tmpName) }()
 	if onTempCreated != nil {
-		if err := onTempCreated(true); err != nil {
+		if err := onTempCreated(true, target); err != nil {
 			return err
 		}
 	}
