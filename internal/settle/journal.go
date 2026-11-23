@@ -217,9 +217,11 @@ type journal struct {
 	// land in the wrong tree. Rollback therefore verifies
 	// the identity before dereferencing the path at all (see
 	// verifyParentIdentity). A journal written before
-	// identities were recorded carries none, and an absent
-	// identity is unverifiable: rollback refuses it, the
-	// ownership record's rule one level up.
+	// identities were recorded carries none; rollback
+	// proceeds for it under the form guards alone, because
+	// refusing it would wedge the scope permanently (every
+	// verb reaches the journal only through entry recovery)
+	// — the grandfathering verifyParentIdentity records.
 	ParentIdentity string
 	Fact           canonical.Value
 	Units          []journalUnit
@@ -550,9 +552,9 @@ func writeJournal(root string, j *journal) error {
 	// disk carries it from there): re-recording at a later
 	// write would let a directory replaced mid-settlement
 	// re-anchor the journal to itself. A directory that
-	// cannot be stat'ed leaves the field empty, and the
-	// journal unverifiable — rollback refuses it rather than
-	// act on an unproven claim (see verifyParentIdentity).
+	// cannot be stat'ed leaves the field empty; a journal
+	// carrying no identity is grandfathered at rollback
+	// under the form guards alone (see verifyParentIdentity).
 	if j.ParentIdentity == "" {
 		if id, err := parentDirIdentity(j.ParentDir); err == nil {
 			j.ParentIdentity = id
@@ -798,11 +800,12 @@ func decodeJournal(v canonical.Value) (*journal, error) {
 	// The parent identity is optional on read, on the
 	// started flag's precedent: journals written before
 	// identities were recorded carry no such field, and
-	// their claim on the parent directory is simply
-	// unverifiable — rollback refuses them for it (see
-	// verifyParentIdentity). When present it must be a
-	// well-formed identity: one that cannot be read is not
-	// one recovery may guess at.
+	// their claim on the parent directory is unverifiable —
+	// rollback proceeds for them under the form guards
+	// alone, the grandfathering verifyParentIdentity
+	// records. When present it must be a well-formed
+	// identity: one that cannot be read is not one recovery
+	// may guess at.
 	for _, p := range v.Pairs {
 		if p.Key != "parent_identity" {
 			continue
@@ -2241,14 +2244,24 @@ func symlinkInParentPath(dir string) (string, bool, error) {
 // concurrent actor, under which rollback's restores would
 // overwrite the replacement's files and its removals delete
 // them while the settled tree sits aside unrecovered. A
-// journal carrying no identity — written before identities
-// were recorded — is refused rather than acted on: the
-// claim is unverifiable, and recovery does not guess. A
-// directory that cannot be stat'ed at all is refused the
-// same way: its identity cannot be verified either.
+// journal carrying an identity is held to it exactly: a
+// mismatch refuses, and a directory that cannot be stat'ed
+// at all refuses the same way — its identity cannot be
+// verified either. A journal carrying NO identity — written
+// before identities were recorded — is grandfathered:
+// rollback proceeds for it under the form guards alone.
+// Refusing it would wedge the scope permanently, because
+// every verb reaches the journal only through entry
+// recovery: a refused recovery blocks every verb forever,
+// and the journal could never resolve except by manual
+// deletion — an availability failure worse than the bounded
+// residual it leaves, which is exactly one generation deep:
+// the replacement this check exists for stays open for
+// identity-absent journals, and closed for every journal
+// that carries an identity.
 func verifyParentIdentity(j *journal) error {
 	if j.ParentIdentity == "" {
-		return fmt.Errorf("settle: recover %q: the journal records no parent identity for %q — it predates identity recording, so the directory standing there cannot be verified as the one the settlement wrote through; refusing to roll back on an unverifiable journal", j.ParentScope, j.ParentDir)
+		return nil
 	}
 	id, err := parentDirIdentity(j.ParentDir)
 	if err != nil {

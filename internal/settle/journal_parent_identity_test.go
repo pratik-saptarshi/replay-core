@@ -17,11 +17,19 @@ package settle
 // identity — device and inode of the resolved directory,
 // taken when the journal is created — and rollback must
 // verify it before any path under the recorded directory is
-// dereferenced. A journal carrying no identity (written
-// before identities were recorded) is unverifiable, and an
-// unverifiable journal is refused, never acted on: the
-// ownership record's rule, one level up — absence of the
-// record means the claim is unproven.
+// dereferenced. A journal carrying an identity is held to
+// it exactly: mismatch, or a directory that cannot be
+// stat'ed at all, is a refusal. A journal carrying NO
+// identity (written before identities were recorded) is
+// grandfathered: rollback proceeds for it under the form
+// guards alone (parentRootReplaced, the ancestor walk),
+// because refusing it would wedge the scope permanently —
+// every verb reaches the journal only through entry
+// recovery, so a refused recovery blocks every verb forever
+// and the journal could never resolve except by manual
+// deletion. The real-directory substitution therefore
+// remains open for that one generation of journals, and
+// closed for every journal that carries an identity.
 
 import (
 	"os"
@@ -93,23 +101,29 @@ func TestRecoverRefusesReplacedParentDirectory(t *testing.T) {
 	}
 }
 
-// TestRecoverRefusesJournalWithoutParentIdentity: a journal
-// in the form written before parent identities were
+// TestRecoverRollsBackJournalWithoutParentIdentity: a
+// journal in the form written before parent identities were
 // recorded — the full writer state of its day (anchor
 // vouching for its exact bytes, preimage durable, unit
 // marked) minus the identity field. Its claim on the parent
-// directory is unverifiable, so rollback refuses it
-// descriptively and leaves the tree and the journal
-// untouched, exactly as it refuses a unit whose temp record
-// is absent.
-func TestRecoverRefusesJournalWithoutParentIdentity(t *testing.T) {
+// directory is unverifiable, but rollback PROCEEDS for it
+// under the remaining guards and restores the tree exactly:
+// refusing it would wedge the scope permanently, because
+// every verb resolves the journal through entry recovery
+// and a refused recovery can never clear it — the journal
+// would block every verb forever, resolvable only by manual
+// deletion. The grandfathering is one generation deep: it
+// covers exactly the journals that predate the identity,
+// and the replacement-tree substitution stays open for
+// them, as the file header records.
+func TestRecoverRollsBackJournalWithoutParentIdentity(t *testing.T) {
 	f := newJournalFixture(t)
+	preHash := hashTree(t, f.parentDir)
 
 	// The interrupted verb's landed state and its preimage.
 	journalWriteFile(t, filepath.Join(f.parentDir, "mod.txt"), "changed\n", 0o644)
 	preDir := filepath.Join(f.root, "staging", "op-noident", "pre")
 	journalWriteFile(t, filepath.Join(preDir, "mod.txt"), "original\n", 0o644)
-	preHash := hashTree(t, f.parentDir)
 
 	// The old-form journal: every field the writer of its
 	// day recorded, and no parent_identity among them.
@@ -131,20 +145,19 @@ func TestRecoverRefusesJournalWithoutParentIdentity(t *testing.T) {
 		t.Fatalf("write parent anchor: %v", err)
 	}
 
-	err := Recover(f.ctx, "parent")
-	if err == nil {
-		t.Fatal("Recover acted on a journal carrying no parent identity; want a descriptive refusal (absent identity is unverifiable)")
-	}
-	if !strings.Contains(err.Error(), "identity") {
-		t.Fatalf("Recover refusal = %v, want it to name the missing parent identity", err)
+	if err := Recover(f.ctx, "parent"); err != nil {
+		t.Fatalf("Recover of an identity-absent journal: %v, want it to proceed under the form guards and roll back (refusing would wedge the scope permanently)", err)
 	}
 	if got := hashTree(t, f.parentDir); got != preHash {
-		t.Fatalf("parent walk hash after refused Recover = %s, want %s (rollback acted on an unverifiable journal)", got, preHash)
+		t.Fatalf("parent walk hash after Recover = %s, want pre-verb %s (the grandfathered journal's rollback did not converge)", got, preHash)
 	}
-	if _, serr := os.Stat(jpath); serr != nil {
-		t.Fatalf("journal after refused Recover: %v, want still present as evidence", serr)
+	if b, err := os.ReadFile(filepath.Join(f.parentDir, "mod.txt")); err != nil || string(b) != "original\n" {
+		t.Fatalf("mod.txt after Recover = %q, %v; want the restored preimage %q", b, err, "original\n")
+	}
+	if _, serr := os.Stat(jpath); !os.IsNotExist(serr) {
+		t.Fatalf("journal after Recover: err = %v, want cleared (a grandfathered journal resolves, never wedges)", serr)
 	}
 	if facts := f.journalFacts(t, "run-a"); len(facts) != 0 {
-		t.Fatalf("refused Recover left %d facts, want 0", len(facts))
+		t.Fatalf("rolled-back grandfathered journal left %d facts, want 0", len(facts))
 	}
 }
