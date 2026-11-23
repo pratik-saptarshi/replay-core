@@ -294,14 +294,17 @@ func TestRecoverLeavesUnrecordedTempDebrisAndRetryRefuses(t *testing.T) {
 // a delete unit's restore temp, and the next restore retried
 // into the same name and failed on the collision. Rollback
 // now persists the unit's temp-created record for its own
-// restore temps (the record below), so the repeated restore
-// may remove the recorded temp and retry creation once. The
-// fixture is the state that kill leaves, built by hand the
-// way the wave-9 fixtures build theirs: the verb's delete
-// landed, the first restore's temp stands at the derived
-// name under the journal's op, the record is in the journal,
-// the destination is still absent, the preimage still
-// staged.
+// restore temps (the record below, with the temp's
+// identity), so the repeated restore may remove the recorded
+// temp and retry creation once. The fixture is the state
+// that kill leaves, built by hand the way the wave-9
+// fixtures build theirs: the verb's delete landed, the
+// first restore's temp stands at the RESTORE-derived name
+// under the journal's op — the restore path's own
+// derivation, distinct from the write path's, so a write
+// temp spared at the write name can never block it — the
+// record is in the journal, the destination is still
+// absent, the preimage still staged.
 func TestRecoverRetriesRestoreOverRecordedRestoreTemp(t *testing.T) {
 	f := newJournalFixture(t)
 	preHash := hashTree(t, f.parentDir)
@@ -312,13 +315,13 @@ func TestRecoverRetriesRestoreOverRecordedRestoreTemp(t *testing.T) {
 	}
 	// The killed restore's temp, carrying the preimage bytes
 	// it was about to rename into place.
-	tempPath := filepath.Join(f.parentDir, derivedTempName(filepath.Join(f.parentDir, "mod.txt"), "op-restore", false))
+	tempPath := filepath.Join(f.parentDir, derivedRestoreTempName(filepath.Join(f.parentDir, "mod.txt"), "op-restore"))
 	journalWriteFile(t, tempPath, "original\n", 0o644)
 	preDir := filepath.Join(f.root, "staging", "op-restore", "pre")
 	journalWriteFile(t, filepath.Join(preDir, "mod.txt"), "original\n", 0o644)
 
 	writeRawJournal(t, f, "op-restore", []canonical.Value{
-		rawUnitWithTemp("mod.txt", unitDelete, true, true, false),
+		rawUnitWithTempIdentity("mod.txt", unitDelete, true, true, false, tempFileIdentityOf("original\n")),
 	})
 
 	if err := Recover(f.ctx, "parent"); err != nil {
@@ -332,11 +335,12 @@ func TestRecoverRetriesRestoreOverRecordedRestoreTemp(t *testing.T) {
 
 // TestRecoverRefusesRestoreOverUnrecordedTemp: the same
 // killed-restore shape with NO temp-created record for the
-// unit. The temp standing at the derived name is unproven —
-// it may be a genuine file that predates the settlement —
-// so the restore's collision stays a descriptive refusal:
-// the occupant survives byte-identical and the journal
-// stays in place as evidence. Foreign until proven owned.
+// unit. The temp standing at the restore-derived name is
+// unproven — it may be a genuine file that predates the
+// settlement — so the restore's collision stays a
+// descriptive refusal: the occupant survives byte-identical
+// and the journal stays in place as evidence. Foreign until
+// proven owned.
 func TestRecoverRefusesRestoreOverUnrecordedTemp(t *testing.T) {
 	f := newJournalFixture(t)
 
@@ -344,7 +348,7 @@ func TestRecoverRefusesRestoreOverUnrecordedTemp(t *testing.T) {
 	if err := os.Remove(filepath.Join(f.parentDir, "mod.txt")); err != nil {
 		t.Fatalf("remove mod.txt: %v", err)
 	}
-	occupant := filepath.Join(f.parentDir, derivedTempName(filepath.Join(f.parentDir, "mod.txt"), "op-restore", false))
+	occupant := filepath.Join(f.parentDir, derivedRestoreTempName(filepath.Join(f.parentDir, "mod.txt"), "op-restore"))
 	journalWriteFile(t, occupant, "precious\n", 0o644)
 	preDir := filepath.Join(f.root, "staging", "op-restore", "pre")
 	journalWriteFile(t, filepath.Join(preDir, "mod.txt"), "original\n", 0o644)
@@ -374,11 +378,14 @@ func TestRecoverRefusesRestoreOverUnrecordedTemp(t *testing.T) {
 // exactly one temp kind, so its record must vouch for
 // exactly that kind's derived name. This unit's writer
 // created the FILE temp — the partial temp stands, the
-// record is in the journal — and a foreign file stands at
-// the LINK kind's derived name for the same destination.
-// Recover must clean the unit's own file temp and leave
-// the link-kind occupant byte-identical: the file-kind
-// record is not a warrant for the link-kind name.
+// record and the temp's identity are in the journal — and
+// a foreign file stands at the LINK kind's derived name
+// for the same destination. Recover must clean the unit's
+// own file temp (verified against its recorded identity:
+// the partial content is a strict prefix of the staged
+// source's) and leave the link-kind occupant
+// byte-identical: the file-kind record is not a warrant
+// for the link-kind name.
 func TestRecoverCleansOnlyTheRecordedFileTempKind(t *testing.T) {
 	f := newJournalFixture(t)
 
@@ -389,9 +396,10 @@ func TestRecoverCleansOnlyTheRecordedFileTempKind(t *testing.T) {
 	journalWriteFile(t, foreign, "precious link\n", 0o644)
 	preDir := filepath.Join(f.root, "staging", "op-xkind", "pre")
 	journalWriteFile(t, filepath.Join(preDir, "mod.txt"), "original\n", 0o644)
+	stageTreeFile(t, f, "op-xkind", "mod.txt", "run mod\n")
 
 	writeRawJournal(t, f, "op-xkind", []canonical.Value{
-		rawUnitWithTemp("mod.txt", unitWrite, false, true, false),
+		rawUnitWithTempIdentity("mod.txt", unitWrite, false, true, false, tempFileIdentityOf("run mod\n")),
 	})
 
 	if err := Recover(f.ctx, "parent"); err != nil {
@@ -412,8 +420,9 @@ func TestRecoverCleansOnlyTheRecordedFileTempKind(t *testing.T) {
 }
 
 // TestRecoverCleansOnlyTheRecordedLinkTempKind: the mirror
-// — a symlink write's record covers its LINK temp only, and
-// a foreign file at the FILE kind's derived name for the
+// — a symlink write's record (with its temp's identity,
+// the link's target) covers its LINK temp only, and a
+// foreign file at the FILE kind's derived name for the
 // same destination survives Recover byte-identical.
 func TestRecoverCleansOnlyTheRecordedLinkTempKind(t *testing.T) {
 	f := newJournalFixture(t)
@@ -427,7 +436,7 @@ func TestRecoverCleansOnlyTheRecordedLinkTempKind(t *testing.T) {
 	journalWriteFile(t, foreign, "precious\n", 0o644)
 
 	writeRawJournal(t, f, "op-xkind", []canonical.Value{
-		rawUnitWithTemp("link.txt", unitWrite, false, true, true),
+		rawUnitWithTempIdentity("link.txt", unitWrite, false, true, true, "keep.txt"),
 	})
 
 	if err := Recover(f.ctx, "parent"); err != nil {

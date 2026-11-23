@@ -857,12 +857,40 @@ func syncTempName(dst, op string, link bool) string {
 	return prefix + hex.EncodeToString(sum[:])[:32]
 }
 
+// syncRestoreTempName returns the temp name rollback's
+// RESTORE path lands a write to dst through, in dst's
+// directory: ".synctree-restore-" plus the first 32 hex
+// chars of the SHA-256 of the destination path, the
+// operation ID, and a restore discriminator. The derivation
+// is deliberately DISTINCT from the write path's
+// (syncTempName): a write temp the cleanup spared — a
+// flag-only record proves no ownership, and no identity
+// proof means no deletion — stands at the write name, and
+// a restore deriving that same name would collide with it
+// at exclusive creation and, its recorded-temp retry
+// sparing the occupant on the same absence of proof, wedge
+// recovery on the unit forever. Under its own derivation
+// the restore never meets the write name at all: it
+// collides only with a temp a previous restore of the same
+// unit left at the restore name, which is the recorded
+// case the retry exists for, and removeUnitTemps cleans
+// the restore name under the unit's file-kind record
+// beside the write name. Like the write derivation, the
+// name is a pure function of state the journal already
+// records, knowable before any restore temp exists.
+func syncRestoreTempName(dst, op string) string {
+	sum := sha256.Sum256([]byte(dst + "\x00" + op + "\x00restore"))
+	return ".synctree-restore-" + hex.EncodeToString(sum[:])[:32]
+}
+
 // copyFileAtomic writes src's bytes to dst with perm,
 // atomically: a temp file in dst's directory, renamed over dst.
 // A directory standing at dst is removed first — the target
 // tree's shape wins. The temp takes its derived name
-// (syncTempName, from dst and the governing operation's ID)
-// and is created exclusively: a kill between the creation
+// (syncTempName, from dst and the governing operation's ID;
+// rollback's restores pass restore=true and take the
+// restore derivation, syncRestoreTempName, instead) and is
+// created exclusively: a kill between the creation
 // and the rename leaves a temp rollback can name, and a
 // file already at that name is a refusal, not an overwrite.
 // onTempCreated, when non-nil, is invoked after the temp's
@@ -881,7 +909,7 @@ func syncTempName(dst, op string, link bool) string {
 // on the unit being restored; callers whose temps need no
 // ownership record (preimage capture, the staging builders)
 // pass nil.
-func copyFileAtomic(src, dst string, perm os.FileMode, op string, onTempCreated func(link bool, identity string) error) error {
+func copyFileAtomic(src, dst string, perm os.FileMode, op string, restore bool, onTempCreated func(link bool, identity string) error) error {
 	if err := clearBlockingDirs(dst); err != nil {
 		return err
 	}
@@ -893,7 +921,11 @@ func copyFileAtomic(src, dst string, perm os.FileMode, op string, onTempCreated 
 	if err != nil {
 		return fmt.Errorf("settle: read staged %s: %w", src, err)
 	}
-	tmpName := filepath.Join(parent, syncTempName(dst, op, false))
+	tempName := syncTempName(dst, op, false)
+	if restore {
+		tempName = syncRestoreTempName(dst, op)
+	}
+	tmpName := filepath.Join(parent, tempName)
 	tmp, err := os.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return fmt.Errorf("settle: create temp %s: %w", tmpName, err)

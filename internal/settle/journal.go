@@ -156,8 +156,12 @@ type journalUnit struct {
 	// the recorded identity before removing it (see
 	// removeUnitTemps and verifyTempOccupant). Records
 	// written before identities existed carry the flag
-	// alone and keep its original force — the identity
-	// governs every record the writer produces now, and a
+	// alone, and a flag-only record warrants NO deletion
+	// at either removal site — the flag proves a temp was
+	// created, never that the file standing at the name is
+	// that temp, so cleanup spares the occupant exactly as
+	// it spares an unrecorded name's. The identity governs
+	// every record the writer produces now, and a
 	// flag-only record is the previous form's, not a
 	// stripped one.
 	TempFileIdentity string
@@ -1020,10 +1024,11 @@ func decodeJournal(v canonical.Value) (*journal, error) {
 				// for the same reason the flags are: a
 				// journal written before identities were
 				// recorded carries neither, and its records
-				// keep the flag's original force. When
-				// present each must be well-formed — an
-				// identity that cannot be read is not one
-				// cleanup may guess at.
+				// then warrant no deletion — a flag-only
+				// record spares the occupant at both removal
+				// sites. When present each must be
+				// well-formed — an identity that cannot be
+				// read is not one cleanup may guess at.
 				if pr.Value.Kind != canonical.KindString || !validTempFileIdentity(pr.Value.Str) {
 					return nil, fmt.Errorf("unit %d has an invalid temp_file_identity", i)
 				}
@@ -1699,7 +1704,7 @@ func applyWriteUnit(req materializeRequest, treeDir, rel string, entry snapshot.
 		}
 		return replaceWithSymlink(dst, target, req.opID, onTempCreated)
 	}
-	return copyFileAtomic(src, dst, permForMode(entry.Mode), req.opID, onTempCreated)
+	return copyFileAtomic(src, dst, permForMode(entry.Mode), req.opID, false, onTempCreated)
 }
 
 // capturePreimage copies one unit target's current occupant
@@ -1758,7 +1763,7 @@ func capturePreimage(op, parentDir, preDir, rel string) error {
 		}
 		return nil
 	case info.Mode().IsRegular():
-		return copyFileAtomic(src, dst, info.Mode().Perm(), op, nil)
+		return copyFileAtomic(src, dst, info.Mode().Perm(), op, false, nil)
 	default:
 		return nil
 	}
@@ -1990,15 +1995,32 @@ func rollbackJournal(ctx *Context, j *journal) error {
 			// reports, as the materializer's hook stores
 			// it — the kind is asserted by the storing,
 			// not assumed.
+			//
+			// The record RE-BINDS on every creation: a unit
+			// whose write temp was recorded by the verb
+			// carries the WRITE temp's identity into
+			// rollback, and when its restore then creates a
+			// temp of its own, the record must come to
+			// vouch for the temp that may now stand — the
+			// restore temp, under the restore derivation —
+			// not for the write temp the cleanup already
+			// removed. A record left bound to the write
+			// temp's identity would fail the restore temp's
+			// verification at the next Recover (its content
+			// is the preimage, not the write's), spare it,
+			// and wedge the retried restore on the collision
+			// it could not clear. A creation reporting the
+			// identity already recorded changes nothing and
+			// writes nothing.
 			u := &j.Units[idx]
 			if link {
-				if u.TempCreatedLink {
+				if u.TempCreatedLink && u.TempLinkIdentity == identity {
 					return nil
 				}
 				u.TempCreatedLink = true
 				u.TempLinkIdentity = identity
 			} else {
-				if u.TempCreatedFile {
+				if u.TempCreatedFile && u.TempFileIdentity == identity {
 					return nil
 				}
 				u.TempCreatedFile = true
@@ -2078,8 +2100,11 @@ func rollbackJournal(ctx *Context, j *journal) error {
 
 // removeUnitTemps removes the temp files a write unit may
 // have left in the parent tree — the file temp and the
-// symlink temp, each under its derived name (syncTempName).
-// Two disciplines gate every removal, each answering a
+// symlink temp, each under its derived name (syncTempName),
+// and the file kind's restore temp under the restore
+// derivation (syncRestoreTempName), which the same
+// file-kind record vouches for once a restore has re-bound
+// it. Two disciplines gate every removal, each answering a
 // defect the derived-name cleanup shipped with:
 //
 //   - Ownership: the derived name is a pure function of the
@@ -2119,14 +2144,22 @@ func rollbackJournal(ctx *Context, j *journal) error {
 //     occupant naming the recorded target. A mismatch is
 //     left standing and the undo proceeds around it: the
 //     occupant is not the settlement's, and nothing in the
-//     undo needs its name. A record carrying no identity
-//     predates identity recording and keeps the flag's
-//     original force.
+//     undo needs its name. A record carrying NO identity
+//     — the flag alone, the form journals carried before
+//     temp identities were recorded — is spared the same
+//     way, at this site and at the restore collision:
+//     the flag proves a temp was created, never that the
+//     file standing at the name is that temp, so no
+//     identity proof means no deletion. The spared
+//     occupant stands as debris of the accepted class;
+//     sparing cannot wedge the undo, because the restore
+//     derives its own temp name and never needs the
+//     write temp's.
 //   - Confinement: the temp path is decided lexically,
 //     through the unit's ancestors in the live tree
 //     (blockedByAncestor) — the decision removeCreatedOccupant
-//     makes for its removal. Both temp names share the
-//     unit's directory, so one guard covers both passes.
+//     makes for its removal. All three temp names share
+//     the unit's directory, so one guard covers every pass.
 //     If an ancestor stands replaced — above all a symlink
 //     an earlier rollback pass restored from its preimage —
 //     the temp is not reachable in this tree, and resolving
@@ -2158,37 +2191,60 @@ func removeUnitTemps(parentDir, preDir, treeDir, op string, u journalUnit) error
 		return nil
 	}
 	dst := filepath.Join(parentDir, filepath.FromSlash(u.Path))
-	for _, kind := range []struct {
+	// The names this unit's records vouch for. The link kind
+	// has one: its write temp's. The file kind has TWO — the
+	// write temp's name and the restore temp's (the restore
+	// derivation, syncRestoreTempName) — under the one
+	// file-kind record: the record re-binds to whichever
+	// temp the unit's latest creation left standing (the
+	// write hook records the write temp's identity;
+	// rollback's restore hook re-binds it to the restore
+	// temp's), and the identity verification below, not the
+	// name, decides which standing occupant is the
+	// settlement's own.
+	type tempName struct {
+		path     string
 		link     bool
-		recorded bool
 		identity string
-	}{{false, u.TempCreatedFile, u.TempFileIdentity}, {true, u.TempCreatedLink, u.TempLinkIdentity}} {
-		if !kind.recorded {
+	}
+	var names []tempName
+	if u.TempCreatedFile {
+		names = append(names,
+			tempName{filepath.Join(filepath.Dir(dst), syncTempName(dst, op, false)), false, u.TempFileIdentity},
+			tempName{filepath.Join(filepath.Dir(dst), syncRestoreTempName(dst, op)), false, u.TempFileIdentity})
+	}
+	if u.TempCreatedLink {
+		names = append(names, tempName{filepath.Join(filepath.Dir(dst), syncTempName(dst, op, true)), true, u.TempLinkIdentity})
+	}
+	for _, name := range names {
+		// No identity proof, no deletion: a record carrying
+		// the flag alone — the form journals carried before
+		// temp identities were recorded — proves nothing
+		// about the occupant, so the occupant is spared,
+		// exactly as an unrecorded name's occupant is.
+		if name.identity == "" {
 			continue
 		}
-		tmp := filepath.Join(filepath.Dir(dst), syncTempName(dst, op, kind.link))
-		info, err := os.Lstat(tmp)
+		info, err := os.Lstat(name.path)
 		if err != nil {
 			if targetGone(err) {
 				continue
 			}
-			return fmt.Errorf("settle: stat temp %s: %w", tmp, err)
+			return fmt.Errorf("settle: stat temp %s: %w", name.path, err)
 		}
 		if info.IsDir() && info.Mode()&fs.ModeSymlink == 0 {
 			continue
 		}
-		if kind.identity != "" {
-			owned, err := verifyTempOccupant(tmp, info, kind.link, kind.identity,
-				filepath.Join(treeDir, filepath.FromSlash(u.Path)),
-				filepath.Join(preDir, filepath.FromSlash(u.Path)))
-			if err != nil {
-				return err
-			}
-			if !owned {
-				continue
-			}
+		owned, err := verifyTempOccupant(name.path, info, name.link, name.identity,
+			filepath.Join(treeDir, filepath.FromSlash(u.Path)),
+			filepath.Join(preDir, filepath.FromSlash(u.Path)))
+		if err != nil {
+			return err
 		}
-		if err := removeOccupant(tmp); err != nil {
+		if !owned {
+			continue
+		}
+		if err := removeOccupant(name.path); err != nil {
 			return err
 		}
 	}
@@ -2629,24 +2685,31 @@ func removeOccupant(dst string) error {
 // what stood there (the directory→file swap's landed file),
 // and the restore recreates the directory itself.
 //
-// The restore writes through the derived-name temp under the
-// journal's op, and recordTemp — rollback's ownership hook —
-// persists the unit's temp-created record between the temp's
-// creation and its content write, exactly as the write path
-// does. That record is what lets a repeated restore proceed
-// past its own predecessor: if this restore's exclusive
-// creation collides with a temp already standing at the
-// derived name AND the unit carries the record, the standing
-// temp is the recorded one's — an earlier Recover was killed
-// between creating it and renaming it — so it is removed and
-// creation retried once; where the record carries the
-// temp's identity, the occupant is verified against it
+// The restore writes through its own derived-name temp
+// under the journal's op — the RESTORE derivation
+// (syncRestoreTempName), distinct from the write path's, so
+// a write temp spared at the write name (a flag-only record
+// proves no ownership, and no identity proof means no
+// deletion) can never block the restore whose unit it
+// belongs to — and recordTemp — rollback's ownership hook —
+// persists the unit's temp-created record between the
+// temp's creation and its content write, exactly as the
+// write path does. That record is what lets a repeated
+// restore proceed past its own predecessor: if this
+// restore's exclusive creation collides with a temp already
+// standing at the restore-derived name AND the unit carries
+// the record, the standing temp is the recorded one's — an
+// earlier Recover was killed between creating it and
+// renaming it — so it is removed and creation retried once;
+// the occupant is verified against the record's identity
 // first, since the record can outlive its temp and a
 // foreign occupant is then indistinguishable from the
 // recorded one by the flag alone. A collision with no
-// record, or an occupant the identity does not vouch for,
-// is a foreign occupant: the refusal stands, byte-identical,
-// because a computable name is not ownership.
+// record, with a record carrying no identity (the flag
+// alone proves nothing about the occupant), or with an
+// occupant the identity does not vouch for, is a foreign
+// occupant: the refusal stands, byte-identical, because a
+// computable name is not ownership.
 func restorePreimage(parentDir, preDir string, u journalUnit, op string, recordTemp func(bool, string) error) error {
 	rel := u.Path
 	dst := filepath.Join(parentDir, filepath.FromSlash(rel))
@@ -2701,42 +2764,45 @@ func restorePreimage(parentDir, preDir string, u journalUnit, op string, recordT
 		}
 		return nil
 	}
-	err = copyFileAtomic(pre, dst, preInfo.Mode().Perm(), op, recordTemp)
+	err = copyFileAtomic(pre, dst, preInfo.Mode().Perm(), op, true, recordTemp)
 	if err == nil || !u.TempCreatedFile || !errors.Is(err, fs.ErrExist) {
 		return err
 	}
 	// The recorded-temp collision above: the unit's file-kind
 	// record proves this settlement created a temp at the
-	// derived name (a restore temp is always the file kind —
-	// the only kind this path creates) — and where the
-	// record carries the temp's identity, the occupant
-	// standing there must still BE that temp (verified
-	// against the preimage, the content a restore temp is
-	// created to carry) before it is removed: a record that
-	// outlived its temp warrants nothing, and a foreign
-	// occupant keeps the refusal, byte-identical, exactly as
-	// an occupant with no record does.
-	tmp := filepath.Join(filepath.Dir(dst), syncTempName(dst, op, false))
-	if u.TempFileIdentity != "" {
-		info, lerr := os.Lstat(tmp)
-		if lerr != nil {
-			if targetGone(lerr) {
-				return err
-			}
-			return fmt.Errorf("settle: stat recorded restore temp %s: %w", tmp, lerr)
-		}
-		owned, verr := verifyTempOccupant(tmp, info, false, u.TempFileIdentity, pre)
-		if verr != nil {
-			return verr
-		}
-		if !owned {
+	// restore-derived name (a restore temp is always the
+	// file kind — the only kind this path creates) — and the
+	// occupant standing there must still BE that temp
+	// (verified against the record's identity, itself
+	// anchored on the preimage, the content a restore temp
+	// is created to carry) before it is removed: a record
+	// that outlived its temp warrants nothing, a record
+	// carrying no identity warrants nothing either — the
+	// flag alone proves nothing about the occupant — and a
+	// foreign occupant keeps the refusal, byte-identical,
+	// exactly as an occupant with no record does.
+	tmp := filepath.Join(filepath.Dir(dst), syncRestoreTempName(dst, op))
+	if u.TempFileIdentity == "" {
+		return err
+	}
+	info, lerr := os.Lstat(tmp)
+	if lerr != nil {
+		if targetGone(lerr) {
 			return err
 		}
+		return fmt.Errorf("settle: stat recorded restore temp %s: %w", tmp, lerr)
+	}
+	owned, verr := verifyTempOccupant(tmp, info, false, u.TempFileIdentity, pre)
+	if verr != nil {
+		return verr
+	}
+	if !owned {
+		return err
 	}
 	if rerr := os.Remove(tmp); rerr != nil && !targetGone(rerr) {
 		return fmt.Errorf("settle: remove recorded restore temp %s: %w", tmp, rerr)
 	}
-	return copyFileAtomic(pre, dst, preInfo.Mode().Perm(), op, recordTemp)
+	return copyFileAtomic(pre, dst, preInfo.Mode().Perm(), op, true, recordTemp)
 }
 
 // settlementFactExists reports whether the run scope's trace

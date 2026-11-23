@@ -32,10 +32,13 @@ package settle
 // descriptive refusal the unrecorded collision has.
 //
 // Journals written before identities were recorded carry
-// the flag alone; their records keep the flag's original
-// force (the floor fixtures in journal_temp_test.go and
-// journal_temp_ownership_test.go pin that form), and every
-// journal the writer produces now binds the identity.
+// the flag alone; their records prove nothing about the
+// occupant, and cleanup spares it — no identity proof, no
+// deletion (PR #11 Sourcery re-review round 2, ruling on
+// F3; the spare fixtures live in journal_temp_spare_test.go
+// and the converted killed-write fixtures in
+// journal_temp_test.go) — while every journal the writer
+// produces now binds the identity.
 
 import (
 	"crypto/sha256"
@@ -307,7 +310,7 @@ func TestRecoverRefusesRestoreOverForeignTempOccupant(t *testing.T) {
 	if err := os.Remove(filepath.Join(f.parentDir, "mod.txt")); err != nil {
 		t.Fatal(err)
 	}
-	occupant := filepath.Join(f.parentDir, derivedTempName(filepath.Join(f.parentDir, "mod.txt"), "op-rident", false))
+	occupant := filepath.Join(f.parentDir, derivedRestoreTempName(filepath.Join(f.parentDir, "mod.txt"), "op-rident"))
 	journalWriteFile(t, occupant, "precious\n", 0o644)
 	preDir := filepath.Join(f.root, "staging", "op-rident", "pre")
 	journalWriteFile(t, filepath.Join(preDir, "mod.txt"), "original\n", 0o644)

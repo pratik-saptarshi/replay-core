@@ -335,7 +335,7 @@ func overlayDelta(ctx *Context, stage, commit string, d treeDelta, opID string) 
 			replaced[rel] = true
 			continue
 		}
-		if err := copyFileAtomic(srcPath, dst, permForMode(entry.Mode), opID, nil); err != nil {
+		if err := copyFileAtomic(srcPath, dst, permForMode(entry.Mode), opID, false, nil); err != nil {
 			return err
 		}
 		replaced[rel] = true
