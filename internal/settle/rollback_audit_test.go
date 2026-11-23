@@ -1,0 +1,510 @@
+package settle
+
+// The rollback deletion audit (post-merge fix wave, panel
+// R1 + issue #9 process demand): the class that produced
+// both defects — a rollback-path deletion that resolves a
+// live-tree path without the lexical ancestor discipline,
+// or deletes by derived name without journaled ownership —
+// becomes a standing machine check, not another hand
+// census. The audit enumerates every deletion site in
+// journal.go (the os.Remove family and the package's own
+// deletion helpers) and requires each enclosing function to
+// appear in the classification table below with its
+// discipline; the disciplines that are mechanically
+// checkable (an ancestor-guard call in the body, the
+// ownership record's presence) are checked against the AST.
+// A new deletion site in an unclassified function fails
+// this test, as does a classified function whose guard or
+// gate disappears — the census is drawn by the invariant,
+// and the machine, not a summary, keeps the count.
+
+import (
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"testing"
+)
+
+// deletionClass is one classified function's discipline.
+// guards names the guard callees the function body must
+// call before it deletes through a live-tree path (empty
+// where the function's deletions resolve no live-tree
+// path). recordFields names the journaled per-kind
+// temp-created ownership record fields the body must
+// reference — the gate is checked per field, because the
+// record itself is per kind: a cleanup that consults only
+// one kind's record while deleting both kinds' names is
+// the divergence the per-kind record exists to close.
+// why states the discipline in words — the rationale a
+// future editor must preserve or consciously amend here.
+type deletionClass struct {
+	guards       []string
+	recordFields []string
+	why          string
+}
+
+// deletionClasses classifies every function in journal.go
+// that contains a deletion site. The table and the code
+// must agree exactly: an unlisted deletion function fails,
+// and a stale entry whose function no longer deletes fails
+// too, so the table cannot quietly outlive the code.
+var deletionClasses = map[string]deletionClass{
+	// The rollback path proper.
+	"removeUnitTemps": {
+		guards:       []string{"blockedByAncestor"},
+		recordFields: []string{"TempCreatedFile", "TempCreatedLink", "TempRestoreCreated"},
+		why:          "derived-name temp cleanup: removes each derivation's temp only under that derivation's journaled temp-created record (a write unit creates one write kind; the other kind's name is not its record's to vouch for — and the restore temp's name belongs to the restore record alone, never to the write record whose identity it would otherwise borrow), and only through ancestors that stand as real directories of this tree",
+	},
+	"removeCreatedOccupant": {
+		guards: []string{"blockedByAncestor"},
+		why:    "removes only the occupant a write unit created at its recorded path, and only when no ancestor stands replaced in the live tree",
+	},
+	"restorePreimage": {
+		guards:       []string{"symlinkAncestor"},
+		recordFields: []string{"TempRestoreCreated"},
+		why:          "restores a unit's preimage at its recorded path: refuses outright rather than remove or write through a symlink ancestor; its one derived-name removal — the restore temp a killed earlier Recover left — is ownership-gated on the unit's journaled RESTORE temp record (a restore creates only file-kind temps, under the restore derivation, so the restore record is the only one that can vouch for that name; the write kinds' records are never consulted here), and a collision without the record stays a refusal",
+	},
+	"removeOccupant": {
+		why: "the deletion primitive itself: removes the single occupant at an exact path (a tree, for a directory); absence in targetGone's sense is success. It carries no discipline of its own — every caller must be classified above",
+	},
+	"rollbackJournal": {
+		guards: []string{"parentRootReplaced", "symlinkInParentPath", "verifyParentIdentity", "verifyParentChain"},
+		why:    "rollback's conductor: before any undo it refuses a journal whose parent root's final component stands as a symlink (parentRootReplaced) — the journaled path was resolved when written, so a link there now means the root was replaced after the crash and every undo path would resolve into the tree the link names — it refuses a journal whose recorded path passes through a symlink at ANY component (symlinkInParentPath), since the recorded path was symlink-free when written and an ancestor's substitution is invisible to the component guards that start inside the parent, and it verifies the root's identity against the journal's recorded parent identity (verifyParentIdentity), since a different REAL directory placed at the recorded path passes every form check while rollback's restores and removals land in the wrong tree; a journal carrying no recorded identity — written before identities were recorded — proceeds under the form guards alone, because refusing it would wedge the scope permanently (every verb reaches the journal only through entry recovery), so the identity is grandfathered for that one generation while every journal carrying one is held to it exactly, and it verifies the recorded path's whole ancestor chain (verifyParentChain), since an ancestor replaced by a different REAL directory — the parent moved into it, inode intact — passes both the symlink walk and the final-component identity while rollback resolves through a directory object no record vouches for; a journal carrying no chain is grandfathered the same way. Its only deletion call is removeUnitTemps, whose guard and gate travel with it; the undo helpers it drives are classified in their own entries",
+	},
+	// The materializer's deletions: the verb's own journal
+	// units and its own staging, never unrecorded content.
+	"materialize": {
+		why: "journal-unit deletions: removes blocking ancestors and extras that are themselves recorded units under captured preimages and started intent, prunes only Lstat-verified empty directories the result tree does not imply (lexically excluding replaced ancestors), and wipes its own staging remnant under the settle Root",
+	},
+	// Operational-state cleanup under the settle Root: the
+	// settlement's own records and temp files, never
+	// parent-tree content.
+	"clearJournalState": {
+		why: "removes the settlement's own journal, its parent anchor, and the op's staging directory, all under the settle Root, once the settlement is complete or undone",
+	},
+	"writeJournal": {
+		why: "removes only its own journal temp file under the settle Root, on the failure paths of the write it was staging",
+	},
+	"writeParentAnchor": {
+		why: "removes only its own anchor temp file under the settle Root, on the failure paths of the write it was staging",
+	},
+}
+
+// deletionSite is one enumerated deletion call site in
+// journal.go.
+type deletionSite struct {
+	fn   string // enclosing function name
+	call string // e.g. "os.Remove", "removeOccupant"
+	pos  string // line, for failure messages
+}
+
+// deletionCallees is the audited call set: the os removal
+// family, plus the package's deletion helpers — a call to
+// one of these IS a deletion, whoever makes it.
+func isDeletionCall(call *ast.CallExpr, imports map[string]string) (string, bool) {
+	switch fun := call.Fun.(type) {
+	case *ast.SelectorExpr:
+		if id, ok := fun.X.(*ast.Ident); ok {
+			if imports[id.Name] == "os" && (fun.Sel.Name == "Remove" || fun.Sel.Name == "RemoveAll") {
+				return "os." + fun.Sel.Name, true
+			}
+		}
+	case *ast.Ident:
+		if fun.Name == "removeOccupant" || fun.Name == "removeUnitTemps" {
+			return fun.Name, true
+		}
+	}
+	return "", false
+}
+
+// auditJournalDeletions parses one journal.go-shaped source
+// and returns its deletion sites plus the classification
+// violations: sites in unclassified functions, and
+// classified functions whose mechanically checkable
+// discipline (guard call, ownership gate) is absent from
+// the body.
+func auditJournalDeletions(src []byte) ([]deletionSite, []string, error) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "journal.go", src, 0)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse: %w", err)
+	}
+	imports := map[string]string{}
+	for _, imp := range f.Imports {
+		p := strings.Trim(imp.Path.Value, "\"")
+		base := filepath.Base(p)
+		local := base
+		if imp.Name != nil {
+			local = imp.Name.Name
+		}
+		imports[local] = base
+	}
+
+	var sites []deletionSite
+	var violations []string
+	for _, decl := range f.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok || fd.Body == nil {
+			continue
+		}
+		name := fd.Name.Name
+		class, classified := deletionClasses[name]
+		callsGuard := map[string]bool{}
+		referencedRecords := map[string]bool{}
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.CallExpr:
+				if id, ok := node.Fun.(*ast.Ident); ok {
+					callsGuard[id.Name] = true
+				}
+				if call, isDel := isDeletionCall(node, imports); isDel {
+					sites = append(sites, deletionSite{
+						fn:   name,
+						call: call,
+						pos:  fmt.Sprintf("journal.go:%d", fset.Position(node.Pos()).Line),
+					})
+					if !classified {
+						violations = append(violations, fmt.Sprintf("journal.go:%d: %s calls %s, which is not in the rollback deletion classification", fset.Position(node.Pos()).Line, name, call))
+					}
+				}
+			case *ast.SelectorExpr:
+				if node.Sel.Name == "TempCreatedFile" || node.Sel.Name == "TempCreatedLink" || node.Sel.Name == "TempRestoreCreated" {
+					referencedRecords[node.Sel.Name] = true
+				}
+			}
+			return true
+		})
+		if !classified {
+			continue
+		}
+		for _, guard := range class.guards {
+			if !callsGuard[guard] {
+				violations = append(violations, fmt.Sprintf("%s is classified guarded but never calls %s", name, guard))
+			}
+		}
+		for _, field := range class.recordFields {
+			if !referencedRecords[field] {
+				violations = append(violations, fmt.Sprintf("%s is classified ownership-gated but never references the %s record", name, field))
+			}
+		}
+	}
+	return sites, violations, nil
+}
+
+// TestRollbackDeletionAudit is the standing check: the real
+// journal.go must classify clean, and the classifier must
+// have teeth — the negative controls below feed it a rogue
+// deletion and a guard-less, gate-less removeUnitTemps, and
+// both must be flagged.
+func TestRollbackDeletionAudit(t *testing.T) {
+	// Negative control 1: an unclassified deletion site.
+	rogue := `package settle
+
+import "os"
+
+func rogueDelete() error { return os.Remove("x") }
+`
+	_, rogueViolations, err := auditJournalDeletions([]byte(rogue))
+	if err != nil {
+		t.Fatalf("audit rogue control: %v", err)
+	}
+	if len(rogueViolations) != 1 || !strings.Contains(rogueViolations[0], "rogueDelete") {
+		t.Fatalf("rogue control violations = %v, want exactly the rogueDelete site flagged", rogueViolations)
+	}
+
+	// Negative control 2: removeUnitTemps present and
+	// deleting, but with neither its ancestor guard nor its
+	// ownership gate — the guard and the per-kind record
+	// references (and the restore record's) must be flagged.
+	unguarded := `package settle
+
+func removeUnitTemps(parentDir, op string, u journalUnit) error {
+	return removeOccupant(parentDir)
+}
+
+func removeOccupant(dst string) error { return nil }
+`
+	_, unguardedViolations, err := auditJournalDeletions([]byte(unguarded))
+	if err != nil {
+		t.Fatalf("audit unguarded control: %v", err)
+	}
+	joined := strings.Join(unguardedViolations, "\n")
+	if !strings.Contains(joined, "blockedByAncestor") || !strings.Contains(joined, "TempCreatedFile") || !strings.Contains(joined, "TempCreatedLink") {
+		t.Fatalf("unguarded control violations = %v, want the missing guard and both missing per-kind ownership gates flagged", unguardedViolations)
+	}
+
+	// Negative control 3: removeUnitTemps guarded and gated
+	// on SOME records only (the file kind's and the
+	// restore's) — the per-field gate must flag the record
+	// it never consults, since a cleanup that checks one
+	// record while deleting another's name is the scope
+	// divergence the per-record gate closes.
+	oneKind := `package settle
+
+func removeUnitTemps(parentDir, op string, u journalUnit) error {
+	if !u.TempCreatedFile && !u.TempRestoreCreated {
+		return nil
+	}
+	if _, err := blockedByAncestor(parentDir, u.Path); err != nil {
+		return err
+	}
+	return removeOccupant(parentDir)
+}
+
+func blockedByAncestor(parentDir, rel string) (bool, error) { return false, nil }
+
+func removeOccupant(dst string) error { return nil }
+`
+	_, oneKindViolations, err := auditJournalDeletions([]byte(oneKind))
+	if err != nil {
+		t.Fatalf("audit one-kind control: %v", err)
+	}
+	if len(oneKindViolations) != 1 || !strings.Contains(oneKindViolations[0], "TempCreatedLink") {
+		t.Fatalf("one-kind control violations = %v, want exactly the unconsulted TempCreatedLink gate flagged", oneKindViolations)
+	}
+
+	// Negative control 4: rollbackJournal conducting its
+	// deletions without ever judging the parent root — the
+	// missing parentRootReplaced call must be flagged,
+	// since a conductor that skips the root check resolves
+	// every undo through a replaced root into another tree.
+	rootless := `package settle
+
+func rollbackJournal(ctx *Context, j *journal) error {
+	return removeUnitTemps(j.ParentDir, j.Op, j.Units[0])
+}
+
+func removeUnitTemps(parentDir, op string, u journalUnit) error { return nil }
+`
+	_, rootlessViolations, err := auditJournalDeletions([]byte(rootless))
+	if err != nil {
+		t.Fatalf("audit rootless control: %v", err)
+	}
+	joinedRootless := strings.Join(rootlessViolations, "\n")
+	if !strings.Contains(joinedRootless, "rollbackJournal") || !strings.Contains(joinedRootless, "parentRootReplaced") {
+		t.Fatalf("rootless control violations = %v, want rollbackJournal's missing parentRootReplaced check flagged", rootlessViolations)
+	}
+
+	// Negative control 5: rollbackJournal judging the parent
+	// root's FORM (parentRootReplaced) but never verifying
+	// its IDENTITY — the missing verifyParentIdentity call
+	// must be flagged, since a conductor that checks only
+	// the form rolls back into a different real directory
+	// placed at the recorded path.
+	unverified := `package settle
+
+func rollbackJournal(ctx *Context, j *journal) error {
+	if parentRootReplaced(j.ParentDir) {
+		return nil
+	}
+	if _, through, err := symlinkInParentPath(j.ParentDir); err != nil || through {
+		return err
+	}
+	if err := verifyParentChain(j); err != nil {
+		return err
+	}
+	return removeUnitTemps(j.ParentDir, j.Op, j.Units[0])
+}
+
+func parentRootReplaced(dir string) bool { return false }
+
+func symlinkInParentPath(dir string) (string, bool, error) { return "", false, nil }
+
+func verifyParentChain(j *journal) error { return nil }
+
+func removeUnitTemps(parentDir, op string, u journalUnit) error {
+	if !u.TempCreatedFile && !u.TempCreatedLink && !u.TempRestoreCreated {
+		return nil
+	}
+	if _, err := blockedByAncestor(parentDir, u.Path); err != nil {
+		return err
+	}
+	return removeOccupant(parentDir)
+}
+
+func blockedByAncestor(parentDir, rel string) (bool, error) { return false, nil }
+
+func removeOccupant(dst string) error { return nil }
+`
+	_, unverifiedViolations, err := auditJournalDeletions([]byte(unverified))
+	if err != nil {
+		t.Fatalf("audit unverified control: %v", err)
+	}
+	if len(unverifiedViolations) != 1 || !strings.Contains(unverifiedViolations[0], "verifyParentIdentity") {
+		t.Fatalf("unverified control violations = %v, want exactly rollbackJournal's missing verifyParentIdentity check flagged", unverifiedViolations)
+	}
+
+	// Negative control 6: rollbackJournal judging the parent
+	// root's form and identity but never walking the recorded
+	// path's components — the missing symlinkInParentPath
+	// call must be flagged, since a conductor that skips the
+	// walk resolves every undo through a substituted ancestor
+	// symlink into the tree it names.
+	unwalked := `package settle
+
+func rollbackJournal(ctx *Context, j *journal) error {
+	if parentRootReplaced(j.ParentDir) {
+		return nil
+	}
+	if err := verifyParentIdentity(j); err != nil {
+		return err
+	}
+	if err := verifyParentChain(j); err != nil {
+		return err
+	}
+	return removeUnitTemps(j.ParentDir, j.Op, j.Units[0])
+}
+
+func parentRootReplaced(dir string) bool { return false }
+
+func verifyParentIdentity(j *journal) error { return nil }
+
+func verifyParentChain(j *journal) error { return nil }
+
+func removeUnitTemps(parentDir, op string, u journalUnit) error {
+	if !u.TempCreatedFile && !u.TempCreatedLink && !u.TempRestoreCreated {
+		return nil
+	}
+	if _, err := blockedByAncestor(parentDir, u.Path); err != nil {
+		return err
+	}
+	return removeOccupant(parentDir)
+}
+
+func blockedByAncestor(parentDir, rel string) (bool, error) { return false, nil }
+
+func removeOccupant(dst string) error { return nil }
+`
+	_, unwalkedViolations, err := auditJournalDeletions([]byte(unwalked))
+	if err != nil {
+		t.Fatalf("audit unwalked control: %v", err)
+	}
+	if len(unwalkedViolations) != 1 || !strings.Contains(unwalkedViolations[0], "symlinkInParentPath") {
+		t.Fatalf("unwalked control violations = %v, want exactly rollbackJournal's missing symlinkInParentPath check flagged", unwalkedViolations)
+	}
+
+	// Negative control 7: rollbackJournal judging the parent
+	// root's form, its ancestor symlinks, and its identity,
+	// but never verifying the ancestor CHAIN — the missing
+	// verifyParentChain call must be flagged, since a
+	// conductor that skips the chain resolves every undo
+	// through an ancestor replaced by a different real
+	// directory, which neither the walk nor the
+	// final-component identity can see.
+	unchained := `package settle
+
+func rollbackJournal(ctx *Context, j *journal) error {
+	if parentRootReplaced(j.ParentDir) {
+		return nil
+	}
+	if _, through, err := symlinkInParentPath(j.ParentDir); err != nil || through {
+		return err
+	}
+	if err := verifyParentIdentity(j); err != nil {
+		return err
+	}
+	return removeUnitTemps(j.ParentDir, j.Op, j.Units[0])
+}
+
+func parentRootReplaced(dir string) bool { return false }
+
+func symlinkInParentPath(dir string) (string, bool, error) { return "", false, nil }
+
+func verifyParentIdentity(j *journal) error { return nil }
+
+func removeUnitTemps(parentDir, op string, u journalUnit) error {
+	if !u.TempCreatedFile && !u.TempCreatedLink && !u.TempRestoreCreated {
+		return nil
+	}
+	if _, err := blockedByAncestor(parentDir, u.Path); err != nil {
+		return err
+	}
+	return removeOccupant(parentDir)
+}
+
+func blockedByAncestor(parentDir, rel string) (bool, error) { return false, nil }
+
+func removeOccupant(dst string) error { return nil }
+`
+	_, unchainedViolations, err := auditJournalDeletions([]byte(unchained))
+	if err != nil {
+		t.Fatalf("audit unchained control: %v", err)
+	}
+	if len(unchainedViolations) != 1 || !strings.Contains(unchainedViolations[0], "verifyParentChain") {
+		t.Fatalf("unchained control violations = %v, want exactly rollbackJournal's missing verifyParentChain check flagged", unchainedViolations)
+	}
+
+	// Negative control 8: removeUnitTemps guarded and gated
+	// on both WRITE kinds' records but never consulting the
+	// RESTORE record — the missing TempRestoreCreated gate
+	// must be flagged, since a cleanup that judges the
+	// restore temp's name without the restore record is the
+	// cross-derivation borrowing the per-derivation record
+	// closes. (The audit checks each gate's PRESENCE in the
+	// body; which identity a name is judged under is beyond
+	// its expression — that application is pinned by the
+	// behavior fixtures, not here.)
+	norestore := `package settle
+
+func removeUnitTemps(parentDir, op string, u journalUnit) error {
+	if !u.TempCreatedFile && !u.TempCreatedLink {
+		return nil
+	}
+	if _, err := blockedByAncestor(parentDir, u.Path); err != nil {
+		return err
+	}
+	return removeOccupant(parentDir)
+}
+
+func blockedByAncestor(parentDir, rel string) (bool, error) { return false, nil }
+
+func removeOccupant(dst string) error { return nil }
+`
+	_, norestoreViolations, err := auditJournalDeletions([]byte(norestore))
+	if err != nil {
+		t.Fatalf("audit no-restore control: %v", err)
+	}
+	if len(norestoreViolations) != 1 || !strings.Contains(norestoreViolations[0], "TempRestoreCreated") {
+		t.Fatalf("no-restore control violations = %v, want exactly the unconsulted TempRestoreCreated gate flagged", norestoreViolations)
+	}
+
+	// The real tree.
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed; cannot locate package sources")
+	}
+	src, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "journal.go"))
+	if err != nil {
+		t.Fatalf("read journal.go: %v", err)
+	}
+	sites, violations, err := auditJournalDeletions(src)
+	if err != nil {
+		t.Fatalf("audit journal.go: %v", err)
+	}
+	for _, v := range violations {
+		t.Error(v)
+	}
+	if len(sites) < 12 {
+		t.Fatalf("audit enumerated only %d deletion sites in journal.go — the walk is not seeing the tree", len(sites))
+	}
+	observed := map[string]bool{}
+	for _, s := range sites {
+		observed[s.fn] = true
+	}
+	var stale []string
+	for fn := range deletionClasses {
+		if !observed[fn] {
+			stale = append(stale, fn)
+		}
+	}
+	if len(stale) > 0 {
+		sort.Strings(stale)
+		t.Errorf("deletion classification entries with no remaining deletion site (stale): %v", stale)
+	}
+}

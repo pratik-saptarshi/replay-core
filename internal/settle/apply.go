@@ -191,7 +191,7 @@ func Apply(ctx *Context, parentScope, parentDir, runScope, opID string) (store.R
 	// Build the union tree in staging and snapshot it: the
 	// result commit is a durable artifact before the parent
 	// directory is touched.
-	resultCommit, err := buildUnionTree(ctx, sc.ForkCommit, probeCommit, runHead, parentDelta, runDelta, union)
+	resultCommit, err := buildUnionTree(ctx, sc.ForkCommit, probeCommit, runHead, parentDelta, runDelta, union, opID)
 	if err != nil {
 		return store.Receipt{}, fmt.Errorf("settle: apply %q: %w", runScope, err)
 	}
@@ -242,7 +242,7 @@ func Apply(ctx *Context, parentScope, parentDir, runScope, opID string) (store.R
 // directory untouched. The staging directory is removed on
 // every path: the result commit is the durable artifact, not
 // the directory it was built in.
-func buildUnionTree(ctx *Context, forkCommit, parentCommit, runCommit string, parentDelta, runDelta treeDelta, union map[string]snapshot.WorkspaceEntry) (string, error) {
+func buildUnionTree(ctx *Context, forkCommit, parentCommit, runCommit string, parentDelta, runDelta treeDelta, union map[string]snapshot.WorkspaceEntry, opID string) (string, error) {
 	stagingDir := filepath.Join(ctx.Root, "staging")
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
 		return "", fmt.Errorf("settle: create staging dir: %w", err)
@@ -255,10 +255,10 @@ func buildUnionTree(ctx *Context, forkCommit, parentCommit, runCommit string, pa
 	if err := ctx.Snaps.ExtractWorkspace(forkCommit, stage); err != nil {
 		return "", err
 	}
-	if err := overlayDelta(ctx, stage, parentCommit, parentDelta); err != nil {
+	if err := overlayDelta(ctx, stage, parentCommit, parentDelta, opID); err != nil {
 		return "", err
 	}
-	if err := overlayDelta(ctx, stage, runCommit, runDelta); err != nil {
+	if err := overlayDelta(ctx, stage, runCommit, runDelta, opID); err != nil {
 		return "", err
 	}
 	resultCommit, err := ctx.Snaps.Snapshot(stage, map[string]string{"settle": "apply-union"})
@@ -297,7 +297,7 @@ func buildUnionTree(ctx *Context, forkCommit, parentCommit, runCommit string, pa
 // named file from the link's target, outside the staging tree.
 // The pass therefore never touches a path whose ancestor it
 // itself replaced. Any other delete failure still aborts.
-func overlayDelta(ctx *Context, stage, commit string, d treeDelta) error {
+func overlayDelta(ctx *Context, stage, commit string, d treeDelta, opID string) error {
 	if len(d.paths) == 0 {
 		return nil
 	}
@@ -329,13 +329,13 @@ func overlayDelta(ctx *Context, stage, commit string, d treeDelta) error {
 			if err != nil {
 				return fmt.Errorf("settle: read overlay symlink %s: %w", srcPath, err)
 			}
-			if err := replaceWithSymlink(dst, target); err != nil {
+			if err := replaceWithSymlink(dst, target, opID, nil); err != nil {
 				return err
 			}
 			replaced[rel] = true
 			continue
 		}
-		if err := copyFileAtomic(srcPath, dst, permForMode(entry.Mode)); err != nil {
+		if err := copyFileAtomic(srcPath, dst, permForMode(entry.Mode), opID, false, nil); err != nil {
 			return err
 		}
 		replaced[rel] = true

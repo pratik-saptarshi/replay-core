@@ -165,12 +165,17 @@ func interruptedRefresh(t *testing.T, f *journalFixture) (j1, j2 []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	identity, err := parentDirIdentity(f.parentDir)
+	if err != nil {
+		t.Fatalf("parent identity of fixture dir: %v", err)
+	}
 	j2 = plantRawJournal(t, filepath.Join(f.scratch, "next-state.json"), rawJournalSpec{
 		op: "op-live", verb: verbSelect, parentScope: "parent", runScope: "run-a",
 		state: journalStateApplying, oldHead: f.parent0, resultCommit: f.parent0,
-		parentDir: f.parentDir,
-		fact:      store.SettleSelectBody("op-live", "parent", "run-a", f.parent0, f.parent0),
-		units:     []canonical.Value{rawUnit("mod.txt", unitWrite, true, true)},
+		parentDir:      f.parentDir,
+		parentIdentity: identity,
+		fact:           store.SettleSelectBody("op-live", "parent", "run-a", f.parent0, f.parent0),
+		units:          []canonical.Value{rawUnit("mod.txt", unitWrite, true, true)},
 	})
 	return j1, j2
 }

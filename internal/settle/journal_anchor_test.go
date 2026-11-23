@@ -47,8 +47,22 @@ type rawJournalSpec struct {
 	oldHead      string
 	resultCommit string
 	parentDir    string
-	fact         canonical.Value
-	units        []canonical.Value
+	// parentIdentity, when non-empty, is planted as the
+	// journal's parent_identity — the field the writer
+	// records at a journal's creation. Plants that mean to
+	// stand for a writer-produced journal set it (from
+	// parentDirIdentity); plants of crafted journals leave
+	// it empty, as they leave the anchor unrecorded.
+	parentIdentity string
+	// parentChain, when non-nil, is planted as the
+	// journal's parent_chain — the ancestor-chain identities
+	// the writer records at a journal's creation. Plants
+	// that mean to stand for a writer-produced journal set
+	// it (from parentChainIdentities); plants of crafted or
+	// pre-chain journals leave it nil.
+	parentChain []string
+	fact        canonical.Value
+	units       []canonical.Value
 }
 
 // plantRawJournal writes spec's journal in canonical form at
@@ -56,11 +70,23 @@ type rawJournalSpec struct {
 // exact bytes planted.
 func plantRawJournal(t *testing.T, path string, spec rawJournalSpec) []byte {
 	t.Helper()
-	v := canonical.ObjectOf(
-		canonical.Pair{Key: "fact", Value: spec.fact},
-		canonical.Pair{Key: "old_head", Value: canonical.StringOf(spec.oldHead)},
-		canonical.Pair{Key: "op", Value: canonical.StringOf(spec.op)},
-		canonical.Pair{Key: "parent_dir", Value: canonical.StringOf(spec.parentDir)},
+	pairs := []canonical.Pair{
+		{Key: "fact", Value: spec.fact},
+		{Key: "old_head", Value: canonical.StringOf(spec.oldHead)},
+		{Key: "op", Value: canonical.StringOf(spec.op)},
+	}
+	if spec.parentChain != nil {
+		elems := make([]canonical.Value, 0, len(spec.parentChain))
+		for _, id := range spec.parentChain {
+			elems = append(elems, canonical.StringOf(id))
+		}
+		pairs = append(pairs, canonical.Pair{Key: "parent_chain", Value: canonical.ArrayOf(elems...)})
+	}
+	pairs = append(pairs, canonical.Pair{Key: "parent_dir", Value: canonical.StringOf(spec.parentDir)})
+	if spec.parentIdentity != "" {
+		pairs = append(pairs, canonical.Pair{Key: "parent_identity", Value: canonical.StringOf(spec.parentIdentity)})
+	}
+	pairs = append(pairs,
 		canonical.Pair{Key: "parent_scope", Value: canonical.StringOf(spec.parentScope)},
 		canonical.Pair{Key: "result_commit", Value: canonical.StringOf(spec.resultCommit)},
 		canonical.Pair{Key: "run_scope", Value: canonical.StringOf(spec.runScope)},
@@ -68,6 +94,7 @@ func plantRawJournal(t *testing.T, path string, spec rawJournalSpec) []byte {
 		canonical.Pair{Key: "units", Value: canonical.ArrayOf(spec.units...)},
 		canonical.Pair{Key: "verb", Value: canonical.StringOf(spec.verb)},
 	)
+	v := canonical.ObjectOf(pairs...)
 	b, err := canonical.MarshalKernel(v)
 	if err != nil {
 		t.Fatalf("marshal planted journal: %v", err)
