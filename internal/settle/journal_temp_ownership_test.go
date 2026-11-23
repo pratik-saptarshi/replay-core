@@ -17,6 +17,15 @@ package settle
 // that happens to stand at the derived temp name. The parent
 // converges and the journal clears, so the loss is silent.
 //
+// The cleanup reaches that decision only under a durable
+// temp-created record for the unit, so the fixture re-plants
+// the journal in the writer's current form — record and temp
+// identity together — before the repeated Recover (see the
+// re-plant below): without the record the cleanup
+// early-returns and the victims survive for the wrong reason,
+// and the confinement guard this fixture pins is never
+// exercised.
+//
 // Issue #9 (ownership): wave 9 made temp names derivable
 // from the destination path so rollback can compute them —
 // but derivable is not owned. If a file the operation did
@@ -94,14 +103,43 @@ func TestRecoverTempCleanupConfinedByRestoredSymlink(t *testing.T) {
 		t.Fatalf("journal after interrupted Recover: %v, want still present", err)
 	}
 
+	// The journal the crashed Select left no longer carries
+	// the write unit's temp-created record: the materializer
+	// cleared it in the same write that marked the unit done
+	// (the record-lifetime rule), and the manual undos above
+	// receive the record as a parameter precisely because
+	// nothing persisted it. A repeated Recover reading THAT
+	// journal early-returns in removeUnitTemps on the absent
+	// record and never reaches the confinement decision — the
+	// victims below would survive with the guard deleted.
+	// The journal is therefore re-planted in the writer's
+	// current form — the unit's per-kind record and the
+	// temp's identity in one write, the anchor vouching for
+	// the planted bytes — the durable state in which the
+	// repeated Recover's cleanup actually stands at the
+	// deletion path and only the guard turns it away.
+	writeRawJournal(t, f, "op-r1", []canonical.Value{
+		rawUnitWithTempIdentity("old/inner.txt", unitWrite, true, true, false, tempFileIdentityOf("settled inner\n")),
+		rawUnit("old", unitDelete, true, true),
+	})
+
 	// The victims: files in the OUTSIDE tree standing at the
 	// two derived temp names for old/inner.txt — the names the
 	// repeated Recover's temp cleanup computes for the unit,
-	// resolved through the restored symlink at old.
+	// resolved through the restored symlink at old. The file
+	// victim carries exactly the bytes the unit's temp was
+	// created to carry — the content the re-planted record's
+	// identity names — so the cleanup's ownership gate and
+	// identity verification both pass on it, and nothing but
+	// the lexical confinement decision keeps the cleanup from
+	// deleting it. (The link-kind name is never this unit's
+	// to clean — a file write records only the file kind —
+	// so its victim pins the outside tree untouched wholesale,
+	// as the target hash below does.)
 	dst := filepath.Join(f.parentDir, "old", "inner.txt")
 	victimFile := filepath.Join(targetDir, derivedTempName(dst, "op-r1", false))
 	victimLink := filepath.Join(targetDir, derivedTempName(dst, "op-r1", true))
-	journalWriteFile(t, victimFile, "victim file\n", 0o644)
+	journalWriteFile(t, victimFile, "settled inner\n", 0o644)
 	journalWriteFile(t, victimLink, "victim link\n", 0o644)
 	targetHash := hashTree(t, targetDir)
 
@@ -114,7 +152,7 @@ func TestRecoverTempCleanupConfinedByRestoredSymlink(t *testing.T) {
 	for _, victim := range []struct {
 		path, want string
 	}{
-		{victimFile, "victim file\n"},
+		{victimFile, "settled inner\n"},
 		{victimLink, "victim link\n"},
 	} {
 		if b, err := os.ReadFile(victim.path); err != nil || string(b) != victim.want {
