@@ -1792,7 +1792,13 @@ func capturePreimage(op, parentDir, preDir, rel string) error {
 // is a descriptive refusal — the line moved under a crashed
 // verb, and recovery does not guess. The verb's fact is then
 // minted from the journal's recorded fact body iff no fact
-// carries the op, and journal + staging are cleared.
+// carries the op — and iff no settlement fact from another
+// operation already consumes the run scope: that state means
+// the scope was settled by a settlement this journal did not
+// commit, and recovery refuses, leaving the journal in place,
+// rather than mint a second fact for one scope (the mint
+// guard at the mint below). Journal + staging are cleared
+// only on completion.
 //
 // State planned/applying → roll back: every done unit — and
 // every started unit, whose mutation may have landed before
@@ -1869,6 +1875,32 @@ func Recover(ctx *Context, parentScope string) error {
 			return err
 		}
 		if !found {
+			// The mint guard (defense-in-depth; spec §9 is
+			// unchanged and no concurrency is claimed): the
+			// verbs' consume-once law is keyed on ANY
+			// settlement fact on the run scope, and this
+			// branch's op-specific check diverged from it —
+			// a verified journal whose operation never
+			// committed, resolved after another operation's
+			// fact already consumed the scope, would mint a
+			// SECOND settlement fact for a scope only one
+			// settlement committed. That durable state is
+			// reachable only from overlapping callers (the
+			// shape §9 excludes) or a planted journal, but
+			// the mint is recovery's own act, and it is
+			// judged by the same law the verbs enforce:
+			// any fact standing, and none of it this
+			// journal's, means the scope was consumed by a
+			// settlement this journal did not commit.
+			// Refuse, and leave the journal in place as
+			// evidence — never mint, never clear.
+			consumed, err := anySettlementFactExists(ctx, j.RunScope)
+			if err != nil {
+				return err
+			}
+			if consumed {
+				return fmt.Errorf("settle: recover %q: run scope %q already carries a settlement fact from another operation, but none for this journal's operation %q — the scope was consumed by a settlement this journal did not commit, and minting its fact would record a second settlement for one scope; refusing, and leaving the journal in place as evidence (concurrent settlement callers on one scope are outside the settlement caller contract, spec §9)", parentScope, j.RunScope, j.Op)
+			}
 			if _, err := mintFromJournal(ctx, j); err != nil {
 				return fmt.Errorf("settle: recover %q: %w", parentScope, err)
 			}
@@ -2803,6 +2835,26 @@ func restorePreimage(parentDir, preDir string, u journalUnit, op string, recordT
 		return fmt.Errorf("settle: remove recorded restore temp %s: %w", tmp, rerr)
 	}
 	return copyFileAtomic(pre, dst, preInfo.Mode().Perm(), op, true, recordTemp)
+}
+
+// anySettlementFactExists reports whether the run scope's
+// trace path carries ANY settlement fact — select, apply,
+// or discard, whatever its op: the consume-once scan in the
+// verbs' own keying (ensureNotConsumed), returning a bool
+// for Recover's mint guard.
+func anySettlementFactExists(ctx *Context, runScope string) (bool, error) {
+	recs, err := ctx.Trace.PathRecords(runScope)
+	if err != nil {
+		return false, fmt.Errorf("settle: consume-once scan of %q: %w", runScope, err)
+	}
+	for _, rec := range recs {
+		ref, _ := stringField(rec.Record, "schema_ref")
+		switch ref {
+		case store.SettleSelectSchemaRef, store.SettleApplySchemaRef, store.SettleDiscardSchemaRef:
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // settlementFactExists reports whether the run scope's trace
